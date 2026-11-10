@@ -27,8 +27,20 @@ action_checksums = "Checksums"
 action_batch_rename = "Renomear em lote"
 action_compress = "Comprimir"
 action_extract = "Extrair"
+action_toggle_view_mode = "Modo de visualização"
+action_toggle_quick_open = "Abrir rápido"
+
+view_mode_list = "Lista"
+view_mode_icons = "Ícones"
 
 hints_title = "Atalhos"
+
+quick_open_title = "Abrir rápido"
+quick_open_placeholder = "Digite para buscar arquivos…"
+quick_open_start = "Digite para buscar no índice."
+quick_open_empty = "Nenhum resultado."
+quick_open_indexing = "Indexando… %{count} itens"
+quick_open_footer = "%{count} itens indexados · Enter abre · Esc fecha"
 
 column_name = "Nome"
 column_size = "Tamanho"

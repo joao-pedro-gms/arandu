@@ -17,8 +17,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arandu_config::{
     Action, Config, KeyBinding, Keymap, Modifiers as KeyModifiers, TagsStore, Theme,
@@ -30,6 +31,7 @@ use arandu_core::hash::{md5_file, sha256_file};
 use arandu_core::ops::{self, Op, OpKind, OpsError, Progress};
 use arandu_core::preview::{PreviewContent, PreviewError, PreviewRequest, UnsupportedReason};
 use arandu_core::queue::{OpQueue, QueueEvent, UndoStack};
+use arandu_index::{IndexEntry, IndexStore, Indexer};
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Key, Label, Layout, Modifiers, Rect, RichText,
     ScrollArea, Sense, Stroke, StrokeKind, TextFormat, TextStyle, Ui, UiBuilder, pos2, vec2,
@@ -78,10 +80,27 @@ const PREVIEW_CACHE_CAP: usize = 20;
 /// dispor um `LayoutJob` completo a cada frame travaria a UI. O texto inteiro
 /// continua disponível no cache, apenas a renderização é limitada.
 const MAX_HIGHLIGHT_LINES: usize = 2000;
+/// Largura de uma célula no modo ícones.
+const CELL_W: f32 = 96.0;
+/// Altura de uma linha de células no modo ícones.
+const GRID_ROW_H: f32 = 100.0;
+/// Espaçamento horizontal entre células no modo ícones.
+const CELL_GAP: f32 = 8.0;
+/// Tamanho do glifo do ícone no modo ícones.
+const ICON_SIZE: f32 = 28.0;
+/// Altura reservada para o nome (duas linhas) no modo ícones.
+const GRID_NAME_H: f32 = 40.0;
+/// Máximo de resultados exibidos no quick-open (Ctrl+P).
+const QUICK_OPEN_MAX_RESULTS: usize = 20;
+/// Altura de uma linha de resultado no quick-open.
+const QUICK_OPEN_ROW_H: f32 = 22.0;
+/// Intervalo mínimo entre rescans automáticos do índice ao reabrir.
+const QUICK_OPEN_REFRESH: Duration = Duration::from_secs(300);
 
 /// Ações listadas na status bar, na ordem em que aparecem (as principais).
-const STATUS_HINTS: [Action; 6] = [
+const STATUS_HINTS: [Action; 7] = [
     Action::TogglePreview,
+    Action::ToggleViewMode,
     Action::Copy,
     Action::Move,
     Action::Rename,
@@ -113,6 +132,33 @@ pub enum SortOrder {
     NameAscending,
 }
 
+/// Modo de visualização de um painel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ViewMode {
+    /// Lista detalhada (Nome/Tamanho/Modificado).
+    #[default]
+    List,
+    /// Grade de ícones.
+    Icons,
+}
+
+impl ViewMode {
+    /// Nome curto do modo, traduzido (exibido na toolbar).
+    fn label(self) -> String {
+        match self {
+            Self::List => rust_i18n::t!("view_mode_list").into_owned(),
+            Self::Icons => rust_i18n::t!("view_mode_icons").into_owned(),
+        }
+    }
+
+    fn toggled(self) -> Self {
+        match self {
+            Self::List => Self::Icons,
+            Self::Icons => Self::List,
+        }
+    }
+}
+
 /// Estado de um painel.
 pub struct PanelState {
     /// Diretório atual do painel.
@@ -125,6 +171,10 @@ pub struct PanelState {
     pub focus: usize,
     /// Ordenação visual (sem interação nesta etapa).
     pub sort: SortOrder,
+    /// Modo de visualização do painel.
+    pub view_mode: ViewMode,
+    /// Colunas da grade no último frame (usado pela navegação por teclado).
+    grid_cols: usize,
 
     /// Conjunto de itens selecionados (inclui `selected`).
     multi: BTreeSet<usize>,
@@ -146,6 +196,8 @@ impl PanelState {
             selected: None,
             focus: 0,
             sort: SortOrder::default(),
+            view_mode: ViewMode::default(),
+            grid_cols: 1,
             multi: BTreeSet::new(),
             error: None,
             scroll_offset: 0.0,
@@ -191,6 +243,22 @@ impl PanelState {
         if let Some(parent) = self.cwd.parent() {
             let parent = parent.to_path_buf();
             self.navigate_to(parent);
+        }
+    }
+
+    /// Navega para o diretório pai de `path` e foca a entrada, se presente.
+    ///
+    /// Usado pelo quick-open: o item vem do índice global e pode estar em
+    /// qualquer lugar da árvore.
+    fn reveal_path(&mut self, path: &Path) {
+        if let Some(parent) = path.parent()
+            && parent != self.cwd
+        {
+            self.navigate_to(parent.to_path_buf());
+        }
+        if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
+            self.select(index, false);
+            self.ensure_focus_visible();
         }
     }
 
@@ -249,11 +317,33 @@ impl PanelState {
         self.ensure_focus_visible();
     }
 
+    /// Move o foco uma linha inteira da grade (para cima/baixo no modo ícones).
+    fn move_focus_row(&mut self, delta: isize) {
+        let cols = self.grid_cols.max(1) as isize;
+        self.move_focus(delta * cols);
+    }
+
+    /// Move o foco uma célula na grade (para os lados no modo ícones).
+    fn move_focus_column(&mut self, delta: isize) {
+        self.move_focus(delta);
+    }
+
+    /// Alterna entre lista e ícones, reposicionando o scroll para o foco.
+    pub fn toggle_view_mode(&mut self) {
+        self.view_mode = self.view_mode.toggled();
+        self.ensure_focus_visible();
+    }
+
     /// Pede ao próximo frame que ajuste o scroll para mostrar o foco.
     fn ensure_focus_visible(&mut self) {
-        let top = self.focus as f32 * ROW_H;
-        let bottom = top + ROW_H;
-        let view_h = self.viewport_h.max(ROW_H);
+        let (row_h, cols) = match self.view_mode {
+            ViewMode::List => (ROW_H, 1),
+            ViewMode::Icons => (GRID_ROW_H, self.grid_cols.max(1)),
+        };
+        let row = self.focus / cols;
+        let top = row as f32 * row_h;
+        let bottom = top + row_h;
+        let view_h = self.viewport_h.max(row_h);
         let mut offset = self.scroll_offset;
         if top < offset {
             offset = top;
@@ -466,6 +556,69 @@ struct ArchiveJob {
     reload_dir: PathBuf,
 }
 
+/// Evento enviado pela thread de indexação.
+enum IndexScanEvent {
+    /// Total de entradas já percorridas.
+    Progress(usize),
+    /// Scan concluído com o índice completo.
+    Done(Vec<IndexEntry>),
+}
+
+/// Estado do scan do índice global.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum IndexScanStatus {
+    /// Nenhum scan iniciado nesta sessão.
+    #[default]
+    Idle,
+    /// Scan em andamento em background.
+    Scanning,
+    /// Índice pronto para consultas.
+    Ready,
+}
+
+/// Overlay de quick-open (Ctrl+P).
+struct QuickOpenState {
+    open: bool,
+    query: String,
+    focus: usize,
+    results: Vec<(u32, IndexEntry)>,
+    /// Última consulta usada para preencher `results`.
+    last_query: String,
+    /// Pede recomputação dos resultados no próximo frame.
+    dirty: bool,
+    store: IndexStore,
+    receiver: Option<Receiver<IndexScanEvent>>,
+    /// Cancelamento compartilhado com a thread de scan.
+    cancel: Arc<AtomicBool>,
+    status: IndexScanStatus,
+    /// Entradas já percorridas no scan atual.
+    scanned: usize,
+    /// Fim do último scan bem-sucedido (para o refresh automático).
+    last_scan: Option<Instant>,
+    /// Pede foco no campo de busca no próximo frame.
+    needs_focus: bool,
+}
+
+impl Default for QuickOpenState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            query: String::new(),
+            focus: 0,
+            results: Vec::new(),
+            last_query: String::new(),
+            dirty: false,
+            store: IndexStore::new(),
+            receiver: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            status: IndexScanStatus::Idle,
+            scanned: 0,
+            last_scan: None,
+            needs_focus: false,
+        }
+    }
+}
+
 /// Aplicação principal do Arandu.
 pub struct AranduApp {
     config: Config,
@@ -507,6 +660,8 @@ pub struct AranduApp {
     keymap: Keymap,
     /// Cheatsheet de atalhos visível (F1).
     show_hints: bool,
+    /// Quick-open global (Ctrl+P).
+    quick_open: QuickOpenState,
     /// Congela a drenagem da fila em testes determinísticos de progresso.
     #[cfg(test)]
     injected_ops: bool,
@@ -580,6 +735,7 @@ impl AranduApp {
             theme,
             keymap,
             show_hints: false,
+            quick_open: QuickOpenState::default(),
             #[cfg(test)]
             injected_ops: false,
         }
@@ -605,6 +761,7 @@ impl AranduApp {
         self.pump_preview();
         self.pump_checksums();
         self.pump_archive_jobs();
+        self.pump_index_scan(&ctx);
         if self.compress_job.is_some() || self.extract_job.is_some() {
             ctx.request_repaint();
         }
@@ -642,6 +799,7 @@ impl AranduApp {
         }
         self.draw_status_bar(ui, status_rect);
         self.draw_hints_overlay(&ctx);
+        self.draw_quick_open(&ctx);
         self.draw_dialogs(&ctx);
     }
 
@@ -815,6 +973,39 @@ impl AranduApp {
             return;
         }
 
+        // Quick-open: o campo de busca captura a digitação. Setas percorrem a
+        // lista, Enter ativa o item focado e Esc/Ctrl+P fecham o overlay.
+        if self.quick_open.open {
+            let pressed = pressed_keys(ctx);
+            let toggle = self.action_pressed(Action::ToggleQuickOpen, &pressed);
+            let (escape, up, down, enter) = ctx.input_mut(|input| {
+                (
+                    input.consume_key(Modifiers::NONE, Key::Escape),
+                    input.consume_key(Modifiers::NONE, Key::ArrowUp),
+                    input.consume_key(Modifiers::NONE, Key::ArrowDown),
+                    input.consume_key(Modifiers::NONE, Key::Enter),
+                )
+            });
+
+            if toggle || escape {
+                self.quick_open.open = false;
+                return;
+            }
+            if !self.quick_open.results.is_empty() {
+                let last = self.quick_open.results.len() - 1;
+                if up {
+                    self.quick_open.focus = self.quick_open.focus.saturating_sub(1);
+                }
+                if down {
+                    self.quick_open.focus = (self.quick_open.focus + 1).min(last);
+                }
+            }
+            if enter {
+                self.activate_quick_open();
+            }
+            return;
+        }
+
         // Diálogos das ferramentas: Esc (e, no caso dos checksums, a própria
         // ação) fecham; o restante da digitação/atalhos fica suspenso. O
         // cálculo em background pode terminar sozinho e o resultado é
@@ -855,7 +1046,13 @@ impl AranduApp {
             return;
         }
 
+        if self.action_pressed(Action::ToggleQuickOpen, &pressed) {
+            self.open_quick_open();
+            return;
+        }
+
         let toggle_preview = self.action_pressed(Action::TogglePreview, &pressed);
+        let toggle_view_mode = self.action_pressed(Action::ToggleViewMode, &pressed);
         let toggle_panel = self.action_pressed(Action::TogglePanel, &pressed);
         let up = self.action_pressed(Action::NavigateUp, &pressed);
         let down = self.action_pressed(Action::NavigateDown, &pressed);
@@ -877,17 +1074,49 @@ impl AranduApp {
         if toggle_preview {
             self.preview.visible = !self.preview.visible;
         }
+        if toggle_view_mode {
+            self.active_panel_mut().toggle_view_mode();
+        }
         if toggle_panel {
             self.active = self.active.other();
         }
 
         {
+            let view_mode = self.active_panel().view_mode;
+            // No modo ícones, as setas horizontais percorrem a grade. Como não
+            // há ações dedicadas para elas (o keymap permanece enxuto), são
+            // consumidas diretamente do input neste frame.
+            let (grid_left, grid_right) = if view_mode == ViewMode::Icons {
+                ctx.input_mut(|input| {
+                    (
+                        input.consume_key(Modifiers::NONE, Key::ArrowLeft),
+                        input.consume_key(Modifiers::NONE, Key::ArrowRight),
+                    )
+                })
+            } else {
+                (false, false)
+            };
+
             let panel = self.active_panel_mut();
             if up {
-                panel.move_focus(-1);
+                if view_mode == ViewMode::Icons {
+                    panel.move_focus_row(-1);
+                } else {
+                    panel.move_focus(-1);
+                }
             }
             if down {
-                panel.move_focus(1);
+                if view_mode == ViewMode::Icons {
+                    panel.move_focus_row(1);
+                } else {
+                    panel.move_focus(1);
+                }
+            }
+            if grid_left {
+                panel.move_focus_column(-1);
+            }
+            if grid_right {
+                panel.move_focus_column(1);
             }
             if enter {
                 panel.open_focused();
@@ -1358,6 +1587,230 @@ impl AranduApp {
         }
     }
 
+    /// Abre o quick-open, iniciando o scan do `$HOME` no primeiro uso.
+    ///
+    /// Reabrir reaproveita o índice em memória; um rescans só acontece se o
+    /// último scan tiver mais de [`QUICK_OPEN_REFRESH`].
+    fn open_quick_open(&mut self) {
+        self.quick_open.open = true;
+        self.quick_open.needs_focus = true;
+        self.quick_open.query.clear();
+        self.quick_open.focus = 0;
+        self.quick_open.results.clear();
+        self.quick_open.last_query.clear();
+        self.quick_open.dirty = true;
+
+        let needs_scan = match self.quick_open.status {
+            IndexScanStatus::Idle => true,
+            IndexScanStatus::Scanning => false,
+            IndexScanStatus::Ready => self
+                .quick_open
+                .last_scan
+                .is_none_or(|last| last.elapsed() >= QUICK_OPEN_REFRESH),
+        };
+        if needs_scan {
+            self.start_index_scan();
+        }
+    }
+
+    /// Inicia o scan do diretório home em uma thread própria.
+    fn start_index_scan(&mut self) {
+        if self.quick_open.receiver.is_some() {
+            return;
+        }
+
+        let root = home_directory();
+        let cancel = Arc::clone(&self.quick_open.cancel);
+        cancel.store(false, Ordering::Relaxed);
+        let (sender, receiver) = mpsc::channel();
+        self.quick_open.receiver = Some(receiver);
+        self.quick_open.status = IndexScanStatus::Scanning;
+        self.quick_open.scanned = 0;
+
+        std::thread::spawn(move || {
+            let progress_sender = sender.clone();
+            let entries = Indexer::new().scan_with_progress(&root, &cancel, |count| {
+                let _ = progress_sender.send(IndexScanEvent::Progress(count));
+            });
+            // Canal descartado = app encerrado; a thread termina sozinha.
+            let _ = sender.send(IndexScanEvent::Done(entries));
+        });
+    }
+
+    /// Drena eventos do scan de índice sem bloquear a UI.
+    fn pump_index_scan(&mut self, ctx: &egui::Context) {
+        let mut progress = None;
+        let mut finished = None;
+
+        if let Some(receiver) = &self.quick_open.receiver {
+            while let Ok(event) = receiver.try_recv() {
+                match event {
+                    IndexScanEvent::Progress(count) => progress = Some(count),
+                    IndexScanEvent::Done(entries) => finished = Some(entries),
+                }
+            }
+        }
+
+        if let Some(count) = progress {
+            self.quick_open.scanned = count;
+        }
+
+        if let Some(entries) = finished {
+            self.quick_open.store.update(entries);
+            self.quick_open.status = IndexScanStatus::Ready;
+            self.quick_open.scanned = self.quick_open.store.len();
+            self.quick_open.receiver = None;
+            self.quick_open.last_scan = Some(Instant::now());
+            self.quick_open.dirty = true;
+        }
+
+        if self.quick_open.receiver.is_some() {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Recalcula os resultados quando a consulta/índice mudou.
+    fn refresh_quick_open_results(&mut self) {
+        if !self.quick_open.dirty && self.quick_open.query == self.quick_open.last_query {
+            return;
+        }
+
+        self.quick_open
+            .last_query
+            .clone_from(&self.quick_open.query);
+        self.quick_open.results = self
+            .quick_open
+            .store
+            .search(&self.quick_open.query, QUICK_OPEN_MAX_RESULTS);
+        self.quick_open.dirty = false;
+
+        if self.quick_open.results.is_empty() {
+            self.quick_open.focus = 0;
+        } else {
+            self.quick_open.focus = self.quick_open.focus.min(self.quick_open.results.len() - 1);
+        }
+    }
+
+    /// Ativa o resultado focado: navega o painel ativo e foca a entrada.
+    fn activate_quick_open(&mut self) {
+        let Some((_, entry)) = self.quick_open.results.get(self.quick_open.focus).cloned() else {
+            return;
+        };
+        self.quick_open.open = false;
+        self.active_panel_mut().reveal_path(&entry.path);
+    }
+
+    /// Overlay central de quick-open (Ctrl+P).
+    fn draw_quick_open(&mut self, ctx: &egui::Context) {
+        if !self.quick_open.open {
+            return;
+        }
+        self.refresh_quick_open_results();
+
+        let mut activate = false;
+        let mut clicked_row = None;
+        let quick = &mut self.quick_open;
+        let scanning = quick.status == IndexScanStatus::Scanning;
+        let scanned = quick.scanned;
+
+        let modal = egui::Modal::new(egui::Id::unique("quick-open")).show(ctx, |ui| {
+            ui.set_min_width(640.0);
+            ui.set_max_width(640.0);
+
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut quick.query)
+                    .hint_text(rust_i18n::t!("quick_open_placeholder"))
+                    .desired_width(f32::INFINITY),
+            );
+            if quick.needs_focus {
+                response.request_focus();
+                quick.needs_focus = false;
+            }
+            ui.add_space(6.0);
+
+            if quick.results.is_empty() {
+                let message = if scanning {
+                    rust_i18n::t!("quick_open_indexing", count => scanned).into_owned()
+                } else if quick.query.is_empty() {
+                    rust_i18n::t!("quick_open_start").into_owned()
+                } else {
+                    rust_i18n::t!("quick_open_empty").into_owned()
+                };
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new(message)
+                        .color(ui.visuals().weak_text_color())
+                        .italics(),
+                );
+                ui.add_space(12.0);
+            } else {
+                let visuals = ui.visuals().clone();
+                let weak = visuals.weak_text_color();
+                for (index, (_, entry)) in quick.results.iter().enumerate() {
+                    let selected = index == quick.focus;
+                    let (rect, row) = ui.allocate_exact_size(
+                        vec2(ui.available_width(), QUICK_OPEN_ROW_H),
+                        Sense::click(),
+                    );
+                    if selected {
+                        ui.painter()
+                            .rect_filled(rect, 3.0, visuals.selection.bg_fill);
+                    }
+                    let text_color = if selected {
+                        visuals.strong_text_color()
+                    } else {
+                        visuals.text_color()
+                    };
+                    let mut row_ui = ui.new_child(
+                        UiBuilder::new()
+                            .max_rect(rect.shrink2(vec2(8.0, 2.0)))
+                            .layout(Layout::left_to_right(Align::Center)),
+                    );
+                    row_ui.spacing_mut().item_spacing.x = 10.0;
+                    row_ui.label(RichText::new(&entry.name).strong().color(text_color));
+                    row_ui.add(
+                        Label::new(
+                            RichText::new(entry.path.display().to_string())
+                                .small()
+                                .color(weak),
+                        )
+                        .truncate(),
+                    );
+
+                    if row.clicked() {
+                        clicked_row = Some(index);
+                    }
+                    if row.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                }
+            }
+
+            ui.add_space(4.0);
+            let footer = if scanning {
+                rust_i18n::t!("quick_open_indexing", count => scanned).into_owned()
+            } else {
+                rust_i18n::t!("quick_open_footer", count => quick.store.len()).into_owned()
+            };
+            ui.label(
+                RichText::new(footer)
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+        });
+
+        if modal.should_close() {
+            self.quick_open.open = false;
+        }
+        if let Some(index) = clicked_row {
+            self.quick_open.focus = index;
+            activate = true;
+        }
+        if activate {
+            self.activate_quick_open();
+        }
+    }
+
     /// Persiste as tags (em testes, não toca no disco real).
     fn persist_tags(&self) {
         #[cfg(not(test))]
@@ -1433,6 +1886,30 @@ impl AranduApp {
                             .on_hover_text(rust_i18n::t!("toggle_theme"));
                         if theme_button.clicked() {
                             self.cycle_theme(ui.ctx());
+                        }
+
+                        let view_mode = self.active_panel().view_mode;
+                        let view_hint = self
+                            .keymap
+                            .effective(Action::ToggleViewMode)
+                            .into_iter()
+                            .next()
+                            .map(|binding| {
+                                format!("{binding} {}", action_description(Action::ToggleViewMode))
+                            })
+                            .unwrap_or_else(|| action_description(Action::ToggleViewMode));
+                        let view_button = ui
+                            .add(
+                                Label::new(
+                                    RichText::new(view_mode.label())
+                                        .size(12.5)
+                                        .color(ui.visuals().weak_text_color()),
+                                )
+                                .sense(Sense::CLICK),
+                            )
+                            .on_hover_text(view_hint);
+                        if view_button.clicked() {
+                            self.active_panel_mut().toggle_view_mode();
                         }
                         let settings = ui
                             .add(Label::new(rust_i18n::t!("settings")).sense(Sense::CLICK))
@@ -2423,10 +2900,12 @@ fn draw_panel(
             interacted = true;
         }
 
-        // Cabeçalho de colunas (apenas visual nesta etapa).
-        let (column_rect, _) =
-            ui.allocate_exact_size(vec2(ui.available_width(), COLUMN_HEADER_H), Sense::hover());
-        paint_columns(ui, column_rect, &visuals, active);
+        // Cabeçalho de colunas (apenas no modo lista).
+        if panel.view_mode == ViewMode::List {
+            let (column_rect, _) =
+                ui.allocate_exact_size(vec2(ui.available_width(), COLUMN_HEADER_H), Sense::hover());
+            paint_columns(ui, column_rect, &visuals, active);
+        }
 
         if let Some(error) = &panel.error {
             draw_error(ui, error, &visuals);
@@ -2451,27 +2930,63 @@ fn draw_panel(
         let active_selection = panel.multi.clone();
         let mut action = None;
 
-        let output = {
-            let entries = &panel.entries;
-            let selection = &active_selection;
-            scroll.show_rows(ui, ROW_H, entries.len(), |ui, range| {
-                for index in range {
-                    let entry = &entries[index];
-                    let selected = selection.contains(&index);
-                    let style = RowStyle {
-                        selected,
-                        focused: focused == index,
-                        active,
-                        accent,
-                        dim: !active,
-                    };
-                    if let Some(row_action) =
-                        draw_row(ui, entry, index, &style, &visuals, side, tags)
-                    {
-                        action = Some(row_action);
+        let output = match panel.view_mode {
+            ViewMode::List => {
+                let entries = &panel.entries;
+                let selection = &active_selection;
+                scroll.show_rows(ui, ROW_H, entries.len(), |ui, range| {
+                    for index in range {
+                        let entry = &entries[index];
+                        let selected = selection.contains(&index);
+                        let style = RowStyle {
+                            selected,
+                            focused: focused == index,
+                            active,
+                            accent,
+                            dim: !active,
+                        };
+                        if let Some(row_action) =
+                            draw_row(ui, entry, index, &style, &visuals, side, tags)
+                        {
+                            action = Some(row_action);
+                        }
                     }
-                }
-            })
+                })
+            }
+            ViewMode::Icons => {
+                let width = ui.available_width();
+                let cols = (((width + CELL_GAP) / (CELL_W + CELL_GAP)).floor() as usize).max(1);
+                panel.grid_cols = cols;
+                let rows = panel.entries.len().div_ceil(cols);
+                let entries = &panel.entries;
+                let selection = &active_selection;
+                scroll.show_rows(ui, GRID_ROW_H, rows, |ui, range| {
+                    for row in range {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = CELL_GAP;
+                            for column in 0..cols {
+                                let index = row * cols + column;
+                                let Some(entry) = entries.get(index) else {
+                                    break;
+                                };
+                                let selected = selection.contains(&index);
+                                let style = RowStyle {
+                                    selected,
+                                    focused: focused == index,
+                                    active,
+                                    accent,
+                                    dim: !active,
+                                };
+                                if let Some(row_action) =
+                                    draw_grid_cell(ui, entry, index, &style, &visuals, side)
+                                {
+                                    action = Some(row_action);
+                                }
+                            }
+                        });
+                    }
+                })
+            }
         };
 
         panel.scroll_offset = output.state.clamped_offset().y;
@@ -2657,6 +3172,109 @@ fn draw_row(
         return Some(RowAction::Click { index, ctrl });
     }
     None
+}
+
+/// Desenha uma célula da grade (modo ícones), com seleção e foco.
+fn draw_grid_cell(
+    ui: &mut Ui,
+    entry: &Entry,
+    index: usize,
+    style: &RowStyle,
+    visuals: &egui::Visuals,
+    side: PanelSide,
+) -> Option<RowAction> {
+    let (rect, _) = ui.allocate_exact_size(vec2(CELL_W, GRID_ROW_H), Sense::hover());
+    let id = ui.make_persistent_id(("grid", side, &entry.path));
+    let response = ui.interact(rect, id, Sense::CLICK);
+
+    if style.selected {
+        ui.painter()
+            .rect_filled(rect, 4.0, with_alpha(style.accent, SELECTION_ALPHA));
+    } else if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, 4.0, visuals.widgets.hovered.weak_bg_fill);
+    }
+
+    let text_color = if style.dim {
+        with_alpha(visuals.text_color(), 153)
+    } else {
+        visuals.text_color()
+    };
+    // O accent vem do tema (aplicado em `apply_theme`); nada hardcoded.
+    let icon_color = if entry.is_dir {
+        visuals.selection.stroke.color
+    } else {
+        text_color
+    };
+    let icon = if entry.is_dir { "🗀" } else { "🗋" };
+    ui.painter().text(
+        pos2(rect.center().x, rect.top() + ICON_SIZE * 0.5 + 8.0),
+        Align2::CENTER_CENTER,
+        icon,
+        FontId::proportional(ICON_SIZE),
+        icon_color,
+    );
+
+    let name_rect = Rect::from_min_max(
+        pos2(rect.left() + 4.0, rect.top() + ICON_SIZE + 12.0),
+        pos2(
+            rect.right() - 4.0,
+            rect.top() + ICON_SIZE + 12.0 + GRID_NAME_H,
+        ),
+    );
+    let mut name_ui = ui.new_child(
+        UiBuilder::new()
+            .max_rect(name_rect)
+            .layout(Layout::top_down(Align::Center)),
+    );
+    let name = if entry.is_dir {
+        format!("{}/", entry.name)
+    } else {
+        entry.name.clone()
+    };
+    let display = compact_grid_name(&name);
+    // `wrap()` quebra em até duas linhas; a área de recorte limita o excesso.
+    name_ui.add(
+        Label::new(RichText::new(display).size(12.0).color(text_color))
+            .wrap()
+            .selectable(false),
+    );
+
+    if style.focused && style.active {
+        ui.painter().rect_stroke(
+            rect,
+            4.0,
+            Stroke::new(1.0, style.accent),
+            StrokeKind::Inside,
+        );
+    }
+
+    if response.double_clicked() {
+        return Some(RowAction::Open { index });
+    }
+    if response.clicked() {
+        let ctrl = response.ctx.input(|input| input.modifiers.ctrl);
+        return Some(RowAction::Click { index, ctrl });
+    }
+    None
+}
+
+/// Encurta um nome longo para a célula da grade com elipse no meio.
+///
+/// O limite de 26 caracteres corresponde a duas linhas de ~13 caracteres na
+/// largura de uma célula; nomes menores passam intactos.
+fn compact_grid_name(name: &str) -> String {
+    const MAX_CHARS: usize = 26;
+    let count = name.chars().count();
+    if count <= MAX_CHARS {
+        return name.to_owned();
+    }
+    let keep = MAX_CHARS.saturating_sub(1);
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let start: String = name.chars().take(head).collect();
+    let end: String = name.chars().skip(count - tail).collect();
+    format!("{start}…{end}")
 }
 
 /// Desenha chips de tags antes das colunas de Tamanho/Modificado.
@@ -2861,7 +3479,7 @@ fn draw_empty(ui: &mut Ui, visuals: &egui::Visuals) {
     ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
         ui.vertical_centered(|ui| {
             ui.add_space((body.height() / 2.0 - 48.0).max(8.0));
-            ui.label(RichText::new("📁").size(48.0));
+            ui.label(RichText::new("🗀").size(48.0));
             ui.add_space(4.0);
             ui.label(RichText::new(rust_i18n::t!("empty_dir")).color(visuals.weak_text_color()));
         });
@@ -2998,6 +3616,15 @@ fn key_name(key: Key) -> String {
     }
 }
 
+/// Diretório home do usuário, com fallback para o diretório atual.
+fn home_directory() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
 /// Descrição i18n curta de uma ação (usada nos hints e no cheatsheet).
 fn action_description(action: Action) -> String {
     let key = match action {
@@ -3020,6 +3647,8 @@ fn action_description(action: Action) -> String {
         Action::BatchRename => "action_batch_rename",
         Action::Compress => "action_compress",
         Action::Extract => "action_extract",
+        Action::ToggleViewMode => "action_toggle_view_mode",
+        Action::ToggleQuickOpen => "action_toggle_quick_open",
     };
     rust_i18n::t!(key).into_owned()
 }
@@ -3295,13 +3924,17 @@ mod tests {
 
     use arandu_config::Config;
     use arandu_core::ops::{OpKind, Progress};
+    use arandu_index::IndexEntry;
     use eframe::egui;
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
 
-    use super::{AranduApp, PanelSide, format_modified, parse_hex_color, visible_breadcrumb};
+    use super::{
+        AranduApp, IndexScanStatus, PanelSide, ViewMode, format_modified, parse_hex_color,
+        visible_breadcrumb,
+    };
     use std::path::PathBuf;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::{Duration, Instant, UNIX_EPOCH};
 
     fn fixture_app() -> (tempfile::TempDir, AranduApp) {
         let dir = tempfile::tempdir().expect("cria diretório temporário");
@@ -3385,6 +4018,57 @@ mod tests {
         assert_eq!(app.active_selected_count(), 2);
         app.left.select(1, true);
         assert_eq!(app.active_selected_count(), 1);
+    }
+
+    #[test]
+    fn quick_open_activation_navigates_and_focuses_file() {
+        let (dir, mut app) = fixture_app();
+        let target = dir.path().join("fixture-file.txt");
+        app.quick_open.store.update(vec![IndexEntry {
+            path: target.clone(),
+            name: "fixture-file.txt".to_owned(),
+            is_dir: false,
+            size: 8,
+            modified: UNIX_EPOCH,
+        }]);
+        app.quick_open.open = true;
+        app.quick_open.query = "fixture".to_owned();
+        app.refresh_quick_open_results();
+
+        assert_eq!(app.quick_open.results.len(), 1);
+        app.activate_quick_open();
+
+        assert!(!app.quick_open.open);
+        assert_eq!(app.left.cwd, dir.path());
+        let index = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.path == target)
+            .expect("arquivo visível no painel");
+        assert_eq!(app.left.focus, index);
+        assert_eq!(app.left.selected, Some(index));
+    }
+
+    #[test]
+    fn reopening_quick_open_reuses_ready_index() {
+        let (_dir, mut app) = fixture_app();
+        app.quick_open.status = IndexScanStatus::Ready;
+        app.quick_open.last_scan = Some(Instant::now());
+        app.quick_open.store.update(vec![IndexEntry {
+            path: PathBuf::from("/tmp/a.txt"),
+            name: "a.txt".to_owned(),
+            is_dir: false,
+            size: 0,
+            modified: UNIX_EPOCH,
+        }]);
+
+        app.open_quick_open();
+
+        assert!(app.quick_open.open);
+        assert!(app.quick_open.receiver.is_none());
+        assert_eq!(app.quick_open.store.len(), 1);
+        assert!(app.quick_open.query.is_empty());
     }
 
     #[test]
@@ -3659,8 +4343,9 @@ mod tests {
         harness.run();
 
         let expected = format!(
-            "F3 {} · F5 {} · F6 {} · F2 {} · Del {} · Ctrl+Z {}",
+            "F3 {} · Ctrl+1 {} · F5 {} · F6 {} · F2 {} · Del {} · Ctrl+Z {}",
             rust_i18n::t!("action_toggle_preview"),
+            rust_i18n::t!("action_toggle_view_mode"),
             rust_i18n::t!("action_copy"),
             rust_i18n::t!("action_move"),
             rust_i18n::t!("action_rename"),
@@ -3671,6 +4356,102 @@ mod tests {
             harness.query_all_by_label(&expected).count() >= 1,
             "esperava os hints dinâmicos na status bar: {expected}"
         );
+    }
+
+    #[test]
+    fn ctrl_1_toggles_view_mode_roundtrip() {
+        let (_dir, app) = fixture_app();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        assert_eq!(harness.state().left.view_mode, ViewMode::List);
+
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::Num1);
+        harness.run();
+        assert_eq!(harness.state().left.view_mode, ViewMode::Icons);
+
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::Num1);
+        harness.run();
+        assert_eq!(harness.state().left.view_mode, ViewMode::List);
+    }
+
+    #[test]
+    fn icons_toolbar_reflects_current_mode() {
+        let (_dir, app) = fixture_app();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        let list = rust_i18n::t!("view_mode_list").to_string();
+        let icons = rust_i18n::t!("view_mode_icons").to_string();
+        assert!(harness.query_all_by_label(&list).count() >= 1);
+
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::Num1);
+        harness.run();
+        assert!(
+            harness.query_all_by_label(&icons).count() >= 1,
+            "a toolbar deveria exibir o modo 'Ícones'"
+        );
+        assert_eq!(harness.query_all_by_label(&list).count(), 0);
+    }
+
+    #[test]
+    fn icons_mode_keeps_enter_on_focused_directory() {
+        let (dir, mut app) = fixture_app();
+        app.left.view_mode = ViewMode::Icons;
+        let index = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.is_dir)
+            .expect("fixture tem um diretório");
+        app.left.focus = index;
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+
+        assert_eq!(harness.state().left.cwd, dir.path().join("fixture-dir"));
+    }
+
+    #[test]
+    fn arrow_keys_move_focus_through_icon_grid() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        for index in 0..12 {
+            fs::write(dir.path().join(format!("arquivo-{index:02}.txt")), b"x")
+                .expect("cria arquivo");
+        }
+        let mut app = AranduApp::new_at(Config::default(), dir.path());
+        app.left.view_mode = ViewMode::Icons;
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        let cols = harness.state().left.grid_cols;
+        assert!(cols >= 2, "esperava pelo menos duas colunas na grade");
+
+        harness.key_press(egui::Key::ArrowRight);
+        harness.run();
+        assert_eq!(harness.state().left.focus, 1);
+
+        harness.key_press(egui::Key::ArrowDown);
+        harness.run();
+        assert_eq!(harness.state().left.focus, 1 + cols);
+
+        harness.key_press(egui::Key::ArrowLeft);
+        harness.run();
+        assert_eq!(harness.state().left.focus, cols);
+
+        harness.key_press(egui::Key::ArrowUp);
+        harness.run();
+        assert_eq!(harness.state().left.focus, 0);
     }
 
     #[test]

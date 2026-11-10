@@ -14,9 +14,13 @@ screenshot-tests = []
 
 [dependencies]
 eframe.workspace = true
+# Habilita o Noto Emoji monoespaçado para os glifos de pasta/arquivo do modo
+# ícones (🗀/🗋); sem ele o epaint só carrega Ubuntu + egui-icons.
+egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
 rust-i18n.workspace = true
 arandu-config.workspace = true
 arandu-core.workspace = true
+arandu-index.workspace = true
 syntect.workspace = true
 image.workspace = true
 

@@ -7,7 +7,7 @@ O roadmap detalhado com justificativas vive em [SCOPE.md](SCOPE.md). Esta págin
 
 - [x] Workspace Cargo com crates `core`, `config`, `ui` (+ `git`/`index` reservados) <!-- PR #1 -->
 - [x] Navegação dual pane (splitter arrastável, foco por painel) <!-- PR #3 -->
-- [ ] Modos de visualização: ícones, lista, colunas (virtualização com `show_rows`) <!-- PR #3: lista; ícones/colunas pendentes -->
+- [x] Modos de visualização: ícones, lista (virtualização com `show_rows`) <!-- PR #3 lista; PR #12 ícones -->
 - [x] Operações: copiar/mover/renomear/deletar com **fila + progresso** <!-- PR #4 -->
 - [x] **Undo** de operações + **lixeira** do SO <!-- PR #4: undo sem redo (decisão) -->
 - [x] Preview pane: texto com syntax highlight (syntect), imagens <!-- PR #5: F3, cache LRU; PDF pendente fase 2 -->

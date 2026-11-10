@@ -40,6 +40,7 @@ pub enum Action {
     BatchRename,
     Compress,
     Extract,
+    ToggleViewMode,
 }
 
 impl Action {
@@ -65,11 +66,12 @@ impl Action {
             Self::BatchRename => "batch_rename",
             Self::Compress => "compress",
             Self::Extract => "extract",
+            Self::ToggleViewMode => "toggle_view_mode",
         }
     }
 
     /// Todas as ações, na ordem canônica do arquivo.
-    pub const ALL: [Action; 19] = [
+    pub const ALL: [Action; 20] = [
         Self::TogglePreview,
         Self::TogglePanel,
         Self::NavigateUp,
@@ -89,6 +91,7 @@ impl Action {
         Self::BatchRename,
         Self::Compress,
         Self::Extract,
+        Self::ToggleViewMode,
     ];
 
     /// Converte um nome `snake_case` em ação.
@@ -363,6 +366,8 @@ fn default_bindings(action: Action) -> Vec<KeyBinding> {
         Action::BatchRename => vec![kb("F7")],
         Action::Compress => vec![kb("F8")],
         Action::Extract => vec![kb("F10")],
+        // Um único atalho cicla lista -> ícones -> lista.
+        Action::ToggleViewMode => vec![ctrl("1")],
     }
 }
 
@@ -389,6 +394,7 @@ fn vim_bindings(action: Action) -> Vec<KeyBinding> {
         Action::BatchRename => vec![kb("F7")],
         Action::Compress => vec![kb("F8")],
         Action::Extract => vec![kb("F10")],
+        Action::ToggleViewMode => vec![ctrl("1")],
     }
 }
 
@@ -597,6 +603,20 @@ mod tests {
             Action::from_name("extract").expect("extract"),
             Action::Extract
         );
+    }
+
+    #[test]
+    fn toggle_view_mode_is_bound_to_ctrl_1_in_both_presets() {
+        for preset in ["default", "vim"] {
+            let keymap = Keymap {
+                preset: preset.to_owned(),
+                ..Keymap::default()
+            };
+            assert_eq!(
+                keymap.effective(Action::ToggleViewMode),
+                vec![KeyBinding::with_mods(Modifiers::CTRL, "1")]
+            );
+        }
     }
 
     #[test]

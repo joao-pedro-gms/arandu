@@ -27,6 +27,10 @@ action_checksums = "Checksums"
 action_batch_rename = "Batch rename"
 action_compress = "Compress"
 action_extract = "Extract"
+action_toggle_view_mode = "View mode"
+
+view_mode_list = "List"
+view_mode_icons = "Icons"
 
 hints_title = "Shortcuts"
 

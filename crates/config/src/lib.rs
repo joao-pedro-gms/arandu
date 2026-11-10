@@ -6,9 +6,11 @@
 
 mod error;
 pub mod keymap;
+pub mod tags;
 
 pub use error::ConfigError;
 pub use keymap::{Action, KeyBinding, Keymap, Modifiers};
+pub use tags::TagsStore;
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

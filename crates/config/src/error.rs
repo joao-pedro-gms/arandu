@@ -34,4 +34,10 @@ pub enum ConfigError {
     /// Nome de tecla fora do conjunto suportado.
     #[error("tecla inválida em `{action}`: {key:?} (nomes egui: F1..F12, Tab, ArrowUp, J, ...)")]
     InvalidKey { action: String, key: String },
+
+    /// Tag vazia, com vírgula/quebra de linha ou longa demais.
+    #[error(
+        "tag inválida: {tag:?} (não pode ser vazia, conter vírgula ou quebra de linha, nem passar de 32 caracteres)"
+    )]
+    InvalidTag { tag: String },
 }

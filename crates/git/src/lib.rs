@@ -823,6 +823,40 @@ mod tests {
     }
 
     #[test]
+    fn ahead_e_behind_contra_upstream() {
+        let repo = TestRepo::new();
+        repo.write("a.txt", "1");
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "inicial"]);
+
+        let clone_dir = tempfile::tempdir().expect("tempdir do clone");
+        let clone = clone_dir.path().join("clone");
+        let clone_str = clone.to_str().expect("utf-8").to_owned();
+        repo.git(&["clone", repo.path.to_str().expect("utf-8"), &clone_str]);
+        git(&clone, &["config", "user.name", "Clone"]);
+        git(&clone, &["config", "user.email", "clone@example.com"]);
+        std::fs::write(clone.join("b.txt"), "2").unwrap();
+        git(&clone, &["add", "."]);
+        git(&clone, &["commit", "-m", "segundo"]);
+
+        repo.git(&["remote", "add", "origin", &clone_str]);
+        repo.git(&["fetch", "origin"]);
+        repo.git(&["branch", "--set-upstream-to=origin/main", "main"]);
+
+        let status = Repo::discover(&repo.path).unwrap().status().unwrap();
+        assert_eq!(status.upstream.as_deref(), Some("origin/main"));
+        assert_eq!(status.behind, 1);
+        assert_eq!(status.ahead, 0);
+
+        repo.write("c.txt", "3");
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "terceiro"]);
+        let status = Repo::discover(&repo.path).unwrap().status().unwrap();
+        assert_eq!(status.ahead, 1);
+        assert_eq!(status.behind, 1);
+    }
+
+    #[test]
     fn branch_name_correto() {
         let repo = TestRepo::new();
         repo.git(&["checkout", "-b", "feat/painel-git"]);

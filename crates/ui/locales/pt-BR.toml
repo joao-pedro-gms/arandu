@@ -2,3 +2,17 @@ _version = 1
 
 welcome = "Bem-vindo ao Arandu"
 welcome_hint = "Seu gerenciador de arquivos customizável. Pressione Ctrl+Q para sair."
+
+menu = "Menu da aplicação"
+search = "Pesquisar"
+settings = "Configurações"
+
+column_name = "Nome"
+column_size = "Tamanho"
+column_modified = "Modificado"
+
+empty_dir = "Diretório vazio"
+error_dir_title = "Não foi possível abrir o diretório"
+splitter_hint = "Arraste para redimensionar"
+items_count = "%{count} itens"
+selected_count = "%{count} selecionados"

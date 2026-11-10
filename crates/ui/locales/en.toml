@@ -2,3 +2,17 @@ _version = 1
 
 welcome = "Welcome to Arandu"
 welcome_hint = "Your customizable file manager. Press Ctrl+Q to quit."
+
+menu = "Application menu"
+search = "Search"
+settings = "Settings"
+
+column_name = "Name"
+column_size = "Size"
+column_modified = "Modified"
+
+empty_dir = "Empty directory"
+error_dir_title = "Cannot open directory"
+splitter_hint = "Drag to resize"
+items_count = "%{count} items"
+selected_count = "%{count} selected"

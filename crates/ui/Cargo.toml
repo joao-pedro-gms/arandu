@@ -12,3 +12,8 @@ description = "Interface egui do Arandu"
 eframe.workspace = true
 rust-i18n.workspace = true
 arandu-config.workspace = true
+arandu-core.workspace = true
+
+[dev-dependencies]
+egui_kittest = "0.37"
+tempfile = "3.27.0"

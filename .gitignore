@@ -21,3 +21,8 @@ target/
 # OS
 .DS_Store
 Thumbs.db
+
+# egui_kittest: artefatos de difusão de snapshots
+**/tests/snapshots/*.diff.png
+**/tests/snapshots/*.new.png
+**/tests/snapshots/*.old.png

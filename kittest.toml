@@ -1,0 +1,11 @@
+# Configuração do egui_kittest (lida a partir do diretório do Cargo.lock).
+# `output_path` é relativo ao crate em teste (crates/ui) nas execuções de
+# `cargo test`, então os PNGs ficam em crates/ui/tests/snapshots.
+output_path = "tests/snapshots"
+threshold = 0.6
+max_failed_pixels = 0
+
+# lavapipe/software rendering varia alguns pixels entre versões de driver.
+[linux]
+threshold = 1.0
+max_failed_pixels = 4

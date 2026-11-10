@@ -1484,14 +1484,19 @@ impl AranduApp {
 
     /// Drena o resultado da consulta de status sem bloquear a UI.
     fn pump_git(&mut self) {
-        let received = self.git.receiver.as_ref().map(Receiver::try_recv);
-        let Some(result) = received else {
+        let Some(receiver) = self.git.receiver.as_ref() else {
             return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.git.receiver = None;
+                return;
+            }
         };
         self.git.receiver = None;
-        let Ok((dir, refresh)) = result else {
-            return;
-        };
+        let (dir, refresh) = result;
         // Descarta resultados de um diretório que não é mais o alvo.
         if self.git.requested_dir.as_deref() != Some(dir.as_path()) {
             return;
@@ -1527,18 +1532,18 @@ impl AranduApp {
         status
             .staged
             .iter()
-            .map(|entry| (false, root.join(&entry.path)))
+            .map(|entry| (true, root.join(&entry.path)))
             .chain(
                 status
                     .modified
                     .iter()
-                    .map(|entry| (true, root.join(&entry.path))),
+                    .map(|entry| (false, root.join(&entry.path))),
             )
             .chain(
                 status
                     .untracked
                     .iter()
-                    .map(|entry| (true, root.join(&entry.path))),
+                    .map(|entry| (false, root.join(&entry.path))),
             )
             .collect()
     }
@@ -3879,6 +3884,94 @@ mod tests {
         harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::G);
         harness.run();
         assert!(!harness.state().git.visible);
+    }
+
+    #[test]
+    fn git_panel_enter_stages_and_unstages_focused_row() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        let run_git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("executa git");
+            assert!(
+                output.status.success(),
+                "git {:?} falhou: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&["init", "-b", "main"]);
+        run_git(&["config", "user.name", "Teste"]);
+        run_git(&["config", "user.email", "teste@example.com"]);
+        fs::write(dir.path().join("novo.txt"), b"conteudo").expect("cria arquivo");
+
+        let app = AranduApp::new_at(Config::default(), dir.path());
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::G);
+        harness.run();
+
+        for _ in 0..200 {
+            if harness.state().git.status.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run();
+        }
+        assert!(harness.state().git.status.is_some(), "status não carregou");
+
+        harness.state_mut().git.focused = true;
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+
+        for _ in 0..200 {
+            let staged = harness
+                .state()
+                .git
+                .status
+                .as_ref()
+                .is_some_and(|status| status.staged.len() == 1 && status.untracked.is_empty());
+            if staged {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run();
+        }
+        let status = harness.state().git.status.clone().expect("status");
+        assert_eq!(status.staged.len(), 1, "Enter deveria preparar o arquivo");
+        assert!(status.untracked.is_empty());
+
+        harness.state_mut().git.focused = true;
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+
+        for _ in 0..200 {
+            let unstaged = harness
+                .state()
+                .git
+                .status
+                .as_ref()
+                .is_some_and(|status| status.staged.is_empty() && status.untracked.len() == 1);
+            if unstaged {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run();
+        }
+        let status = harness.state().git.status.clone().expect("status");
+        assert!(
+            status.staged.is_empty(),
+            "Enter de novo deveria despreparar o arquivo"
+        );
+        assert_eq!(status.untracked.len(), 1);
     }
 
     #[test]

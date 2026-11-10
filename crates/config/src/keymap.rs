@@ -11,6 +11,7 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,7 @@ pub enum Action {
     Undo,
     CycleTheme,
     Quit,
+    ShowHints,
 }
 
 impl Action {
@@ -52,11 +54,12 @@ impl Action {
             Self::Undo => "undo",
             Self::CycleTheme => "cycle_theme",
             Self::Quit => "quit",
+            Self::ShowHints => "show_hints",
         }
     }
 
     /// Todas as ações, na ordem canônica do arquivo.
-    pub const ALL: [Action; 13] = [
+    pub const ALL: [Action; 14] = [
         Self::TogglePreview,
         Self::TogglePanel,
         Self::NavigateUp,
@@ -70,6 +73,7 @@ impl Action {
         Self::Undo,
         Self::CycleTheme,
         Self::Quit,
+        Self::ShowHints,
     ];
 
     /// Converte um nome `snake_case` em ação.
@@ -156,6 +160,40 @@ impl KeyBinding {
             self.key == pressed.key
         };
         same_key && self.mods.matches(pressed.mods, self.key_is_letter())
+    }
+}
+
+impl fmt::Display for KeyBinding {
+    /// Formato compacto para a UI: modificadores na ordem
+    /// Ctrl, Alt, Shift, Logo, separados por `+` (ex.: `Ctrl+Shift+Z`).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        for (enabled, label) in [
+            (self.mods.ctrl, "Ctrl"),
+            (self.mods.alt, "Alt"),
+            (self.mods.shift, "Shift"),
+            (self.mods.logo, "Logo"),
+        ] {
+            if enabled {
+                if !first {
+                    f.write_str("+")?;
+                }
+                f.write_str(label)?;
+                first = false;
+            }
+        }
+        if !first {
+            f.write_str("+")?;
+        }
+        f.write_str(display_key(&self.key))
+    }
+}
+
+/// Nome curto da tecla para exibição (ex.: `Delete` vira `Del`).
+fn display_key(key: &str) -> &str {
+    match key {
+        "Delete" => "Del",
+        other => other,
     }
 }
 
@@ -304,6 +342,7 @@ fn default_bindings(action: Action) -> Vec<KeyBinding> {
         Action::Undo => vec![ctrl("Z")],
         Action::CycleTheme => vec![ctrl("T")],
         Action::Quit => vec![ctrl("Q")],
+        Action::ShowHints => vec![kb("F1")],
     }
 }
 
@@ -324,6 +363,7 @@ fn vim_bindings(action: Action) -> Vec<KeyBinding> {
         Action::Undo => vec![kb("U")],
         Action::CycleTheme => vec![kb("T")],
         Action::Quit => vec![kb("Q")],
+        Action::ShowHints => vec![kb("F1")],
     }
 }
 
@@ -433,5 +473,56 @@ mod tests {
         let binding = KeyBinding::with_mods(Modifiers::CTRL, "Z");
         assert!(binding.matches(&KeyBinding::with_mods(Modifiers::CTRL, "Z")));
         assert!(!binding.matches(&KeyBinding::key("Z")));
+    }
+
+    #[test]
+    fn display_formats_bindings_compactly() {
+        assert_eq!(KeyBinding::key("F3").to_string(), "F3");
+        assert_eq!(KeyBinding::key("J").to_string(), "J");
+        assert_eq!(
+            KeyBinding::with_mods(Modifiers::CTRL, "T").to_string(),
+            "Ctrl+T"
+        );
+        assert_eq!(
+            KeyBinding::with_mods(
+                Modifiers {
+                    ctrl: true,
+                    alt: false,
+                    shift: true,
+                    logo: false,
+                },
+                "Z",
+            )
+            .to_string(),
+            "Ctrl+Shift+Z"
+        );
+        assert_eq!(
+            KeyBinding::with_mods(
+                Modifiers {
+                    ctrl: true,
+                    alt: true,
+                    shift: true,
+                    logo: true,
+                },
+                "Z",
+            )
+            .to_string(),
+            "Ctrl+Alt+Shift+Logo+Z"
+        );
+        assert_eq!(KeyBinding::key("Delete").to_string(), "Del");
+    }
+
+    #[test]
+    fn show_hints_is_bound_to_f1_in_both_presets() {
+        for preset in ["default", "vim"] {
+            let keymap = Keymap {
+                preset: preset.to_owned(),
+                ..Keymap::default()
+            };
+            assert_eq!(
+                keymap.effective(Action::ShowHints),
+                vec![KeyBinding::key("F1")]
+            );
+        }
     }
 }

@@ -35,6 +35,7 @@ pub enum Action {
     CycleTheme,
     Quit,
     ShowHints,
+    TagFiles,
 }
 
 impl Action {
@@ -55,11 +56,12 @@ impl Action {
             Self::CycleTheme => "cycle_theme",
             Self::Quit => "quit",
             Self::ShowHints => "show_hints",
+            Self::TagFiles => "tag_files",
         }
     }
 
     /// Todas as ações, na ordem canônica do arquivo.
-    pub const ALL: [Action; 14] = [
+    pub const ALL: [Action; 15] = [
         Self::TogglePreview,
         Self::TogglePanel,
         Self::NavigateUp,
@@ -74,6 +76,7 @@ impl Action {
         Self::CycleTheme,
         Self::Quit,
         Self::ShowHints,
+        Self::TagFiles,
     ];
 
     /// Converte um nome `snake_case` em ação.
@@ -343,6 +346,7 @@ fn default_bindings(action: Action) -> Vec<KeyBinding> {
         Action::CycleTheme => vec![ctrl("T")],
         Action::Quit => vec![ctrl("Q")],
         Action::ShowHints => vec![kb("F1")],
+        Action::TagFiles => vec![kb("F4")],
     }
 }
 
@@ -364,6 +368,7 @@ fn vim_bindings(action: Action) -> Vec<KeyBinding> {
         Action::CycleTheme => vec![kb("T")],
         Action::Quit => vec![kb("Q")],
         Action::ShowHints => vec![kb("F1")],
+        Action::TagFiles => vec![kb("F4")],
     }
 }
 

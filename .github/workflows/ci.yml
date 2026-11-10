@@ -33,6 +33,40 @@ jobs:
       - name: build
         run: cargo build --workspace --release
 
+  distros:
+    # Build/test em distros além do Ubuntu (GH não tem runners nativos Fedora/Arch)
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - image: fedora:latest
+            deps: "dnf install -y -q curl ca-certificates git gcc pkg-config"
+          - image: archlinux:latest
+            deps: "pacman -Sy --noconfirm --needed curl ca-certificates git gcc pkg-config"
+    runs-on: ubuntu-latest
+    container: ${{ matrix.distro.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar dependências do sistema
+        run: ${{ matrix.distro.deps }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # sem Swatinem/rust-cache aqui: containers rodam como root e a chave de
+      # cache colidiria com a do ubuntu-latest (mesmo runner.os=Linux)
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
+
+      - name: build
+        run: cargo build --workspace --release
+
   msrv:
     runs-on: ubuntu-latest
     steps:

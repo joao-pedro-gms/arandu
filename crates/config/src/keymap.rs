@@ -38,6 +38,8 @@ pub enum Action {
     TagFiles,
     Checksums,
     BatchRename,
+    Compress,
+    Extract,
 }
 
 impl Action {
@@ -61,11 +63,13 @@ impl Action {
             Self::TagFiles => "tag_files",
             Self::Checksums => "checksums",
             Self::BatchRename => "batch_rename",
+            Self::Compress => "compress",
+            Self::Extract => "extract",
         }
     }
 
     /// Todas as ações, na ordem canônica do arquivo.
-    pub const ALL: [Action; 17] = [
+    pub const ALL: [Action; 19] = [
         Self::TogglePreview,
         Self::TogglePanel,
         Self::NavigateUp,
@@ -83,6 +87,8 @@ impl Action {
         Self::TagFiles,
         Self::Checksums,
         Self::BatchRename,
+        Self::Compress,
+        Self::Extract,
     ];
 
     /// Converte um nome `snake_case` em ação.
@@ -355,6 +361,8 @@ fn default_bindings(action: Action) -> Vec<KeyBinding> {
         Action::TagFiles => vec![kb("F4")],
         Action::Checksums => vec![kb("F9")],
         Action::BatchRename => vec![kb("F7")],
+        Action::Compress => vec![kb("F8")],
+        Action::Extract => vec![kb("F10")],
     }
 }
 
@@ -379,11 +387,15 @@ fn vim_bindings(action: Action) -> Vec<KeyBinding> {
         Action::TagFiles => vec![kb("F4")],
         Action::Checksums => vec![kb("F9")],
         Action::BatchRename => vec![kb("F7")],
+        Action::Compress => vec![kb("F8")],
+        Action::Extract => vec![kb("F10")],
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{Action, KeyBinding, Keymap, Modifiers};
 
     #[test]
@@ -556,6 +568,14 @@ mod tests {
                 keymap.effective(Action::BatchRename),
                 vec![KeyBinding::key("F7")]
             );
+            assert_eq!(
+                keymap.effective(Action::Compress),
+                vec![KeyBinding::key("F8")]
+            );
+            assert_eq!(
+                keymap.effective(Action::Extract),
+                vec![KeyBinding::key("F10")]
+            );
         }
     }
 
@@ -569,5 +589,27 @@ mod tests {
             Action::from_name("batch_rename").expect("batch_rename"),
             Action::BatchRename
         );
+        assert_eq!(
+            Action::from_name("compress").expect("compress"),
+            Action::Compress
+        );
+        assert_eq!(
+            Action::from_name("extract").expect("extract"),
+            Action::Extract
+        );
+    }
+
+    #[test]
+    fn all_actions_are_unique_and_roundtrip() {
+        let mut names = BTreeSet::new();
+        for action in Action::ALL {
+            assert!(
+                names.insert(action.as_str()),
+                "duplicada: {}",
+                action.as_str()
+            );
+            assert_eq!(Action::from_name(action.as_str()).expect("ação"), action);
+        }
+        assert_eq!(names.len(), Action::ALL.len());
     }
 }

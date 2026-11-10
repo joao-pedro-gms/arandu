@@ -3868,21 +3868,22 @@ mod tests {
         harness.run();
 
         harness.key_press(egui::Key::F10);
-        harness.run();
+        harness.run_steps(1);
 
-        for _ in 0..200 {
-            if harness.state().extract_job.is_none() {
+        // O job em background mantém repaint contínuo, então `run()` (que
+        // espera a UI assentar) estouraria max_steps. Avança passos com teto
+        // até o diretório extraído aparecer.
+        let extracted = dir.path().join("pacote").join("fixture-file.txt");
+        for _ in 0..20 {
+            if extracted.is_file() && harness.state().extract_job.is_none() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
-            harness.run();
+            harness.run_steps(1);
         }
+        assert!(harness.state().extract_job.is_none());
         assert!(
-            harness.state().extract_job.is_none(),
-            "a extração não terminou a tempo"
-        );
-        assert!(
-            dir.path().join("pacote").join("fixture-file.txt").is_file(),
+            extracted.is_file(),
             "esperava o conteúdo extraído em pacote/"
         );
     }

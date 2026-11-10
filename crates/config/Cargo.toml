@@ -1,0 +1,15 @@
+[package]
+name = "arandu-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Configuração e temas do Arandu em TOML"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+toml.workspace = true
+directories.workspace = true

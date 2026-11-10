@@ -6,6 +6,7 @@ welcome_hint = "Your customizable file manager. Press Ctrl+Q to quit."
 menu = "Application menu"
 search = "Search"
 settings = "Settings"
+toggle_theme = "Switch theme"
 
 column_name = "Name"
 column_size = "Size"

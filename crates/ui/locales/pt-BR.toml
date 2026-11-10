@@ -6,6 +6,7 @@ welcome_hint = "Seu gerenciador de arquivos customizável. Pressione Ctrl+Q para
 menu = "Menu da aplicação"
 search = "Pesquisar"
 settings = "Configurações"
+toggle_theme = "Alternar tema"
 
 column_name = "Nome"
 column_size = "Tamanho"

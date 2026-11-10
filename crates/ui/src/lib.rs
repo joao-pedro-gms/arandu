@@ -23,6 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arandu_config::{
     Action, Config, KeyBinding, Keymap, Modifiers as KeyModifiers, TagsStore, Theme,
 };
+use arandu_core::archive::{self, ArchiveFormat};
 use arandu_core::batch::apply_pattern;
 use arandu_core::fs::{CoreError, Entry, format_size, list_dir};
 use arandu_core::hash::{md5_file, sha256_file};
@@ -445,6 +446,26 @@ struct BatchRenameDialog {
     pattern: String,
 }
 
+/// Diálogo de compressão (F8).
+///
+/// O nome digitado decide o formato pela extensão; o arquivo é criado no
+/// diretório do painel oposto, como em cópia/movimento.
+struct CompressDialog {
+    sources: Vec<PathBuf>,
+    destination_dir: PathBuf,
+    name: String,
+}
+
+/// Trabalho de compressão/extração em background.
+///
+/// A thread é independente da UI: o resultado chega pelo canal e é drenado em
+/// [`AranduApp::pump_archive_jobs`]. Fechar o diálogo não cancela o trabalho.
+struct ArchiveJob {
+    receiver: Receiver<(PathBuf, Result<(), String>)>,
+    /// Diretório a recarregar quando o trabalho terminar.
+    reload_dir: PathBuf,
+}
+
 /// Aplicação principal do Arandu.
 pub struct AranduApp {
     config: Config,
@@ -470,6 +491,12 @@ pub struct AranduApp {
     checksums: Option<ChecksumsDialog>,
     /// Diálogo de renomeação em lote aberto (F7).
     batch_rename: Option<BatchRenameDialog>,
+    /// Diálogo de compressão aberto (F8).
+    compress: Option<CompressDialog>,
+    /// Compressão em andamento (background).
+    compress_job: Option<ArchiveJob>,
+    /// Extração em andamento (background).
+    extract_job: Option<ArchiveJob>,
     /// Tags dos arquivos, persistidas em `tags.toml`.
     tags: TagsStore,
     /// Painel de pré-visualização (F3).
@@ -526,6 +553,9 @@ impl AranduApp {
             tag_editor: None,
             checksums: None,
             batch_rename: None,
+            compress: None,
+            compress_job: None,
+            extract_job: None,
             tags,
             preview: PreviewState::default(),
             theme,
@@ -555,6 +585,10 @@ impl AranduApp {
         self.pump_queue();
         self.pump_preview();
         self.pump_checksums();
+        self.pump_archive_jobs();
+        if self.compress_job.is_some() || self.extract_job.is_some() {
+            ctx.request_repaint();
+        }
         self.handle_keyboard(&ctx);
 
         // O `Ui` entregue pelo eframe 0.37 não tem margem nem fundo: pintamos o
@@ -780,6 +814,12 @@ impl AranduApp {
             }
             return;
         }
+        if self.compress.is_some() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.compress = None;
+            }
+            return;
+        }
 
         let pressed = pressed_keys(ctx);
 
@@ -812,6 +852,8 @@ impl AranduApp {
         let tag_files = self.action_pressed(Action::TagFiles, &pressed);
         let checksums = self.action_pressed(Action::Checksums, &pressed);
         let batch_rename = self.action_pressed(Action::BatchRename, &pressed);
+        let compress = self.action_pressed(Action::Compress, &pressed);
+        let extract = self.action_pressed(Action::Extract, &pressed);
 
         if toggle_preview {
             self.preview.visible = !self.preview.visible;
@@ -853,6 +895,12 @@ impl AranduApp {
         }
         if batch_rename {
             self.start_batch_rename();
+        }
+        if compress {
+            self.start_compress();
+        }
+        if extract {
+            self.start_extract();
         }
         if delete {
             self.request_delete();
@@ -1165,6 +1213,121 @@ impl AranduApp {
             Notice::error(text)
         });
         self.batch_rename = None;
+    }
+
+    /// Abre o diálogo de compressão para a seleção do painel ativo.
+    ///
+    /// O nome padrão é o do primeiro alvo com extensão `.zip`; o diretório de
+    /// destino é o painel oposto (mesmo padrão de cópia/movimento).
+    fn start_compress(&mut self) {
+        let sources = self.active_panel().selected_paths();
+        if sources.is_empty() {
+            self.ops.notice = Some(Notice::error(
+                rust_i18n::t!("compress_no_selection").to_string(),
+            ));
+            return;
+        }
+        let base = sources[0]
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "archive".to_owned());
+        self.compress = Some(CompressDialog {
+            sources,
+            destination_dir: self.other_cwd(),
+            name: format!("{base}.zip"),
+        });
+        self.ops.notice = None;
+    }
+
+    /// Inicia a compressão em background e fecha o diálogo.
+    fn begin_compress(&mut self, dialog: CompressDialog, name: String) {
+        let Some(format) = archive::detect_format(Path::new(&name)) else {
+            return;
+        };
+        let destination = dialog.destination_dir.join(&name);
+        let (sender, receiver) = mpsc::channel();
+        let sources = dialog.sources;
+        let thread_destination = destination.clone();
+        std::thread::spawn(move || {
+            let result = match format {
+                ArchiveFormat::Zip => archive::create_zip(&sources, &thread_destination),
+                ArchiveFormat::Tar => archive::create_tar(&sources, &thread_destination),
+            }
+            .map_err(|error| error.to_string());
+            // Canal descartado = app encerrado; a thread termina sozinha.
+            let _ = sender.send((thread_destination, result));
+        });
+        self.compress_job = Some(ArchiveJob {
+            receiver,
+            reload_dir: dialog.destination_dir,
+        });
+        self.ops.notice = Some(Notice::info(rust_i18n::t!("compressing").to_string()));
+    }
+
+    /// Extrai o item focado se for um arquivo suportado, em background.
+    ///
+    /// O destino é `<nome-sem-extensão>/` no mesmo diretório, com sufixo
+    /// numérico quando já existir.
+    fn start_extract(&mut self) {
+        if self.extract_job.is_some() {
+            return;
+        }
+        let (path, cwd, is_dir) = {
+            let panel = self.active_panel();
+            let Some(entry) = panel.entries.get(panel.focus) else {
+                return;
+            };
+            (entry.path.clone(), panel.cwd.clone(), entry.is_dir)
+        };
+        if is_dir {
+            self.ops.notice = Some(Notice::error(
+                rust_i18n::t!("extract_not_archive").to_string(),
+            ));
+            return;
+        }
+        if archive::detect_format(&path).is_none() {
+            self.ops.notice = Some(Notice::error(
+                rust_i18n::t!("extract_not_archive").to_string(),
+            ));
+            return;
+        }
+
+        let stem = archive_stem(&path);
+        let destination = ops::unique_destination(&cwd, &stem);
+        let (sender, receiver) = mpsc::channel();
+        let thread_archive = path.clone();
+        let thread_destination = destination.clone();
+        std::thread::spawn(move || {
+            let result = archive::extract(&thread_archive, &thread_destination)
+                .map_err(|error| error.to_string());
+            // Canal descartado = app encerrado; a thread termina sozinha.
+            let _ = sender.send((thread_destination, result));
+        });
+        self.extract_job = Some(ArchiveJob {
+            receiver,
+            reload_dir: cwd,
+        });
+        self.ops.notice = Some(Notice::info(rust_i18n::t!("extracting").to_string()));
+    }
+
+    /// Drena os trabalhos de compressão/extração sem bloquear.
+    fn pump_archive_jobs(&mut self) {
+        if let Some(job) = &self.compress_job
+            && let Ok((destination, result)) = job.receiver.try_recv()
+        {
+            let reload = job.reload_dir.clone();
+            self.compress_job = None;
+            self.ops.notice = Some(archive_notice(&destination, result, true));
+            self.reload_dir(&reload);
+        }
+        if let Some(job) = &self.extract_job
+            && let Ok((destination, result)) = job.receiver.try_recv()
+        {
+            let reload = job.reload_dir.clone();
+            self.extract_job = None;
+            self.ops.notice = Some(archive_notice(&destination, result, false));
+            self.reload_dir(&reload);
+        }
     }
 
     /// Recarrega os painéis que estão exibindo `dir`.
@@ -1843,6 +2006,61 @@ impl AranduApp {
                 }
             } else if !cancel {
                 self.tag_editor = Some(dialog);
+            }
+        }
+
+        if let Some(mut dialog) = self.compress.take() {
+            let mut submit = false;
+            let mut cancel = false;
+            egui::Modal::new(egui::Id::unique("compress-dialog")).show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                ui.heading(rust_i18n::t!("compress_title"));
+                ui.add_space(6.0);
+                ui.label(rust_i18n::t!("compress_output_label"));
+                let response = ui
+                    .add(egui::TextEdit::singleline(&mut dialog.name).desired_width(f32::INFINITY));
+                if !response.has_focus() {
+                    response.request_focus();
+                }
+                let valid = archive::detect_format(Path::new(dialog.name.trim())).is_some();
+                if !valid {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        rust_i18n::t!("compress_invalid_extension"),
+                    );
+                }
+                ui.label(
+                    RichText::new(rust_i18n::t!(
+                        "compress_destination",
+                        dir = dialog.destination_dir.display().to_string()
+                    ))
+                    .color(ui.visuals().weak_text_color()),
+                );
+                if ui.input(|input| input.key_pressed(Key::Enter)) {
+                    submit = true;
+                }
+                if ui.input(|input| input.key_pressed(Key::Escape)) {
+                    cancel = true;
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(valid, egui::Button::new(rust_i18n::t!("compress_ok")))
+                        .clicked()
+                    {
+                        submit = true;
+                    }
+                    if ui.button(rust_i18n::t!("cancel")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+            let name = dialog.name.trim().to_owned();
+            if submit && archive::detect_format(Path::new(&name)).is_some() {
+                self.begin_compress(dialog, name);
+            } else if !cancel {
+                self.compress = Some(dialog);
             }
         }
 
@@ -2781,6 +2999,8 @@ fn action_description(action: Action) -> String {
         Action::TagFiles => "action_tag_files",
         Action::Checksums => "action_checksums",
         Action::BatchRename => "action_batch_rename",
+        Action::Compress => "action_compress",
+        Action::Extract => "action_extract",
     };
     rust_i18n::t!(key).into_owned()
 }
@@ -2838,6 +3058,54 @@ fn validate_batch_renames(renames: &[(PathBuf, String, String)]) -> Option<Strin
         }
     }
     None
+}
+
+/// Extrai o nome-base de um arquivo de compressão, removendo a extensão.
+fn archive_stem(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let lower = name.to_ascii_lowercase();
+    let stem = [".tar.gz", ".tgz", ".zip", ".tar"]
+        .iter()
+        .find_map(|suffix| {
+            lower
+                .strip_suffix(suffix)
+                .map(|prefix| &name[..prefix.len()])
+        })
+        .unwrap_or(&name);
+    if stem.is_empty() {
+        "extracted".to_owned()
+    } else {
+        stem.to_owned()
+    }
+}
+
+/// Monta o aviso de conclusão/falha de um trabalho de arquivo.
+fn archive_notice(destination: &Path, result: Result<(), String>, compress: bool) -> Notice {
+    match result {
+        Ok(()) => {
+            let name = destination
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| destination.display().to_string());
+            let text = if compress {
+                rust_i18n::t!("compress_done", name = name)
+            } else {
+                rust_i18n::t!("extract_done", name = name)
+            };
+            Notice::info(text.to_string())
+        }
+        Err(error) => {
+            let text = if compress {
+                rust_i18n::t!("compress_failed", error = error)
+            } else {
+                rust_i18n::t!("extract_failed", error = error)
+            };
+            Notice::error(text.to_string())
+        }
+    }
 }
 
 /// Corta um texto longo para exibição, sinalizando com `…`.
@@ -3539,6 +3807,83 @@ mod tests {
                 .count()
                 >= 1,
             "esperava a pré-visualização sem mudança para o padrão inicial"
+        );
+    }
+
+    #[test]
+    fn compress_dialog_opens_with_default_zip_name() {
+        let (_dir, mut app) = fixture_app();
+        let index = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.name == "fixture-file.txt")
+            .expect("fixture tem fixture-file.txt");
+        app.left.select(index, false);
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .with_accessibility_check(false)
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        harness.key_press(egui::Key::F8);
+        harness.run();
+
+        let dialog = harness
+            .state()
+            .compress
+            .as_ref()
+            .expect("F8 deveria abrir o diálogo de compressão");
+        assert_eq!(dialog.name, "fixture-file.txt.zip");
+        assert_eq!(dialog.destination_dir, dialog.sources[0].parent().unwrap());
+
+        let title = rust_i18n::t!("compress_title").to_string();
+        assert!(
+            harness.query_all_by_label(&title).count() >= 1,
+            "esperava o diálogo '{title}'"
+        );
+    }
+
+    #[test]
+    fn extract_action_creates_directory_in_same_panel() {
+        let (dir, mut app) = fixture_app();
+        let archive = dir.path().join("pacote.zip");
+        arandu_core::archive::create_zip(&[dir.path().join("fixture-file.txt")], &archive)
+            .expect("cria o zip de teste");
+        app.right.reload();
+
+        let index = app
+            .right
+            .entries
+            .iter()
+            .position(|entry| entry.name == "pacote.zip")
+            .expect("fixture tem pacote.zip");
+        app.right.select(index, false);
+        app.active = PanelSide::Right;
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        harness.key_press(egui::Key::F10);
+        harness.run();
+
+        for _ in 0..200 {
+            if harness.state().extract_job.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run();
+        }
+        assert!(
+            harness.state().extract_job.is_none(),
+            "a extração não terminou a tempo"
+        );
+        assert!(
+            dir.path().join("pacote").join("fixture-file.txt").is_file(),
+            "esperava o conteúdo extraído em pacote/"
         );
     }
 }

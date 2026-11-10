@@ -14,9 +14,9 @@ O roadmap detalhado com justificativas vive em [SCOPE.md](SCOPE.md). Esta págin
 - [x] Temas TOML + configuração + keymap redefinível (preset Vim)
 - [x] i18n desde o dia 1 (todas as strings via sistema de tradução) <!-- PR #1: rust-i18n en/pt-BR -->
 - [x] Tags nos arquivos (storage simples; banco na fase 2) <!-- PR #8: TagsStore TOML, editor F4, chips -->
-- [ ] Screenshot tests com egui_kittest no CI
+- [x] Screenshot tests com egui_kittest no CI <!-- job `screenshot` com lavapipe -->
 - [x] Ferramentas: compressão (zip/tar), checksums (SHA-256/MD5), rename em lote <!-- PRs #9 e #10; 7z fora: sem crate madura -->
-- [ ] justfile (check, test, screenshot, release) + cargo-hack
+- [x] justfile (check, test, screenshot, release) + cargo-hack <!-- job `features` (powerset) -->
 - [x] CI verde: fmt, clippy `-D warnings`, testes (Ubuntu + Windows) + job MSRV (N-2) + cargo-deny <!-- PR #1 -->
 
 ## Fase 2 — Diferenciais

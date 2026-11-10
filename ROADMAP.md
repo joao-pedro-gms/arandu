@@ -13,7 +13,7 @@ O roadmap detalhado com justificativas vive em [SCOPE.md](SCOPE.md). Esta págin
 - [x] Preview pane: texto com syntax highlight (syntect), imagens <!-- PR #5: F3, cache LRU; PDF pendente fase 2 -->
 - [x] Temas TOML + configuração + keymap redefinível (preset Vim)
 - [x] i18n desde o dia 1 (todas as strings via sistema de tradução) <!-- PR #1: rust-i18n en/pt-BR -->
-- [ ] Tags nos arquivos (storage simples; banco na fase 2)
+- [x] Tags nos arquivos (storage simples; banco na fase 2) <!-- PR #8: TagsStore TOML, editor F4, chips -->
 - [ ] Screenshot tests com egui_kittest no CI
 - [ ] Ferramentas: compressão (zip/tar/7z), checksums, rename em lote
 - [ ] justfile (check, test, screenshot, release) + cargo-hack

@@ -12,6 +12,8 @@ description = "Operações de filesystem e tipos base do Arandu"
 thiserror.workspace = true
 trash.workspace = true
 image.workspace = true
+sha2.workspace = true
+md-5.workspace = true
 
 [dev-dependencies]
 tempfile = "3.27.0"

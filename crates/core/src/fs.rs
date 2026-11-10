@@ -50,7 +50,7 @@ pub enum CoreError {
 }
 
 impl CoreError {
-    fn from_io(path: &Path, source: std::io::Error) -> Self {
+    pub(crate) fn from_io(path: &Path, source: std::io::Error) -> Self {
         match source.kind() {
             std::io::ErrorKind::NotFound => Self::NotFound {
                 path: path.to_path_buf(),

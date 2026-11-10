@@ -28,7 +28,9 @@ use arandu_core::batch::apply_pattern;
 use arandu_core::fs::{CoreError, Entry, format_size, list_dir};
 use arandu_core::hash::{md5_file, sha256_file};
 use arandu_core::ops::{self, Op, OpKind, OpsError, Progress};
-use arandu_core::preview::{PreviewContent, PreviewError, PreviewRequest, UnsupportedReason};
+use arandu_core::preview::{
+    PreviewContent, PreviewError, PreviewRequest, UnsupportedReason, hex_row,
+};
 use arandu_core::queue::{OpQueue, QueueEvent, UndoStack};
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Key, Label, Layout, Modifiers, Rect, RichText,
@@ -72,6 +74,10 @@ const PREVIEW_MIN_W: f32 = 200.0;
 const PREVIEW_MAX_FRACTION: f32 = 0.6;
 /// Entradas mantidas no cache de preview (LRU simples).
 const PREVIEW_CACHE_CAP: usize = 20;
+/// Bytes por linha no hex dump.
+const HEX_ROW_BYTES: usize = 16;
+/// Máximo de linhas de dados exibidas na tabela CSV.
+const CSV_MAX_ROWS: usize = 1000;
 /// Teto de linhas renderizadas com syntax highlight.
 ///
 /// Um arquivo de 1 MiB pode ter dezenas de milhares de linhas; construir e
@@ -454,8 +460,10 @@ struct PreviewState {
     receiver: Option<Receiver<(PreviewKey, Result<PreviewContent, PreviewError>)>>,
     /// Job de highlight do preview de texto atual.
     job: Option<(PreviewKey, bool, Arc<egui::text::LayoutJob>)>,
-    /// Textura da imagem atual.
+    /// Textura da imagem/PDF atual.
     texture: Option<(PreviewKey, egui::TextureHandle)>,
+    /// Cache de layout/renderização do Markdown.
+    markdown_cache: egui_commonmark::CommonMarkCache,
 }
 
 /// Conjunto padrão de sintaxes (carregado uma única vez).
@@ -1683,6 +1691,7 @@ impl AranduApp {
             .into_iter()
             .next()
             .map(|binding| format!("{binding} {}", action_description(Action::TogglePreview)));
+        let kind_label = entry.and_then(|entry| self.preview_kind_label(entry));
         ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             let header = ui.allocate_ui_with_layout(
@@ -1690,6 +1699,18 @@ impl AranduApp {
                 Layout::left_to_right(Align::Center),
                 |ui| {
                     ui.label(RichText::new(rust_i18n::t!("preview_title")).strong());
+                    if let Some(kind) = &kind_label {
+                        ui.label(
+                            RichText::new("·")
+                                .size(12.5)
+                                .color(visuals.weak_text_color()),
+                        );
+                        ui.label(
+                            RichText::new(kind)
+                                .size(12.5)
+                                .color(visuals.weak_text_color()),
+                        );
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if let Some(hint) = &toggle_hint {
                             ui.label(
@@ -1756,8 +1777,25 @@ impl AranduApp {
                         syntax_name.as_deref(),
                     );
                 }
+                PreviewContent::Markdown { text, truncated } => {
+                    self.draw_preview_markdown(ui, body, text, *truncated);
+                }
+                PreviewContent::Hex {
+                    bytes, truncated, ..
+                } => {
+                    self.draw_preview_hex(ui, body, bytes, *truncated);
+                }
+                PreviewContent::Csv { text, truncated } => {
+                    self.draw_preview_csv(ui, body, text, *truncated);
+                }
+                PreviewContent::Json { text, truncated } => {
+                    self.draw_preview_text(ui, body, &key, text, *truncated, Some("json"));
+                }
                 PreviewContent::Image { image, .. } => {
                     self.draw_preview_image(ui, body, &key, image, visuals);
+                }
+                PreviewContent::Pdf { page, .. } => {
+                    self.draw_preview_rgba(ui, body, &key, page, visuals);
                 }
                 PreviewContent::Unsupported { reason } => {
                     ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
@@ -1840,12 +1878,171 @@ impl AranduApp {
         });
     }
 
+    /// Rótulo do tipo detectado exibido no header do painel.
+    fn preview_kind_label(&self, entry: &Entry) -> Option<String> {
+        if entry.is_dir {
+            return Some(rust_i18n::t!("preview_kind_directory").to_string());
+        }
+        let key = PreviewKey::for_entry(entry);
+        let PreviewEntry::Ready(content) = self.preview.cache.get(&key)? else {
+            return None;
+        };
+        Some(match &*content {
+            PreviewContent::Text { .. } => rust_i18n::t!("preview_kind_text").to_string(),
+            PreviewContent::Markdown { .. } => rust_i18n::t!("preview_kind_markdown").to_string(),
+            PreviewContent::Hex { .. } => rust_i18n::t!("preview_kind_hex").to_string(),
+            PreviewContent::Csv { .. } => rust_i18n::t!("preview_kind_csv").to_string(),
+            PreviewContent::Json { .. } => rust_i18n::t!("preview_kind_json").to_string(),
+            PreviewContent::Image { .. } => rust_i18n::t!("preview_kind_image").to_string(),
+            PreviewContent::Pdf { page_count, .. } => format!(
+                "{} — {}",
+                rust_i18n::t!("preview_kind_pdf"),
+                rust_i18n::t!("preview_pdf_pages", count => *page_count)
+            ),
+            PreviewContent::Unsupported { .. } => return None,
+        })
+    }
+
+    fn draw_preview_markdown(&mut self, ui: &mut Ui, body: Rect, text: &str, truncated: bool) {
+        let cache = &mut self.preview.markdown_cache;
+        ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
+            if truncated {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(rust_i18n::t!("preview_truncated"))
+                        .size(12.5)
+                        .color(ui.visuals().warn_fg_color),
+                );
+            }
+            ScrollArea::vertical()
+                .id_salt("preview-markdown")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add_space(4.0);
+                    egui_commonmark::CommonMarkViewer::new().show(ui, cache, text);
+                    ui.add_space(8.0);
+                });
+        });
+    }
+
+    fn draw_preview_hex(&mut self, ui: &mut Ui, body: Rect, bytes: &[u8], truncated: bool) {
+        ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
+            if truncated {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(rust_i18n::t!("preview_truncated"))
+                        .size(12.5)
+                        .color(ui.visuals().warn_fg_color),
+                );
+            }
+            let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+            let rows = bytes.len().div_ceil(HEX_ROW_BYTES);
+            let visuals = ui.visuals().clone();
+            ScrollArea::vertical()
+                .id_salt("preview-hex")
+                .auto_shrink([false, false])
+                .show_rows(ui, row_height, rows, |ui, row_range| {
+                    for row in row_range {
+                        let offset = row * HEX_ROW_BYTES;
+                        let end = (offset + HEX_ROW_BYTES).min(bytes.len());
+                        let (offset_text, hex_text, ascii_text) =
+                            hex_row(offset, &bytes[offset..end]);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 12.0;
+                            ui.label(
+                                RichText::new(offset_text)
+                                    .monospace()
+                                    .color(visuals.weak_text_color()),
+                            );
+                            ui.label(RichText::new(hex_text).monospace());
+                            ui.label(
+                                RichText::new(ascii_text)
+                                    .monospace()
+                                    .color(visuals.weak_text_color()),
+                            );
+                        });
+                    }
+                });
+        });
+    }
+
+    fn draw_preview_csv(&mut self, ui: &mut Ui, body: Rect, text: &str, truncated: bool) {
+        ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
+            if truncated {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(rust_i18n::t!("preview_truncated"))
+                        .size(12.5)
+                        .color(ui.visuals().warn_fg_color),
+                );
+            }
+            let mut lines = text.lines();
+            let Some(header) = lines.next() else {
+                return;
+            };
+            let delimiter = if header.contains('\t') && !header.contains(',') {
+                '\t'
+            } else {
+                ','
+            };
+            let headers = parse_csv_row(header, delimiter);
+            let rows: Vec<Vec<String>> = lines
+                .take(CSV_MAX_ROWS + 1)
+                .map(|line| parse_csv_row(line, delimiter))
+                .collect();
+            let capped = rows.len() > CSV_MAX_ROWS;
+            ScrollArea::both()
+                .id_salt("preview-csv")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::Grid::new("preview-csv-grid")
+                        .striped(true)
+                        .min_col_width(32.0)
+                        .show(ui, |ui| {
+                            for field in &headers {
+                                ui.label(RichText::new(field.as_str()).strong());
+                            }
+                            ui.end_row();
+                            for row in rows.iter().take(CSV_MAX_ROWS) {
+                                for field in row {
+                                    ui.label(if field.is_empty() { " " } else { field });
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    if capped {
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(rust_i18n::t!(
+                                "preview_csv_limit",
+                                count => CSV_MAX_ROWS
+                            ))
+                            .size(12.5)
+                            .color(ui.visuals().warn_fg_color),
+                        );
+                    }
+                });
+        });
+    }
+
     fn draw_preview_image(
         &mut self,
         ui: &mut Ui,
         body: Rect,
         key: &PreviewKey,
         image: &image::DynamicImage,
+        visuals: &egui::Visuals,
+    ) {
+        let rgba = image.to_rgba8();
+        self.draw_preview_rgba(ui, body, key, &rgba, visuals);
+    }
+
+    fn draw_preview_rgba(
+        &mut self,
+        ui: &mut Ui,
+        body: Rect,
+        key: &PreviewKey,
+        rgba: &image::RgbaImage,
         _visuals: &egui::Visuals,
     ) {
         let stale = self
@@ -1855,7 +2052,6 @@ impl AranduApp {
             .map(|(cached_key, _)| cached_key != key)
             .unwrap_or(true);
         if stale {
-            let rgba = image.to_rgba8();
             let color = egui::ColorImage::from_rgba_unmultiplied(
                 [rgba.width() as usize, rgba.height() as usize],
                 rgba.as_raw(),
@@ -1874,8 +2070,8 @@ impl AranduApp {
         let texture = texture.clone();
 
         let available = body.size() - vec2(0.0, 8.0);
-        let width = image.width() as f32;
-        let height = image.height() as f32;
+        let width = rgba.width() as f32;
+        let height = rgba.height() as f32;
         let scale = (available.x / width)
             .min(available.y / height)
             .clamp(0.01, 1.0);
@@ -3030,8 +3226,39 @@ fn preview_reason(reason: UnsupportedReason) -> String {
         UnsupportedReason::Directory => "preview_reason_directory",
         UnsupportedReason::Binary => "preview_reason_binary",
         UnsupportedReason::TooLarge => "preview_reason_too_large",
+        UnsupportedReason::Pdf => "preview_reason_pdf",
     };
     rust_i18n::t!(key).to_string()
+}
+
+/// Divide uma linha CSV/TSV em campos, tratando aspas duplas básicas.
+fn parse_csv_row(line: &str, delimiter: char) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if quoted {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    quoted = false;
+                }
+            } else {
+                field.push(ch);
+            }
+        } else if ch == '"' && field.is_empty() {
+            quoted = true;
+        } else if ch == delimiter {
+            fields.push(std::mem::take(&mut field));
+        } else {
+            field.push(ch);
+        }
+    }
+    fields.push(field);
+    fields
 }
 
 /// Constrói o `LayoutJob` com syntax highlight (ou monospace puro).
@@ -3496,6 +3723,19 @@ impl AranduApp {
         }
     }
 
+    /// Markdown bruto do preview focado — usado em testes.
+    #[cfg(test)]
+    fn preview_markdown(&self) -> Option<String> {
+        let key = self.focused_preview_key()?;
+        match self.preview.cache.get(&key)? {
+            PreviewEntry::Ready(content) => match &*content {
+                PreviewContent::Markdown { text, .. } => Some(text.clone()),
+                _ => None,
+            },
+            PreviewEntry::Failed(_) => None,
+        }
+    }
+
     /// Se o cálculo de checksums terminou — usado em testes.
     #[cfg(test)]
     fn checksums_done(&self) -> bool {
@@ -3816,6 +4056,101 @@ mod tests {
             0,
             "o painel de preview deveria sumir ao pressionar F3 novamente"
         );
+    }
+
+    #[test]
+    fn parse_csv_row_handles_quotes_and_delimiter() {
+        assert_eq!(
+            super::parse_csv_row("a,\"b,c\",\"d\"\"e\"", ','),
+            vec!["a", "b,c", "d\"e"]
+        );
+        assert_eq!(super::parse_csv_row("a\tb", '\t'), vec!["a", "b"]);
+    }
+
+    fn preview_app_for(name: &str, bytes: &[u8]) -> (tempfile::TempDir, AranduApp) {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        fs::write(dir.path().join(name), bytes).expect("cria arquivo de fixture");
+        let mut app = AranduApp::new_at(Config::default(), dir.path());
+        let index = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.name == name)
+            .expect("fixture contém o arquivo");
+        app.left.select(index, false);
+        (dir, app)
+    }
+
+    fn wait_for_preview(harness: &mut Harness<'_, AranduApp>) {
+        for _ in 0..200 {
+            if harness.state().preview_ready() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run();
+        }
+    }
+
+    #[test]
+    fn preview_markdown_shows_raw_text_and_kind() {
+        let (_dir, app) = preview_app_for("README.md", b"# Titulo\n\n- item\n");
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        harness.key_press(egui::Key::F3);
+        harness.run();
+        wait_for_preview(&mut harness);
+
+        assert_eq!(
+            harness.state().preview_markdown().as_deref(),
+            Some("# Titulo\n\n- item\n")
+        );
+        let kind = rust_i18n::t!("preview_kind_markdown").to_string();
+        assert!(
+            harness.query_all_by_label(&kind).count() >= 1,
+            "esperava o tipo '{kind}' no header do preview"
+        );
+    }
+
+    #[test]
+    fn preview_csv_draws_table_and_kind() {
+        let (_dir, app) = preview_app_for("dados.csv", b"nome,idade\nAna,30\n");
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        harness.key_press(egui::Key::F3);
+        harness.run();
+        wait_for_preview(&mut harness);
+
+        for label in ["nome", "idade", "Ana", "30"] {
+            assert!(
+                harness.query_all_by_label(label).count() >= 1,
+                "esperava a célula '{label}' na tabela CSV"
+            );
+        }
+        let kind = rust_i18n::t!("preview_kind_csv").to_string();
+        assert!(harness.query_all_by_label(&kind).count() >= 1);
+    }
+
+    #[test]
+    fn preview_hex_shows_offsets() {
+        let (_dir, app) = preview_app_for("dados.bin", &[0u8; 20]);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        harness.key_press(egui::Key::F3);
+        harness.run();
+        wait_for_preview(&mut harness);
+
+        for offset in ["00000000", "00000010"] {
+            assert!(
+                harness.query_all_by_label(offset).count() >= 1,
+                "esperava o offset '{offset}' no hex dump"
+            );
+        }
     }
 
     #[test]

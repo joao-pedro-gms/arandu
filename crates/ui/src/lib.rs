@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arandu_config::Config;
+use arandu_config::{Action, Config, KeyBinding, Keymap, Modifiers as KeyModifiers, Theme};
 use arandu_core::fs::{CoreError, Entry, format_size, list_dir};
 use arandu_core::ops::{self, Op, OpKind, OpsError, Progress};
 use arandu_core::preview::{PreviewContent, PreviewError, PreviewRequest, UnsupportedReason};
@@ -417,6 +417,10 @@ pub struct AranduApp {
     rename: Option<RenameDialog>,
     /// Painel de pré-visualização (F3).
     preview: PreviewState,
+    /// Tema resolvido (config + arquivo de tema), aplicado no primeiro frame.
+    theme: Theme,
+    /// Atalhos redefiníveis (preset + overrides).
+    keymap: Keymap,
     /// Congela a drenagem da fila em testes determinísticos de progresso.
     #[cfg(test)]
     injected_ops: bool,
@@ -433,6 +437,14 @@ impl AranduApp {
     pub fn new_at(config: Config, dir: impl Into<PathBuf>) -> Self {
         rust_i18n::set_locale(&config.locale);
         let dir = dir.into();
+        #[cfg(test)]
+        let keymap = Keymap::default();
+        #[cfg(not(test))]
+        let keymap = Keymap::load().unwrap_or_else(|error| {
+            eprintln!("arandu: keymap inválido, usando o preset padrão: {error}");
+            Keymap::default()
+        });
+        let theme = config.resolved_theme();
         Self {
             config,
             left: PanelState::new(dir.clone()),
@@ -446,6 +458,8 @@ impl AranduApp {
             delete_confirm: None,
             rename: None,
             preview: PreviewState::default(),
+            theme,
+            keymap,
             #[cfg(test)]
             injected_ops: false,
         }
@@ -506,14 +520,15 @@ impl AranduApp {
     }
 
     fn apply_theme(&self, ctx: &egui::Context) {
-        let theme = if self.config.theme.dark {
+        let theme = &self.theme;
+        let egui_theme = if theme.dark {
             egui::Theme::Dark
         } else {
             egui::Theme::Light
         };
-        ctx.set_theme(theme);
+        ctx.set_theme(egui_theme);
 
-        let mut style = (*ctx.style_of(theme)).clone();
+        let mut style = (*ctx.style_of(egui_theme)).clone();
         style
             .text_styles
             .insert(TextStyle::Body, FontId::proportional(14.0));
@@ -524,22 +539,97 @@ impl AranduApp {
             .text_styles
             .insert(TextStyle::Small, FontId::proportional(12.5));
 
-        let mut visuals = if self.config.theme.dark {
+        let mut visuals = if theme.dark {
             egui::Visuals::dark()
         } else {
             egui::Visuals::light()
         };
 
-        if let Some(accent) = parse_hex_color(&self.config.theme.accent) {
+        let color = |value: &Option<String>| value.as_deref().and_then(parse_hex_color);
+        let background = color(&theme.background);
+        let panel = color(&theme.panel);
+        let text = color(&theme.text);
+        let text_muted = color(&theme.text_muted);
+        let border = color(&theme.border);
+
+        // Fundos: a janela e as barras usam `background`; os painéis, `panel`.
+        if let Some(fill) = background.or(panel) {
+            visuals.window_fill = fill;
+            visuals.faint_bg_color = fill;
+        }
+        if let Some(fill) = panel.or(background) {
+            visuals.panel_fill = fill;
+        }
+
+        if let Some(text) = text {
+            visuals.override_text_color = Some(text);
+            visuals.widgets.noninteractive.fg_stroke.color = text;
+            visuals.widgets.inactive.fg_stroke.color = text;
+        }
+        if let Some(muted) = text_muted {
+            visuals.weak_text_color = Some(muted);
+        }
+
+        if let Some(accent) = parse_hex_color(&theme.accent) {
             visuals.selection.bg_fill = with_alpha(accent, SELECTION_ALPHA);
             visuals.selection.stroke = Stroke::new(1.0, accent);
             visuals.hyperlink_color = accent;
+            visuals.widgets.active.bg_stroke = Stroke::new(1.0, accent);
+        }
+
+        if let Some(border) = border {
+            let stroke = Stroke::new(1.0, border);
+            visuals.widgets.noninteractive.bg_stroke = stroke;
+            visuals.window_stroke = stroke;
+        }
+
+        // Superfícies de widgets derivadas do fundo com contraste previsível,
+        // em vez de reaproveitar os cinzas fixos do egui.
+        let base = panel.or(background);
+        let towards = text.unwrap_or(visuals.text_color());
+        if let Some(base) = base {
+            let tint = |amount: f32| mix_color(base, towards, amount);
+            visuals.widgets.noninteractive.bg_fill = base;
+            visuals.widgets.noninteractive.weak_bg_fill = base;
+            visuals.widgets.inactive.bg_fill = tint(0.14);
+            visuals.widgets.inactive.weak_bg_fill = tint(0.10);
+            visuals.widgets.hovered.bg_fill = tint(0.20);
+            visuals.widgets.hovered.weak_bg_fill = tint(0.16);
+            visuals.widgets.active.bg_fill = tint(0.28);
+            visuals.widgets.active.weak_bg_fill = tint(0.24);
         }
 
         // O estilo é por tema no egui 0.37; um único ponto de configuração
-        // concentra tema + tipografia + accent.
+        // concentra tema + tipografia + paleta.
         style.visuals = visuals;
-        ctx.set_style_of(theme, style);
+        ctx.set_style_of(egui_theme, style);
+    }
+
+    /// Alterna para o próximo tema disponível e persiste a escolha.
+    fn cycle_theme(&mut self, ctx: &egui::Context) {
+        let available = Theme::available();
+        if available.is_empty() {
+            return;
+        }
+        let current = available
+            .iter()
+            .position(|theme| theme.name == self.config.theme.name)
+            .map_or(0, |index| (index + 1) % available.len());
+        self.config.theme = available[current].clone();
+        self.theme = self.config.theme.clone();
+        self.apply_theme(ctx);
+        #[cfg(not(test))]
+        if let Err(error) = self.config.save() {
+            eprintln!("arandu: não foi possível salvar o tema: {error}");
+        }
+    }
+
+    /// Alguma tecla pressionada no frame casa com os bindings da ação?
+    fn action_pressed(&self, action: Action, pressed: &[KeyBinding]) -> bool {
+        self.keymap
+            .effective(action)
+            .iter()
+            .any(|binding| pressed.iter().any(|key| binding.matches(key)))
     }
 
     fn active_panel(&self) -> &PanelState {
@@ -556,12 +646,11 @@ impl AranduApp {
         }
     }
 
-    /// Trata atalhos globais antes de desenhar os widgets.
+    /// Trata atalhos globais antes de desenhar os widgets, casando as teclas
+    /// pressionadas no frame contra o `Keymap` efetivo.
     ///
-    /// Nenhum widget desta etapa usa `Sense::click()`/`menu_button` (todos os
-    /// clicáveis são `Label` com `Sense::CLICK`, não focáveis), então o Tab do
-    /// egui não tem widgets para onde pular e podemos consumi-lo com segurança.
-    /// Com um diálogo aberto, os atalhos globais ficam suspensos.
+    /// Com um diálogo de confirmação aberto, Enter/Escape continuam fixos.
+    /// Com a renomeação aberta, a digitação vai para o `TextEdit`.
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
         if self.delete_confirm.is_some() {
             let (enter, escape) = ctx.input_mut(|i| {
@@ -583,30 +672,28 @@ impl AranduApp {
             return;
         }
 
-        let toggle_preview = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F3));
+        let pressed = pressed_keys(ctx);
+
+        let toggle_preview = self.action_pressed(Action::TogglePreview, &pressed);
+        let toggle_panel = self.action_pressed(Action::TogglePanel, &pressed);
+        let up = self.action_pressed(Action::NavigateUp, &pressed);
+        let down = self.action_pressed(Action::NavigateDown, &pressed);
+        let enter = self.action_pressed(Action::Enter, &pressed);
+        let back = self.action_pressed(Action::GoBack, &pressed);
+        let copy = self.action_pressed(Action::Copy, &pressed);
+        let moving = self.action_pressed(Action::Move, &pressed);
+        let rename = self.action_pressed(Action::Rename, &pressed);
+        let delete = self.action_pressed(Action::Delete, &pressed);
+        let undo = self.action_pressed(Action::Undo, &pressed);
+        let cycle_theme = self.action_pressed(Action::CycleTheme, &pressed);
+        let quit = self.action_pressed(Action::Quit, &pressed);
+
         if toggle_preview {
             self.preview.visible = !self.preview.visible;
         }
-
-        let tab = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab));
-        if tab {
+        if toggle_panel {
             self.active = self.active.other();
-            return;
         }
-
-        let (up, down, enter, back, copy, moving, rename, delete, undo) = ctx.input_mut(|i| {
-            (
-                i.consume_key(Modifiers::NONE, Key::ArrowUp),
-                i.consume_key(Modifiers::NONE, Key::ArrowDown),
-                i.consume_key(Modifiers::NONE, Key::Enter),
-                i.consume_key(Modifiers::NONE, Key::Backspace),
-                i.consume_key(Modifiers::NONE, Key::F5),
-                i.consume_key(Modifiers::NONE, Key::F6),
-                i.consume_key(Modifiers::NONE, Key::F2),
-                i.consume_key(Modifiers::NONE, Key::Delete),
-                i.consume_key(Modifiers::CTRL, Key::Z),
-            )
-        });
 
         {
             let panel = self.active_panel_mut();
@@ -638,6 +725,12 @@ impl AranduApp {
         }
         if undo {
             self.undo_last();
+        }
+        if cycle_theme {
+            self.cycle_theme(ctx);
+        }
+        if quit {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -861,6 +954,19 @@ impl AranduApp {
                     ui.label(RichText::new(APP_NAME).strong());
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let theme_button = ui
+                            .add(
+                                Label::new(
+                                    RichText::new(self.config.theme.name.clone())
+                                        .size(12.5)
+                                        .color(ui.visuals().weak_text_color()),
+                                )
+                                .sense(Sense::CLICK),
+                            )
+                            .on_hover_text(rust_i18n::t!("toggle_theme"));
+                        if theme_button.clicked() {
+                            self.cycle_theme(ui.ctx());
+                        }
                         let settings = ui
                             .add(Label::new(rust_i18n::t!("settings")).sense(Sense::CLICK))
                             .on_hover_text(rust_i18n::t!("settings"));
@@ -877,7 +983,7 @@ impl AranduApp {
 
     fn draw_content(&mut self, ui: &mut Ui, content: Rect) {
         let visuals = ui.visuals().clone();
-        let accent = accent_color(&self.config, &visuals);
+        let accent = accent_color(&self.theme, &visuals);
 
         // O preview fica fixo à direita; os dois painéis dividem o restante.
         let preview_w = if self.preview.visible {
@@ -1872,8 +1978,8 @@ fn draw_error(ui: &mut Ui, error: &CoreError, visuals: &egui::Visuals) {
 }
 
 /// Cor accent configurada, com fallback para a cor de destaque do tema.
-fn accent_color(config: &Config, visuals: &egui::Visuals) -> Color32 {
-    parse_hex_color(&config.theme.accent).unwrap_or(visuals.selection.bg_fill)
+fn accent_color(theme: &Theme, visuals: &egui::Visuals) -> Color32 {
+    parse_hex_color(&theme.accent).unwrap_or(visuals.selection.bg_fill)
 }
 
 /// Texto secundário, atenuado a 60% quando o painel está inativo.
@@ -1954,6 +2060,65 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// Substitui apenas o alpha, preservando RGB.
 fn with_alpha(color: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+}
+
+/// Mistura `from` em direção a `to` por `amount` (0..=1).
+fn mix_color(from: Color32, to: Color32, amount: f32) -> Color32 {
+    let t = amount.clamp(0.0, 1.0);
+    let blend = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    Color32::from_rgb(
+        blend(from.r(), to.r()),
+        blend(from.g(), to.g()),
+        blend(from.b(), to.b()),
+    )
+}
+
+/// Converte um `Key` do egui no nome usado pelo keymap.
+fn key_name(key: Key) -> String {
+    match key {
+        Key::Num0 => "0".to_owned(),
+        Key::Num1 => "1".to_owned(),
+        Key::Num2 => "2".to_owned(),
+        Key::Num3 => "3".to_owned(),
+        Key::Num4 => "4".to_owned(),
+        Key::Num5 => "5".to_owned(),
+        Key::Num6 => "6".to_owned(),
+        Key::Num7 => "7".to_owned(),
+        Key::Num8 => "8".to_owned(),
+        Key::Num9 => "9".to_owned(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Teclas pressionadas neste frame, no vocabulário do [`Keymap`].
+fn pressed_keys(ctx: &egui::Context) -> Vec<KeyBinding> {
+    ctx.input(|input| {
+        input
+            .events
+            .iter()
+            .filter_map(|event| {
+                if let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = event
+                {
+                    Some(KeyBinding {
+                        mods: KeyModifiers {
+                            ctrl: modifiers.ctrl,
+                            alt: modifiers.alt,
+                            shift: modifiers.shift,
+                            logo: modifiers.mac_cmd,
+                        },
+                        key: key_name(*key),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    })
 }
 
 /// Interpreta `#rrggbb` (o `#` é opcional).
@@ -2313,5 +2478,50 @@ mod tests {
             0,
             "o painel de preview deveria sumir ao pressionar F3 novamente"
         );
+    }
+
+    #[test]
+    fn clicking_theme_button_cycles_active_theme() {
+        let (_dir, app) = fixture_app();
+        let initial = app.config().theme.name.clone();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        let button = harness
+            .query_by_label(&initial)
+            .expect("botão do tema na toolbar");
+        button.click();
+        harness.run();
+
+        let current = harness.state().config().theme.name.clone();
+        assert_ne!(current, initial, "o clique deveria trocar o tema ativo");
+        assert!(
+            harness.query_all_by_label(&current).count() >= 1,
+            "a toolbar deveria exibir o novo tema '{current}'"
+        );
+    }
+
+    #[test]
+    fn vim_preset_navigates_with_j_and_k() {
+        let (_dir, mut app) = fixture_app();
+        app.keymap.preset = "vim".to_owned();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        let start = harness.state().left.focus;
+        harness.key_press(egui::Key::J);
+        harness.run();
+        assert_eq!(harness.state().left.focus, start + 1);
+        harness.key_press(egui::Key::K);
+        harness.run();
+        assert_eq!(harness.state().left.focus, start);
+        // Tab continua alternando o painel no preset vim.
+        harness.key_press(egui::Key::Tab);
+        harness.run();
+        assert_eq!(harness.state().active_side(), PanelSide::Right);
     }
 }

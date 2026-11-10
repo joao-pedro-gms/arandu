@@ -11,7 +11,7 @@ O roadmap detalhado com justificativas vive em [SCOPE.md](SCOPE.md). Esta págin
 - [x] Operações: copiar/mover/renomear/deletar com **fila + progresso** <!-- PR #4 -->
 - [x] **Undo** de operações + **lixeira** do SO <!-- PR #4: undo sem redo (decisão) -->
 - [x] Preview pane: texto com syntax highlight (syntect), imagens <!-- PR #5: F3, cache LRU; PDF pendente fase 2 -->
-- [ ] Temas TOML + configuração + keymap redefinível (preset Vim)
+- [x] Temas TOML + configuração + keymap redefinível (preset Vim)
 - [ ] i18n desde o dia 1 (todas as strings via sistema de tradução)
 - [ ] Tags nos arquivos (storage simples; banco na fase 2)
 - [ ] Screenshot tests com egui_kittest no CI

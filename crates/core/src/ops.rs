@@ -87,11 +87,18 @@ pub struct Progress {
 
 impl Progress {
     /// Fração concluída em `0.0..=1.0`, tolerante a estimativas desatualizadas.
+    ///
+    /// Usa bytes quando disponíveis (progresso mais suave em árvores com
+    /// arquivos de tamanhos diferentes) e cai para contagem de arquivos quando
+    /// o total em bytes é zero.
     pub fn fraction(&self) -> f32 {
-        if self.files_total == 0 {
-            return 0.0;
+        if self.bytes_total > 0 {
+            (self.bytes_done as f32 / self.bytes_total as f32).clamp(0.0, 1.0)
+        } else if self.files_total > 0 {
+            (self.files_done as f32 / self.files_total as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
         }
-        (self.files_done as f32 / self.files_total as f32).clamp(0.0, 1.0)
     }
 }
 

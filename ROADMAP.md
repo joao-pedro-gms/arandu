@@ -5,7 +5,7 @@ O roadmap detalhado com justificativas vive em [SCOPE.md](SCOPE.md). Esta págin
 
 ## Fase 1 — MVP: núcleo do gerenciador de arquivos
 
-- [ ] Workspace Cargo com crates `core`, `config`, `ui` (+ `git`/`index` reservados)
+- [x] Workspace Cargo com crates `core`, `config`, `ui` (+ `git`/`index` reservados) <!-- PR #1 -->
 - [ ] Navegação dual pane (splitter arrastável, foco por painel)
 - [ ] Modos de visualização: ícones, lista, colunas (virtualização com `show_rows`)
 - [ ] Operações: copiar/mover/renomear/deletar/criar com **fila + progresso**
@@ -17,7 +17,7 @@ O roadmap detalhado com justificativas vive em [SCOPE.md](SCOPE.md). Esta págin
 - [ ] Screenshot tests com egui_kittest no CI
 - [ ] Ferramentas: compressão (zip/tar/7z), checksums, rename em lote
 - [ ] justfile (check, test, screenshot, release) + cargo-hack
-- [ ] CI verde: fmt, clippy `-D warnings`, testes (Ubuntu + Windows) + job MSRV (N-2) + cargo-deny
+- [x] CI verde: fmt, clippy `-D warnings`, testes (Ubuntu + Windows) + job MSRV (N-2) + cargo-deny <!-- PR #1 -->
 
 ## Fase 2 — Diferenciais
 

@@ -90,10 +90,21 @@ const GIT_COMMIT_H: f32 = 96.0;
 /// dispor um `LayoutJob` completo a cada frame travaria a UI. O texto inteiro
 /// continua disponível no cache, apenas a renderização é limitada.
 const MAX_HIGHLIGHT_LINES: usize = 2000;
+/// Largura de uma célula no modo ícones.
+const CELL_W: f32 = 96.0;
+/// Altura de uma linha de células no modo ícones.
+const GRID_ROW_H: f32 = 100.0;
+/// Espaçamento horizontal entre células no modo ícones.
+const CELL_GAP: f32 = 8.0;
+/// Tamanho do glifo do ícone no modo ícones.
+const ICON_SIZE: f32 = 28.0;
+/// Altura reservada para o nome (duas linhas) no modo ícones.
+const GRID_NAME_H: f32 = 40.0;
 
 /// Ações listadas na status bar, na ordem em que aparecem (as principais).
-const STATUS_HINTS: [Action; 6] = [
+const STATUS_HINTS: [Action; 7] = [
     Action::TogglePreview,
+    Action::ToggleViewMode,
     Action::Copy,
     Action::Move,
     Action::Rename,
@@ -125,6 +136,33 @@ pub enum SortOrder {
     NameAscending,
 }
 
+/// Modo de visualização de um painel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ViewMode {
+    /// Lista detalhada (Nome/Tamanho/Modificado).
+    #[default]
+    List,
+    /// Grade de ícones.
+    Icons,
+}
+
+impl ViewMode {
+    /// Nome curto do modo, traduzido (exibido na toolbar).
+    fn label(self) -> String {
+        match self {
+            Self::List => rust_i18n::t!("view_mode_list").into_owned(),
+            Self::Icons => rust_i18n::t!("view_mode_icons").into_owned(),
+        }
+    }
+
+    fn toggled(self) -> Self {
+        match self {
+            Self::List => Self::Icons,
+            Self::Icons => Self::List,
+        }
+    }
+}
+
 /// Estado de um painel.
 pub struct PanelState {
     /// Diretório atual do painel.
@@ -137,6 +175,10 @@ pub struct PanelState {
     pub focus: usize,
     /// Ordenação visual (sem interação nesta etapa).
     pub sort: SortOrder,
+    /// Modo de visualização do painel.
+    pub view_mode: ViewMode,
+    /// Colunas da grade no último frame (usado pela navegação por teclado).
+    grid_cols: usize,
 
     /// Conjunto de itens selecionados (inclui `selected`).
     multi: BTreeSet<usize>,
@@ -158,6 +200,8 @@ impl PanelState {
             selected: None,
             focus: 0,
             sort: SortOrder::default(),
+            view_mode: ViewMode::default(),
+            grid_cols: 1,
             multi: BTreeSet::new(),
             error: None,
             scroll_offset: 0.0,
@@ -261,11 +305,33 @@ impl PanelState {
         self.ensure_focus_visible();
     }
 
+    /// Move o foco uma linha inteira da grade (para cima/baixo no modo ícones).
+    fn move_focus_row(&mut self, delta: isize) {
+        let cols = self.grid_cols.max(1) as isize;
+        self.move_focus(delta * cols);
+    }
+
+    /// Move o foco uma célula na grade (para os lados no modo ícones).
+    fn move_focus_column(&mut self, delta: isize) {
+        self.move_focus(delta);
+    }
+
+    /// Alterna entre lista e ícones, reposicionando o scroll para o foco.
+    pub fn toggle_view_mode(&mut self) {
+        self.view_mode = self.view_mode.toggled();
+        self.ensure_focus_visible();
+    }
+
     /// Pede ao próximo frame que ajuste o scroll para mostrar o foco.
     fn ensure_focus_visible(&mut self) {
-        let top = self.focus as f32 * ROW_H;
-        let bottom = top + ROW_H;
-        let view_h = self.viewport_h.max(ROW_H);
+        let (row_h, cols) = match self.view_mode {
+            ViewMode::List => (ROW_H, 1),
+            ViewMode::Icons => (GRID_ROW_H, self.grid_cols.max(1)),
+        };
+        let row = self.focus / cols;
+        let top = row as f32 * row_h;
+        let bottom = top + row_h;
+        let view_h = self.viewport_h.max(row_h);
         let mut offset = self.scroll_offset;
         if top < offset {
             offset = top;
@@ -910,6 +976,7 @@ impl AranduApp {
 
         let toggle_preview = self.action_pressed(Action::TogglePreview, &pressed);
         let toggle_git = self.action_pressed(Action::ToggleGitPanel, &pressed);
+        let toggle_view_mode = self.action_pressed(Action::ToggleViewMode, &pressed);
         let toggle_panel = self.action_pressed(Action::TogglePanel, &pressed);
         let up = self.action_pressed(Action::NavigateUp, &pressed);
         let down = self.action_pressed(Action::NavigateDown, &pressed);
@@ -934,44 +1001,77 @@ impl AranduApp {
         if toggle_git {
             self.toggle_git_panel();
         }
+        if toggle_view_mode {
+            self.active_panel_mut().toggle_view_mode();
+        }
         if toggle_panel {
             self.active = self.active.other();
         }
 
-        let mut git_navigated = false;
-        if self.git.visible && self.git.focused {
-            let rows = self.git_rows();
-            if !rows.is_empty() {
+        {
+            let view_mode = self.active_panel().view_mode;
+            // No modo ícones, as setas horizontais percorrem a grade. Como não
+            // há ações dedicadas para elas (o keymap permanece enxuto), são
+            // consumidas diretamente do input neste frame.
+            let (grid_left, grid_right) = if view_mode == ViewMode::Icons {
+                ctx.input_mut(|input| {
+                    (
+                        input.consume_key(Modifiers::NONE, Key::ArrowLeft),
+                        input.consume_key(Modifiers::NONE, Key::ArrowRight),
+                    )
+                })
+            } else {
+                (false, false)
+            };
+
+            let mut git_navigated = false;
+            if self.git.visible && self.git.focused {
+                let rows = self.git_rows();
+                if !rows.is_empty() {
+                    if up {
+                        self.git.focus = self.git.focus.saturating_sub(1);
+                    }
+                    if down {
+                        self.git.focus = (self.git.focus + 1).min(rows.len() - 1);
+                    }
+                    if enter {
+                        let (staged, path) = rows[self.git.focus.min(rows.len() - 1)].clone();
+                        self.git_toggle(path, !staged);
+                    }
+                    git_navigated = up || down || enter;
+                }
+            }
+
+            if !git_navigated {
+                let panel = self.active_panel_mut();
                 if up {
-                    self.git.focus = self.git.focus.saturating_sub(1);
+                    if view_mode == ViewMode::Icons {
+                        panel.move_focus_row(-1);
+                    } else {
+                        panel.move_focus(-1);
+                    }
                 }
                 if down {
-                    self.git.focus = (self.git.focus + 1).min(rows.len() - 1);
+                    if view_mode == ViewMode::Icons {
+                        panel.move_focus_row(1);
+                    } else {
+                        panel.move_focus(1);
+                    }
+                }
+                if grid_left {
+                    panel.move_focus_column(-1);
+                }
+                if grid_right {
+                    panel.move_focus_column(1);
                 }
                 if enter {
-                    let (staged, path) = rows[self.git.focus.min(rows.len() - 1)].clone();
-                    self.git_toggle(path, !staged);
+                    panel.open_focused();
                 }
-                git_navigated = up || down || enter;
+                if back {
+                    panel.go_up();
+                }
             }
         }
-
-        if !git_navigated {
-            let panel = self.active_panel_mut();
-            if up {
-                panel.move_focus(-1);
-            }
-            if down {
-                panel.move_focus(1);
-            }
-            if enter {
-                panel.open_focused();
-            }
-            if back {
-                panel.go_up();
-            }
-        }
-
         if copy {
             self.start_transfer(OpKind::Copy);
         }
@@ -1691,6 +1791,30 @@ impl AranduApp {
                             .on_hover_text(rust_i18n::t!("toggle_theme"));
                         if theme_button.clicked() {
                             self.cycle_theme(ui.ctx());
+                        }
+
+                        let view_mode = self.active_panel().view_mode;
+                        let view_hint = self
+                            .keymap
+                            .effective(Action::ToggleViewMode)
+                            .into_iter()
+                            .next()
+                            .map(|binding| {
+                                format!("{binding} {}", action_description(Action::ToggleViewMode))
+                            })
+                            .unwrap_or_else(|| action_description(Action::ToggleViewMode));
+                        let view_button = ui
+                            .add(
+                                Label::new(
+                                    RichText::new(view_mode.label())
+                                        .size(12.5)
+                                        .color(ui.visuals().weak_text_color()),
+                                )
+                                .sense(Sense::CLICK),
+                            )
+                            .on_hover_text(view_hint);
+                        if view_button.clicked() {
+                            self.active_panel_mut().toggle_view_mode();
                         }
                         let settings = ui
                             .add(Label::new(rust_i18n::t!("settings")).sense(Sense::CLICK))
@@ -2917,10 +3041,12 @@ fn draw_panel(
             interacted = true;
         }
 
-        // Cabeçalho de colunas (apenas visual nesta etapa).
-        let (column_rect, _) =
-            ui.allocate_exact_size(vec2(ui.available_width(), COLUMN_HEADER_H), Sense::hover());
-        paint_columns(ui, column_rect, &visuals, active);
+        // Cabeçalho de colunas (apenas no modo lista).
+        if panel.view_mode == ViewMode::List {
+            let (column_rect, _) =
+                ui.allocate_exact_size(vec2(ui.available_width(), COLUMN_HEADER_H), Sense::hover());
+            paint_columns(ui, column_rect, &visuals, active);
+        }
 
         if let Some(error) = &panel.error {
             draw_error(ui, error, &visuals);
@@ -2945,27 +3071,63 @@ fn draw_panel(
         let active_selection = panel.multi.clone();
         let mut action = None;
 
-        let output = {
-            let entries = &panel.entries;
-            let selection = &active_selection;
-            scroll.show_rows(ui, ROW_H, entries.len(), |ui, range| {
-                for index in range {
-                    let entry = &entries[index];
-                    let selected = selection.contains(&index);
-                    let style = RowStyle {
-                        selected,
-                        focused: focused == index,
-                        active,
-                        accent,
-                        dim: !active,
-                    };
-                    if let Some(row_action) =
-                        draw_row(ui, entry, index, &style, &visuals, side, tags)
-                    {
-                        action = Some(row_action);
+        let output = match panel.view_mode {
+            ViewMode::List => {
+                let entries = &panel.entries;
+                let selection = &active_selection;
+                scroll.show_rows(ui, ROW_H, entries.len(), |ui, range| {
+                    for index in range {
+                        let entry = &entries[index];
+                        let selected = selection.contains(&index);
+                        let style = RowStyle {
+                            selected,
+                            focused: focused == index,
+                            active,
+                            accent,
+                            dim: !active,
+                        };
+                        if let Some(row_action) =
+                            draw_row(ui, entry, index, &style, &visuals, side, tags)
+                        {
+                            action = Some(row_action);
+                        }
                     }
-                }
-            })
+                })
+            }
+            ViewMode::Icons => {
+                let width = ui.available_width();
+                let cols = (((width + CELL_GAP) / (CELL_W + CELL_GAP)).floor() as usize).max(1);
+                panel.grid_cols = cols;
+                let rows = panel.entries.len().div_ceil(cols);
+                let entries = &panel.entries;
+                let selection = &active_selection;
+                scroll.show_rows(ui, GRID_ROW_H, rows, |ui, range| {
+                    for row in range {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = CELL_GAP;
+                            for column in 0..cols {
+                                let index = row * cols + column;
+                                let Some(entry) = entries.get(index) else {
+                                    break;
+                                };
+                                let selected = selection.contains(&index);
+                                let style = RowStyle {
+                                    selected,
+                                    focused: focused == index,
+                                    active,
+                                    accent,
+                                    dim: !active,
+                                };
+                                if let Some(row_action) =
+                                    draw_grid_cell(ui, entry, index, &style, &visuals, side)
+                                {
+                                    action = Some(row_action);
+                                }
+                            }
+                        });
+                    }
+                })
+            }
         };
 
         panel.scroll_offset = output.state.clamped_offset().y;
@@ -3151,6 +3313,109 @@ fn draw_row(
         return Some(RowAction::Click { index, ctrl });
     }
     None
+}
+
+/// Desenha uma célula da grade (modo ícones), com seleção e foco.
+fn draw_grid_cell(
+    ui: &mut Ui,
+    entry: &Entry,
+    index: usize,
+    style: &RowStyle,
+    visuals: &egui::Visuals,
+    side: PanelSide,
+) -> Option<RowAction> {
+    let (rect, _) = ui.allocate_exact_size(vec2(CELL_W, GRID_ROW_H), Sense::hover());
+    let id = ui.make_persistent_id(("grid", side, &entry.path));
+    let response = ui.interact(rect, id, Sense::CLICK);
+
+    if style.selected {
+        ui.painter()
+            .rect_filled(rect, 4.0, with_alpha(style.accent, SELECTION_ALPHA));
+    } else if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, 4.0, visuals.widgets.hovered.weak_bg_fill);
+    }
+
+    let text_color = if style.dim {
+        with_alpha(visuals.text_color(), 153)
+    } else {
+        visuals.text_color()
+    };
+    // O accent vem do tema (aplicado em `apply_theme`); nada hardcoded.
+    let icon_color = if entry.is_dir {
+        visuals.selection.stroke.color
+    } else {
+        text_color
+    };
+    let icon = if entry.is_dir { "🗀" } else { "🗋" };
+    ui.painter().text(
+        pos2(rect.center().x, rect.top() + ICON_SIZE * 0.5 + 8.0),
+        Align2::CENTER_CENTER,
+        icon,
+        FontId::proportional(ICON_SIZE),
+        icon_color,
+    );
+
+    let name_rect = Rect::from_min_max(
+        pos2(rect.left() + 4.0, rect.top() + ICON_SIZE + 12.0),
+        pos2(
+            rect.right() - 4.0,
+            rect.top() + ICON_SIZE + 12.0 + GRID_NAME_H,
+        ),
+    );
+    let mut name_ui = ui.new_child(
+        UiBuilder::new()
+            .max_rect(name_rect)
+            .layout(Layout::top_down(Align::Center)),
+    );
+    let name = if entry.is_dir {
+        format!("{}/", entry.name)
+    } else {
+        entry.name.clone()
+    };
+    let display = compact_grid_name(&name);
+    // `wrap()` quebra em até duas linhas; a área de recorte limita o excesso.
+    name_ui.add(
+        Label::new(RichText::new(display).size(12.0).color(text_color))
+            .wrap()
+            .selectable(false),
+    );
+
+    if style.focused && style.active {
+        ui.painter().rect_stroke(
+            rect,
+            4.0,
+            Stroke::new(1.0, style.accent),
+            StrokeKind::Inside,
+        );
+    }
+
+    if response.double_clicked() {
+        return Some(RowAction::Open { index });
+    }
+    if response.clicked() {
+        let ctrl = response.ctx.input(|input| input.modifiers.ctrl);
+        return Some(RowAction::Click { index, ctrl });
+    }
+    None
+}
+
+/// Encurta um nome longo para a célula da grade com elipse no meio.
+///
+/// O limite de 26 caracteres corresponde a duas linhas de ~13 caracteres na
+/// largura de uma célula; nomes menores passam intactos.
+fn compact_grid_name(name: &str) -> String {
+    const MAX_CHARS: usize = 26;
+    let count = name.chars().count();
+    if count <= MAX_CHARS {
+        return name.to_owned();
+    }
+    let keep = MAX_CHARS.saturating_sub(1);
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let start: String = name.chars().take(head).collect();
+    let end: String = name.chars().skip(count - tail).collect();
+    format!("{start}…{end}")
 }
 
 /// Desenha chips de tags antes das colunas de Tamanho/Modificado.
@@ -3365,7 +3630,7 @@ fn draw_empty(ui: &mut Ui, visuals: &egui::Visuals) {
     ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
         ui.vertical_centered(|ui| {
             ui.add_space((body.height() / 2.0 - 48.0).max(8.0));
-            ui.label(RichText::new("📁").size(48.0));
+            ui.label(RichText::new("🗀").size(48.0));
             ui.add_space(4.0);
             ui.label(RichText::new(rust_i18n::t!("empty_dir")).color(visuals.weak_text_color()));
         });
@@ -3525,6 +3790,7 @@ fn action_description(action: Action) -> String {
         Action::BatchRename => "action_batch_rename",
         Action::Compress => "action_compress",
         Action::Extract => "action_extract",
+        Action::ToggleViewMode => "action_toggle_view_mode",
     };
     rust_i18n::t!(key).into_owned()
 }
@@ -3804,7 +4070,9 @@ mod tests {
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
 
-    use super::{AranduApp, PanelSide, format_modified, parse_hex_color, visible_breadcrumb};
+    use super::{
+        AranduApp, PanelSide, ViewMode, format_modified, parse_hex_color, visible_breadcrumb,
+    };
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -4283,8 +4551,9 @@ mod tests {
         harness.run();
 
         let expected = format!(
-            "F3 {} · F5 {} · F6 {} · F2 {} · Del {} · Ctrl+Z {}",
+            "F3 {} · Ctrl+1 {} · F5 {} · F6 {} · F2 {} · Del {} · Ctrl+Z {}",
             rust_i18n::t!("action_toggle_preview"),
+            rust_i18n::t!("action_toggle_view_mode"),
             rust_i18n::t!("action_copy"),
             rust_i18n::t!("action_move"),
             rust_i18n::t!("action_rename"),
@@ -4295,6 +4564,102 @@ mod tests {
             harness.query_all_by_label(&expected).count() >= 1,
             "esperava os hints dinâmicos na status bar: {expected}"
         );
+    }
+
+    #[test]
+    fn ctrl_1_toggles_view_mode_roundtrip() {
+        let (_dir, app) = fixture_app();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        assert_eq!(harness.state().left.view_mode, ViewMode::List);
+
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::Num1);
+        harness.run();
+        assert_eq!(harness.state().left.view_mode, ViewMode::Icons);
+
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::Num1);
+        harness.run();
+        assert_eq!(harness.state().left.view_mode, ViewMode::List);
+    }
+
+    #[test]
+    fn icons_toolbar_reflects_current_mode() {
+        let (_dir, app) = fixture_app();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        let list = rust_i18n::t!("view_mode_list").to_string();
+        let icons = rust_i18n::t!("view_mode_icons").to_string();
+        assert!(harness.query_all_by_label(&list).count() >= 1);
+
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::Num1);
+        harness.run();
+        assert!(
+            harness.query_all_by_label(&icons).count() >= 1,
+            "a toolbar deveria exibir o modo 'Ícones'"
+        );
+        assert_eq!(harness.query_all_by_label(&list).count(), 0);
+    }
+
+    #[test]
+    fn icons_mode_keeps_enter_on_focused_directory() {
+        let (dir, mut app) = fixture_app();
+        app.left.view_mode = ViewMode::Icons;
+        let index = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.is_dir)
+            .expect("fixture tem um diretório");
+        app.left.focus = index;
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+
+        assert_eq!(harness.state().left.cwd, dir.path().join("fixture-dir"));
+    }
+
+    #[test]
+    fn arrow_keys_move_focus_through_icon_grid() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        for index in 0..12 {
+            fs::write(dir.path().join(format!("arquivo-{index:02}.txt")), b"x")
+                .expect("cria arquivo");
+        }
+        let mut app = AranduApp::new_at(Config::default(), dir.path());
+        app.left.view_mode = ViewMode::Icons;
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        let cols = harness.state().left.grid_cols;
+        assert!(cols >= 2, "esperava pelo menos duas colunas na grade");
+
+        harness.key_press(egui::Key::ArrowRight);
+        harness.run();
+        assert_eq!(harness.state().left.focus, 1);
+
+        harness.key_press(egui::Key::ArrowDown);
+        harness.run();
+        assert_eq!(harness.state().left.focus, 1 + cols);
+
+        harness.key_press(egui::Key::ArrowLeft);
+        harness.run();
+        assert_eq!(harness.state().left.focus, cols);
+
+        harness.key_press(egui::Key::ArrowUp);
+        harness.run();
+        assert_eq!(harness.state().left.focus, 0);
     }
 
     #[test]

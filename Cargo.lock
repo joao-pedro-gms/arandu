@@ -274,6 +274,7 @@ dependencies = [
  "arandu-core",
  "arandu-git",
  "eframe",
+ "egui",
  "egui_kittest",
  "image",
  "rust-i18n",

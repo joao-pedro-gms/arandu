@@ -28,6 +28,10 @@ action_checksums = "Checksums"
 action_batch_rename = "Renomear em lote"
 action_compress = "Comprimir"
 action_extract = "Extrair"
+action_toggle_view_mode = "Modo de visualização"
+
+view_mode_list = "Lista"
+view_mode_icons = "Ícones"
 
 hints_title = "Atalhos"
 

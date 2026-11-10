@@ -6,8 +6,8 @@ O roadmap detalhado com justificativas vive em [SCOPE.md](SCOPE.md). Esta págin
 ## Fase 1 — MVP: núcleo do gerenciador de arquivos
 
 - [x] Workspace Cargo com crates `core`, `config`, `ui` (+ `git`/`index` reservados) <!-- PR #1 -->
-- [ ] Navegação dual pane (splitter arrastável, foco por painel)
-- [ ] Modos de visualização: ícones, lista, colunas (virtualização com `show_rows`)
+- [x] Navegação dual pane (splitter arrastável, foco por painel) <!-- PR #3 -->
+- [ ] Modos de visualização: ícones, lista, colunas (virtualização com `show_rows`) <!-- PR #3: lista; ícones/colunas pendentes -->
 - [ ] Operações: copiar/mover/renomear/deletar/criar com **fila + progresso**
 - [ ] **Undo/redo** de operações + **lixeira** do SO
 - [ ] Preview pane: texto com syntax highlight (syntect), imagens

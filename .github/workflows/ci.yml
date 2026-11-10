@@ -129,7 +129,7 @@ jobs:
           vulkaninfo --summary || true
           ls -la /usr/share/vulkan/icd.d/ || true
           # Descobre dinamicamente o ICD do lavapipe (nome varia por versão de mesa)
-          LVP=$(ls /usr/share/vulkan/icd.d/lvp_icd.*.json 2>/dev/null | head -1 || true)
+          LVP=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -1 || true)
           echo "ICD lavapipe: $LVP"
           test -n "$LVP"
           echo "VK_ICD_FILENAMES=$LVP" >> "$GITHUB_ENV"

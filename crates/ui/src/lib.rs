@@ -74,6 +74,16 @@ const PREVIEW_CACHE_CAP: usize = 20;
 /// continua disponível no cache, apenas a renderização é limitada.
 const MAX_HIGHLIGHT_LINES: usize = 2000;
 
+/// Ações listadas na status bar, na ordem em que aparecem (as principais).
+const STATUS_HINTS: [Action; 6] = [
+    Action::TogglePreview,
+    Action::Copy,
+    Action::Move,
+    Action::Rename,
+    Action::Delete,
+    Action::Undo,
+];
+
 /// Painel esquerdo ou direito.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum PanelSide {
@@ -421,6 +431,8 @@ pub struct AranduApp {
     theme: Theme,
     /// Atalhos redefiníveis (preset + overrides).
     keymap: Keymap,
+    /// Cheatsheet de atalhos visível (F1).
+    show_hints: bool,
     /// Congela a drenagem da fila em testes determinísticos de progresso.
     #[cfg(test)]
     injected_ops: bool,
@@ -460,6 +472,7 @@ impl AranduApp {
             preview: PreviewState::default(),
             theme,
             keymap,
+            show_hints: false,
             #[cfg(test)]
             injected_ops: false,
         }
@@ -516,6 +529,7 @@ impl AranduApp {
             self.draw_ops_bar(ui, ops_rect);
         }
         self.draw_status_bar(ui, status_rect);
+        self.draw_hints_overlay(&ctx);
         self.draw_dialogs(&ctx);
     }
 
@@ -650,7 +664,11 @@ impl AranduApp {
     /// pressionadas no frame contra o `Keymap` efetivo.
     ///
     /// Com um diálogo de confirmação aberto, Enter/Escape continuam fixos.
-    /// Com a renomeação aberta, a digitação vai para o `TextEdit`.
+    /// Com a renomeação aberta, a digitação vai para o `TextEdit`. Com o
+    /// cheatsheet aberto (F1), os demais atalhos ficam suspensos; fechá-lo com
+    /// F1/Escape é tratado aqui e o clique fora no próprio overlay. O diálogo
+    /// de confirmação tem prioridade: o cheatsheet não abre enquanto ele
+    /// estiver ativo (e os dois nunca ficam abertos ao mesmo tempo).
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
         if self.delete_confirm.is_some() {
             let (enter, escape) = ctx.input_mut(|i| {
@@ -673,6 +691,19 @@ impl AranduApp {
         }
 
         let pressed = pressed_keys(ctx);
+
+        let toggle_hints = self.action_pressed(Action::ShowHints, &pressed);
+        if self.show_hints {
+            let escape = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+            if toggle_hints || escape {
+                self.show_hints = false;
+            }
+            return;
+        }
+        if toggle_hints {
+            self.show_hints = true;
+            return;
+        }
 
         let toggle_preview = self.action_pressed(Action::TogglePreview, &pressed);
         let toggle_panel = self.action_pressed(Action::TogglePanel, &pressed);
@@ -1101,6 +1132,13 @@ impl AranduApp {
             pos2(rect.left() + 8.0, rect.top()),
             pos2(rect.right() - 8.0, rect.bottom()),
         );
+        // Hint do painel: binding efetivo (respeita preset/overrides) + descrição.
+        let toggle_hint = self
+            .keymap
+            .effective(Action::TogglePreview)
+            .into_iter()
+            .next()
+            .map(|binding| format!("{binding} {}", action_description(Action::TogglePreview)));
         ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             let header = ui.allocate_ui_with_layout(
@@ -1109,11 +1147,13 @@ impl AranduApp {
                 |ui| {
                     ui.label(RichText::new(rust_i18n::t!("preview_title")).strong());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(rust_i18n::t!("preview_hint"))
-                                .size(12.5)
-                                .color(visuals.weak_text_color()),
-                        );
+                        if let Some(hint) = &toggle_hint {
+                            ui.label(
+                                RichText::new(hint)
+                                    .size(12.5)
+                                    .color(visuals.weak_text_color()),
+                            );
+                        }
                     });
                 },
             );
@@ -1480,6 +1520,7 @@ impl AranduApp {
             (notice.text.clone(), color)
         });
         let weak = visuals.weak_text_color();
+        let hints = self.status_hints();
 
         ui.scope_builder(
             UiBuilder::new().max_rect(rect.shrink2(vec2(10.0, 0.0))),
@@ -1489,14 +1530,11 @@ impl AranduApp {
                     ui.add_space(12.0);
                     ui.add(Label::new(RichText::new(path).color(weak)).truncate());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.add(
-                            Label::new(
-                                RichText::new(rust_i18n::t!("preview_hint"))
-                                    .size(12.5)
-                                    .color(weak),
-                            )
-                            .truncate(),
-                        );
+                        if !hints.is_empty() {
+                            ui.add(
+                                Label::new(RichText::new(&hints).size(12.5).color(weak)).truncate(),
+                            );
+                        }
                         if let Some((text, color)) = notice {
                             ui.add_space(12.0);
                             ui.add(Label::new(RichText::new(text).color(color)).truncate());
@@ -1505,6 +1543,73 @@ impl AranduApp {
                 });
             },
         );
+    }
+
+    /// Hints compactos das ações principais, gerados do keymap efetivo:
+    /// `F3 Preview · F5 Copy · ...`. Ações sem binding (ex.: `move` no preset
+    /// vim) são omitidas.
+    fn status_hints(&self) -> String {
+        STATUS_HINTS
+            .iter()
+            .filter_map(|action| {
+                let binding = self.keymap.effective(*action).into_iter().next()?;
+                Some(format!("{binding} {}", action_description(*action)))
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+
+    /// Cheatsheet de atalhos sobre o conteúdo (F1).
+    ///
+    /// Segue o padrão de `draw_dialogs` (um `egui::Modal`), que também escurece
+    /// o fundo e bloqueia a interação por trás. Fecha com F1, Escape (tratado
+    /// em `handle_keyboard`) ou clique fora do painel.
+    fn draw_hints_overlay(&mut self, ctx: &egui::Context) {
+        if !self.show_hints {
+            return;
+        }
+
+        let entries: Vec<(String, String)> = Action::ALL
+            .iter()
+            .map(|action| {
+                let binding = self
+                    .keymap
+                    .effective(*action)
+                    .into_iter()
+                    .next()
+                    .map_or_else(|| "—".to_owned(), |binding| binding.to_string());
+                (binding, action_description(*action))
+            })
+            .collect();
+        let rows = entries.len().div_ceil(2);
+
+        let modal = egui::Modal::new(egui::Id::unique("hints-cheatsheet")).show(ctx, |ui| {
+            ui.set_min_width(560.0);
+            ui.heading(rust_i18n::t!("hints_title"));
+            ui.add_space(6.0);
+            let accent = ui.visuals().selection.stroke.color;
+            egui::Grid::new("hints-grid")
+                .num_columns(4)
+                .spacing([24.0, 6.0])
+                .min_col_width(80.0)
+                .show(ui, |ui| {
+                    for row in 0..rows {
+                        for column in 0..2 {
+                            let Some((binding, description)) = entries.get(column * rows + row)
+                            else {
+                                continue;
+                            };
+                            ui.label(RichText::new(binding).strong().color(accent));
+                            ui.label(description);
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+
+        if modal.should_close() {
+            self.show_hints = false;
+        }
     }
 }
 
@@ -2090,6 +2195,27 @@ fn key_name(key: Key) -> String {
     }
 }
 
+/// Descrição i18n curta de uma ação (usada nos hints e no cheatsheet).
+fn action_description(action: Action) -> String {
+    let key = match action {
+        Action::TogglePreview => "action_toggle_preview",
+        Action::TogglePanel => "action_toggle_panel",
+        Action::NavigateUp => "action_navigate_up",
+        Action::NavigateDown => "action_navigate_down",
+        Action::Enter => "action_enter",
+        Action::GoBack => "action_go_back",
+        Action::Copy => "action_copy",
+        Action::Move => "action_move",
+        Action::Rename => "action_rename",
+        Action::Delete => "action_delete",
+        Action::Undo => "action_undo",
+        Action::CycleTheme => "action_cycle_theme",
+        Action::Quit => "action_quit",
+        Action::ShowHints => "action_show_hints",
+    };
+    rust_i18n::t!(key).into_owned()
+}
+
 /// Teclas pressionadas neste frame, no vocabulário do [`Keymap`].
 fn pressed_keys(ctx: &egui::Context) -> Vec<KeyBinding> {
     ctx.input(|input| {
@@ -2523,5 +2649,63 @@ mod tests {
         harness.key_press(egui::Key::Tab);
         harness.run();
         assert_eq!(harness.state().active_side(), PanelSide::Right);
+    }
+
+    #[test]
+    fn f1_opens_cheatsheet_and_escape_closes_it() {
+        let (_dir, app) = fixture_app();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        let title = rust_i18n::t!("hints_title").to_string();
+        assert_eq!(harness.query_all_by_label(&title).count(), 0);
+
+        harness.key_press(egui::Key::F1);
+        harness.run();
+        assert!(harness.state().show_hints);
+        assert!(
+            harness.query_all_by_label(&title).count() >= 1,
+            "esperava o cheatsheet '{title}'"
+        );
+
+        // Os atalhos globais ficam suspensos enquanto o cheatsheet está aberto.
+        harness.key_press(egui::Key::Tab);
+        harness.run();
+        assert_eq!(harness.state().active_side(), PanelSide::Left);
+        assert!(harness.state().show_hints);
+
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert!(!harness.state().show_hints);
+        assert_eq!(
+            harness.query_all_by_label(&title).count(),
+            0,
+            "o cheatsheet deveria sumir ao pressionar Escape"
+        );
+    }
+
+    #[test]
+    fn status_bar_shows_dynamic_hints_from_keymap() {
+        let (_dir, app) = fixture_app();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        let expected = format!(
+            "F3 {} · F5 {} · F6 {} · F2 {} · Del {} · Ctrl+Z {}",
+            rust_i18n::t!("action_toggle_preview"),
+            rust_i18n::t!("action_copy"),
+            rust_i18n::t!("action_move"),
+            rust_i18n::t!("action_rename"),
+            rust_i18n::t!("action_delete"),
+            rust_i18n::t!("action_undo"),
+        );
+        assert!(
+            harness.query_all_by_label(&expected).count() >= 1,
+            "esperava os hints dinâmicos na status bar: {expected}"
+        );
     }
 }

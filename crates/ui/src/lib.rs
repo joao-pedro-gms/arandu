@@ -23,7 +23,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arandu_config::{
     Action, Config, KeyBinding, Keymap, Modifiers as KeyModifiers, TagsStore, Theme,
 };
+use arandu_core::batch::apply_pattern;
 use arandu_core::fs::{CoreError, Entry, format_size, list_dir};
+use arandu_core::hash::{md5_file, sha256_file};
 use arandu_core::ops::{self, Op, OpKind, OpsError, Progress};
 use arandu_core::preview::{PreviewContent, PreviewError, PreviewRequest, UnsupportedReason};
 use arandu_core::queue::{OpQueue, QueueEvent, UndoStack};
@@ -418,6 +420,31 @@ struct TagEditorState {
     error: Option<String>,
 }
 
+/// Hashes calculados para um arquivo.
+#[derive(Clone)]
+struct FileHashes {
+    sha256: String,
+    md5: String,
+}
+
+/// Diálogo de checksums (F9).
+///
+/// A thread de cálculo é independente do diálogo: fechar com Esc apenas
+/// descarta o resultado; o trabalho em background termina sozinho (o `send`
+/// falha quando o canal é descartado e a thread encerra).
+struct ChecksumsDialog {
+    paths: Vec<PathBuf>,
+    /// Resultado por arquivo, na mesma ordem de `paths`.
+    results: Vec<Option<Result<FileHashes, String>>>,
+    receiver: Option<Receiver<(usize, Result<FileHashes, String>)>>,
+}
+
+/// Diálogo de renomeação em lote (F7).
+struct BatchRenameDialog {
+    paths: Vec<PathBuf>,
+    pattern: String,
+}
+
 /// Aplicação principal do Arandu.
 pub struct AranduApp {
     config: Config,
@@ -439,6 +466,10 @@ pub struct AranduApp {
     rename: Option<RenameDialog>,
     /// Editor de tags aberto (F4).
     tag_editor: Option<TagEditorState>,
+    /// Diálogo de checksums aberto (F9).
+    checksums: Option<ChecksumsDialog>,
+    /// Diálogo de renomeação em lote aberto (F7).
+    batch_rename: Option<BatchRenameDialog>,
     /// Tags dos arquivos, persistidas em `tags.toml`.
     tags: TagsStore,
     /// Painel de pré-visualização (F3).
@@ -493,6 +524,8 @@ impl AranduApp {
             delete_confirm: None,
             rename: None,
             tag_editor: None,
+            checksums: None,
+            batch_rename: None,
             tags,
             preview: PreviewState::default(),
             theme,
@@ -521,6 +554,7 @@ impl AranduApp {
 
         self.pump_queue();
         self.pump_preview();
+        self.pump_checksums();
         self.handle_keyboard(&ctx);
 
         // O `Ui` entregue pelo eframe 0.37 não tem margem nem fundo: pintamos o
@@ -728,6 +762,25 @@ impl AranduApp {
             return;
         }
 
+        // Diálogos das ferramentas: Esc (e, no caso dos checksums, a própria
+        // ação) fecham; o restante da digitação/atalhos fica suspenso. O
+        // cálculo em background pode terminar sozinho e o resultado é
+        // descartado ao fechar.
+        if self.checksums.is_some() {
+            let pressed = pressed_keys(ctx);
+            let escape = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+            if escape || self.action_pressed(Action::Checksums, &pressed) {
+                self.checksums = None;
+            }
+            return;
+        }
+        if self.batch_rename.is_some() {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                self.batch_rename = None;
+            }
+            return;
+        }
+
         let pressed = pressed_keys(ctx);
 
         let toggle_hints = self.action_pressed(Action::ShowHints, &pressed);
@@ -757,6 +810,8 @@ impl AranduApp {
         let cycle_theme = self.action_pressed(Action::CycleTheme, &pressed);
         let quit = self.action_pressed(Action::Quit, &pressed);
         let tag_files = self.action_pressed(Action::TagFiles, &pressed);
+        let checksums = self.action_pressed(Action::Checksums, &pressed);
+        let batch_rename = self.action_pressed(Action::BatchRename, &pressed);
 
         if toggle_preview {
             self.preview.visible = !self.preview.visible;
@@ -792,6 +847,12 @@ impl AranduApp {
         }
         if tag_files {
             self.start_tag_editor();
+        }
+        if checksums {
+            self.start_checksums();
+        }
+        if batch_rename {
+            self.start_batch_rename();
         }
         if delete {
             self.request_delete();
@@ -983,6 +1044,136 @@ impl AranduApp {
             input: String::new(),
             error: None,
         });
+    }
+
+    /// Abre o diálogo de checksums e dispara o cálculo em background.
+    ///
+    /// Apenas arquivos regulares entram na lista (diretórios não têm conteúdo
+    /// para resumir). O cálculo roda em `std::thread` e envia cada resultado
+    /// pelo canal; a UI drena sem bloquear em [`Self::pump_checksums`].
+    fn start_checksums(&mut self) {
+        let paths: Vec<PathBuf> = self
+            .active_panel()
+            .selected_paths()
+            .into_iter()
+            .filter(|path| path.is_file())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        let thread_paths = paths.clone();
+        std::thread::spawn(move || {
+            for (index, path) in thread_paths.into_iter().enumerate() {
+                let result = sha256_file(&path)
+                    .and_then(|sha256| md5_file(&path).map(|md5| FileHashes { sha256, md5 }))
+                    .map_err(|error| error.to_string());
+                // Canal descartado = diálogo fechado; a thread termina sozinha.
+                if sender.send((index, result)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let count = paths.len();
+        self.checksums = Some(ChecksumsDialog {
+            paths,
+            results: vec![None; count],
+            receiver: Some(receiver),
+        });
+        self.ops.notice = None;
+    }
+
+    /// Drena os resultados do cálculo de checksums sem bloquear.
+    fn pump_checksums(&mut self) {
+        let Some(dialog) = self.checksums.as_mut() else {
+            return;
+        };
+        let received: Vec<(usize, Result<FileHashes, String>)> = match &dialog.receiver {
+            Some(receiver) => receiver.try_iter().collect(),
+            None => return,
+        };
+        for (index, result) in received {
+            if let Some(slot) = dialog.results.get_mut(index) {
+                *slot = Some(result);
+            }
+        }
+        if dialog.results.iter().all(Option::is_some) {
+            dialog.receiver = None;
+        }
+    }
+
+    /// Abre o diálogo de renomeação em lote para a seleção do painel ativo.
+    ///
+    /// O padrão inicial preserva o nome atual (`{name}{ext}`), então confirmar
+    /// sem editar o padrão não altera nada.
+    fn start_batch_rename(&mut self) {
+        let paths: Vec<PathBuf> = self
+            .active_panel()
+            .selected_paths()
+            .into_iter()
+            .filter(|path| path.is_file())
+            .collect();
+        if paths.is_empty() {
+            self.ops.notice = Some(Notice::error(
+                rust_i18n::t!("batch_rename_no_selection").to_string(),
+            ));
+            return;
+        }
+        self.batch_rename = Some(BatchRenameDialog {
+            paths,
+            pattern: "{name}{ext}".to_owned(),
+        });
+        self.ops.notice = None;
+    }
+
+    /// Executa as renomeações confirmadas, agregando sucessos e falhas.
+    fn apply_batch_rename(&mut self, renames: Vec<(PathBuf, String)>) {
+        let mut succeeded = 0_usize;
+        let mut failed = 0_usize;
+        let mut touched: Vec<PathBuf> = Vec::new();
+
+        for (path, new_name) in renames {
+            let Some(parent) = path.parent() else {
+                failed += 1;
+                continue;
+            };
+            let target = parent.join(new_name.trim());
+            if target == path {
+                succeeded += 1;
+                continue;
+            }
+            match std::fs::rename(&path, &target) {
+                Ok(()) => {
+                    succeeded += 1;
+                    if !touched.iter().any(|dir| dir == parent) {
+                        touched.push(parent.to_path_buf());
+                    }
+                }
+                Err(_) => failed += 1,
+            }
+        }
+
+        for dir in touched {
+            self.reload_dir(&dir);
+        }
+        let text = rust_i18n::t!("batch_rename_done", ok = succeeded, errors = failed).to_string();
+        self.ops.notice = Some(if failed == 0 {
+            Notice::info(text)
+        } else {
+            Notice::error(text)
+        });
+        self.batch_rename = None;
+    }
+
+    /// Recarrega os painéis que estão exibindo `dir`.
+    fn reload_dir(&mut self, dir: &Path) {
+        for panel in [&mut self.left, &mut self.right] {
+            if panel.cwd == dir {
+                panel.reload();
+            }
+        }
     }
 
     /// Persiste as tags (em testes, não toca no disco real).
@@ -1652,6 +1843,133 @@ impl AranduApp {
                 }
             } else if !cancel {
                 self.tag_editor = Some(dialog);
+            }
+        }
+
+        if let Some(dialog) = self.checksums.take() {
+            let mut close = false;
+            egui::Modal::new(egui::Id::unique("checksums-dialog")).show(ctx, |ui| {
+                ui.set_min_width(640.0);
+                ui.heading(rust_i18n::t!("checksums_title"));
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .max_height(380.0)
+                    .show(ui, |ui| {
+                        for (index, path) in dialog.paths.iter().enumerate() {
+                            let name = path
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.display().to_string());
+                            ui.label(RichText::new(name).strong());
+                            match &dialog.results[index] {
+                                None => {
+                                    ui.label(
+                                        RichText::new(rust_i18n::t!("checksums_computing"))
+                                            .color(ui.visuals().weak_text_color()),
+                                    );
+                                }
+                                Some(Ok(hashes)) => {
+                                    hash_row(
+                                        ui,
+                                        &rust_i18n::t!("checksums_sha256"),
+                                        &hashes.sha256,
+                                    );
+                                    hash_row(ui, &rust_i18n::t!("checksums_md5"), &hashes.md5);
+                                }
+                                Some(Err(error)) => {
+                                    ui.colored_label(
+                                        ui.visuals().error_fg_color,
+                                        rust_i18n::t!("checksums_failed", error = error.as_str()),
+                                    );
+                                }
+                            }
+                            ui.add_space(6.0);
+                        }
+                    });
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button(rust_i18n::t!("checksums_close")).clicked() {
+                        close = true;
+                    }
+                });
+            });
+            if !close {
+                self.checksums = Some(dialog);
+            }
+        }
+
+        if let Some(mut dialog) = self.batch_rename.take() {
+            let renames = batch_renames(&dialog.paths, &dialog.pattern);
+            let validation = validate_batch_renames(&renames);
+            let mut submit = false;
+            let mut cancel = false;
+
+            egui::Modal::new(egui::Id::unique("batch-rename-dialog")).show(ctx, |ui| {
+                ui.set_min_width(580.0);
+                ui.heading(rust_i18n::t!("batch_rename_title"));
+                ui.add_space(6.0);
+                ui.label(rust_i18n::t!("batch_rename_pattern"));
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut dialog.pattern)
+                        .hint_text("{name}{ext}")
+                        .desired_width(f32::INFINITY),
+                );
+                if !response.has_focus() {
+                    response.request_focus();
+                }
+                ui.label(
+                    RichText::new(rust_i18n::t!("batch_rename_hint"))
+                        .color(ui.visuals().weak_text_color()),
+                );
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        for (_, current, new_name) in renames.iter().take(8) {
+                            let line = format!("{current} → {}", new_name.trim());
+                            ui.label(
+                                RichText::new(truncate_for_display(&line, 72))
+                                    .text_style(TextStyle::Monospace),
+                            );
+                        }
+                        if renames.len() > 8 {
+                            ui.label("…");
+                        }
+                    });
+                if let Some(error) = &validation {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+                if ui.input(|input| input.key_pressed(Key::Enter)) {
+                    submit = true;
+                }
+                if ui.input(|input| input.key_pressed(Key::Escape)) {
+                    cancel = true;
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            validation.is_none(),
+                            egui::Button::new(rust_i18n::t!("batch_rename_ok")),
+                        )
+                        .clicked()
+                    {
+                        submit = true;
+                    }
+                    if ui.button(rust_i18n::t!("cancel")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+            if submit && validation.is_none() {
+                let pairs = renames
+                    .into_iter()
+                    .map(|(path, _, new_name)| (path, new_name))
+                    .collect();
+                self.apply_batch_rename(pairs);
+            } else if !cancel {
+                self.batch_rename = Some(dialog);
             }
         }
     }
@@ -2461,8 +2779,86 @@ fn action_description(action: Action) -> String {
         Action::Quit => "action_quit",
         Action::ShowHints => "action_show_hints",
         Action::TagFiles => "action_tag_files",
+        Action::Checksums => "action_checksums",
+        Action::BatchRename => "action_batch_rename",
     };
     rust_i18n::t!(key).into_owned()
+}
+
+/// Calcula os novos nomes de uma seleção para pré-visualização.
+///
+/// Devolve `(caminho, nome atual, novo nome)` na ordem recebida.
+fn batch_renames(paths: &[PathBuf], pattern: &str) -> Vec<(PathBuf, String, String)> {
+    let total = paths.len();
+    paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let current = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let name = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let ext = path
+                .extension()
+                .map(|ext| format!(".{}", ext.to_string_lossy()))
+                .unwrap_or_default();
+            let new_name = apply_pattern(pattern, &name, &ext, index + 1, total);
+            (path.clone(), current, new_name)
+        })
+        .collect()
+}
+
+/// Valida os novos nomes antes de executar: vazio, fora do diretório,
+/// duplicado ou conflitante com um arquivo existente.
+fn validate_batch_renames(renames: &[(PathBuf, String, String)]) -> Option<String> {
+    let mut seen = BTreeSet::new();
+    for (path, current, new_name) in renames {
+        let new_name = new_name.trim();
+        if new_name.is_empty() {
+            return Some(rust_i18n::t!("batch_rename_empty").to_string());
+        }
+        let mut components = Path::new(new_name).components();
+        let valid = matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none();
+        if !valid {
+            return Some(rust_i18n::t!("batch_rename_invalid").to_string());
+        }
+        if new_name != current
+            && let Some(parent) = path.parent()
+            && parent.join(new_name).exists()
+        {
+            return Some(rust_i18n::t!("batch_rename_exists", name = new_name).to_string());
+        }
+        if !seen.insert(new_name.to_owned()) {
+            return Some(rust_i18n::t!("batch_rename_duplicate", name = new_name).to_string());
+        }
+    }
+    None
+}
+
+/// Corta um texto longo para exibição, sinalizando com `…`.
+fn truncate_for_display(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let mut output: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        output.push('…');
+    }
+    output
+}
+
+/// Linha `Rótulo: hash [Copiar]` em fonte monoespaçada.
+fn hash_row(ui: &mut Ui, label: &str, hash: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("{label}:")).color(ui.visuals().weak_text_color()));
+        ui.add(Label::new(RichText::new(hash).text_style(TextStyle::Monospace)).truncate());
+        if ui.button(rust_i18n::t!("checksums_copy")).clicked() {
+            ui.ctx().copy_text(hash.to_owned());
+        }
+    });
 }
 
 /// Teclas pressionadas neste frame, no vocabulário do [`Keymap`].
@@ -2565,6 +2961,32 @@ impl AranduApp {
             },
             PreviewEntry::Failed(_) => None,
         }
+    }
+
+    /// Se o cálculo de checksums terminou — usado em testes.
+    #[cfg(test)]
+    fn checksums_done(&self) -> bool {
+        self.checksums
+            .as_ref()
+            .is_some_and(|dialog| dialog.receiver.is_none())
+    }
+
+    /// Hashes calculados, na ordem dos alvos — usado em testes.
+    #[cfg(test)]
+    fn checksums_results(&self) -> Vec<(String, String)> {
+        self.checksums
+            .as_ref()
+            .map(|dialog| {
+                dialog
+                    .results
+                    .iter()
+                    .filter_map(|result| match result {
+                        Some(Ok(hashes)) => Some((hashes.sha256.clone(), hashes.md5.clone())),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Injeta uma operação em andamento para testar a barra de progresso sem
@@ -3029,5 +3451,94 @@ mod tests {
         let map = app.tag_map_for(&app.left);
         let key = path.to_string_lossy().into_owned();
         assert_eq!(map.get(&key), Some(&vec!["chip".to_owned()]));
+    }
+
+    #[test]
+    fn checksums_dialog_shows_sha256_and_md5() {
+        let (dir, mut app) = fixture_app();
+        let index = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.name == "fixture-file.txt")
+            .expect("fixture tem fixture-file.txt");
+        app.left.select(index, false);
+        let _ = dir;
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        harness.key_press(egui::Key::F9);
+        harness.run();
+        assert!(
+            harness.state().checksums.is_some(),
+            "F9 deveria abrir o diálogo de checksums"
+        );
+        let title = rust_i18n::t!("checksums_title").to_string();
+        assert!(
+            harness.query_all_by_label(&title).count() >= 1,
+            "esperava o diálogo '{title}'"
+        );
+
+        // O cálculo roda em thread; bombeia frames até o canal esvaziar.
+        for _ in 0..200 {
+            if harness.state().checksums_done() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run();
+        }
+        assert!(
+            harness.state().checksums_done(),
+            "o cálculo de checksums não terminou a tempo"
+        );
+
+        let results = harness.state().checksums_results();
+        assert_eq!(
+            results,
+            vec![(
+                "92359bb294288000958de4f1f20d5778681b14bfe2f0868104f79230942a6984".to_owned(),
+                "b59853db2f3ef8f156a72e38c30ba7d2".to_owned(),
+            )],
+            "hashes de 'conteudo'"
+        );
+    }
+
+    #[test]
+    fn batch_rename_dialog_previews_unchanged_pattern() {
+        let (_dir, mut app) = fixture_app();
+        let index = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.name == "fixture-file.txt")
+            .expect("fixture tem fixture-file.txt");
+        app.left.select(index, false);
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        harness.key_press(egui::Key::F7);
+        harness.run();
+        assert!(
+            harness.state().batch_rename.is_some(),
+            "F7 deveria abrir o diálogo de renomeação em lote"
+        );
+        let title = rust_i18n::t!("batch_rename_title").to_string();
+        assert!(
+            harness.query_all_by_label(&title).count() >= 1,
+            "esperava o diálogo '{title}'"
+        );
+        assert!(
+            harness
+                .query_all_by_label("fixture-file.txt → fixture-file.txt")
+                .count()
+                >= 1,
+            "esperava a pré-visualização sem mudança para o padrão inicial"
+        );
     }
 }

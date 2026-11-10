@@ -36,6 +36,8 @@ pub enum Action {
     Quit,
     ShowHints,
     TagFiles,
+    Checksums,
+    BatchRename,
 }
 
 impl Action {
@@ -57,11 +59,13 @@ impl Action {
             Self::Quit => "quit",
             Self::ShowHints => "show_hints",
             Self::TagFiles => "tag_files",
+            Self::Checksums => "checksums",
+            Self::BatchRename => "batch_rename",
         }
     }
 
     /// Todas as ações, na ordem canônica do arquivo.
-    pub const ALL: [Action; 15] = [
+    pub const ALL: [Action; 17] = [
         Self::TogglePreview,
         Self::TogglePanel,
         Self::NavigateUp,
@@ -77,6 +81,8 @@ impl Action {
         Self::Quit,
         Self::ShowHints,
         Self::TagFiles,
+        Self::Checksums,
+        Self::BatchRename,
     ];
 
     /// Converte um nome `snake_case` em ação.
@@ -347,6 +353,8 @@ fn default_bindings(action: Action) -> Vec<KeyBinding> {
         Action::Quit => vec![ctrl("Q")],
         Action::ShowHints => vec![kb("F1")],
         Action::TagFiles => vec![kb("F4")],
+        Action::Checksums => vec![kb("F9")],
+        Action::BatchRename => vec![kb("F7")],
     }
 }
 
@@ -369,6 +377,8 @@ fn vim_bindings(action: Action) -> Vec<KeyBinding> {
         Action::Quit => vec![kb("Q")],
         Action::ShowHints => vec![kb("F1")],
         Action::TagFiles => vec![kb("F4")],
+        Action::Checksums => vec![kb("F9")],
+        Action::BatchRename => vec![kb("F7")],
     }
 }
 
@@ -529,5 +539,35 @@ mod tests {
                 vec![KeyBinding::key("F1")]
             );
         }
+    }
+
+    #[test]
+    fn file_tools_actions_have_free_function_keys_in_both_presets() {
+        for preset in ["default", "vim"] {
+            let keymap = Keymap {
+                preset: preset.to_owned(),
+                ..Keymap::default()
+            };
+            assert_eq!(
+                keymap.effective(Action::Checksums),
+                vec![KeyBinding::key("F9")]
+            );
+            assert_eq!(
+                keymap.effective(Action::BatchRename),
+                vec![KeyBinding::key("F7")]
+            );
+        }
+    }
+
+    #[test]
+    fn file_tools_actions_roundtrip_by_name() {
+        assert_eq!(
+            Action::from_name("checksums").expect("checksums"),
+            Action::Checksums
+        );
+        assert_eq!(
+            Action::from_name("batch_rename").expect("batch_rename"),
+            Action::BatchRename
+        );
     }
 }

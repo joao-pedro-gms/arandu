@@ -38,6 +38,8 @@ repository = "https://github.com/joao-pedro-gms/arandu"
 anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 thiserror = "2"
+sha2 = "0.10"
+md-5 = "0.10"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 directories = "6"

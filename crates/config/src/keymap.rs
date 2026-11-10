@@ -316,7 +316,9 @@ fn vim_bindings(action: Action) -> Vec<KeyBinding> {
         Action::Enter => vec![kb("L"), kb("Enter")],
         Action::GoBack => vec![kb("H"), kb("Backspace")],
         Action::Copy => vec![kb("Y")],
-        Action::Move => vec![kb("D")],
+        // Sem equivalente Vim canônico (o usuário pode usar `keymap.toml`);
+        // `D` fica reservado para `Delete` (lixeira).
+        Action::Move => vec![],
         Action::Rename => vec![kb("R")],
         Action::Delete => vec![kb("D")],
         Action::Undo => vec![kb("U")],

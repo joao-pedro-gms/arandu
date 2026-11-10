@@ -149,7 +149,10 @@ fn extract_zip(archive: &Path, destination: &Path) -> Result<(), CoreError> {
             .by_index(index)
             .map_err(|source| archive_error(archive, ArchiveError::Zip(source)))?;
 
-        let name = entry.name().to_owned();
+        let name = entry
+            .name()
+            .map_err(|source| archive_error(archive, ArchiveError::Zip(source)))?
+            .into_owned();
         let relative = entry.enclosed_name().filter(|_| is_safe_name(&name));
         let Some(relative) = relative else {
             return Err(archive_error(

@@ -4133,16 +4133,18 @@ mod tests {
 
         assert!(!harness.state().git.visible);
         harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::G);
-        harness.run();
+        harness.run_steps(1);
         assert!(harness.state().git.visible);
 
-        // A descoberta roda em background; aguarda o resultado sem travar.
+        // O refresh em background mantém repaint contínuo, então `run()` (que
+        // espera a UI assentar) estouraria max_steps. Avança passos com teto
+        // até a descoberta terminar.
         for _ in 0..200 {
             if harness.state().git.not_repo {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
-            harness.run();
+            harness.run_steps(1);
         }
         assert!(
             harness.state().git.not_repo,
@@ -4150,7 +4152,7 @@ mod tests {
         );
 
         harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::G);
-        harness.run();
+        harness.run_steps(1);
         assert!(!harness.state().git.visible);
     }
 
@@ -4183,21 +4185,24 @@ mod tests {
             .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
         harness.run();
         harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::G);
-        harness.run();
+        harness.run_steps(1);
 
+        // O refresh em background mantém repaint contínuo, então `run()` (que
+        // espera a UI assentar) estouraria max_steps. Avança passos com teto
+        // até o status esperado aparecer.
         for _ in 0..200 {
             if harness.state().git.status.is_some() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
-            harness.run();
+            harness.run_steps(1);
         }
         assert!(harness.state().git.status.is_some(), "status não carregou");
 
         harness.state_mut().git.focused = true;
-        harness.run();
+        harness.run_steps(1);
         harness.key_press(egui::Key::Enter);
-        harness.run();
+        harness.run_steps(1);
 
         for _ in 0..200 {
             let staged = harness
@@ -4210,16 +4215,16 @@ mod tests {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
-            harness.run();
+            harness.run_steps(1);
         }
         let status = harness.state().git.status.clone().expect("status");
         assert_eq!(status.staged.len(), 1, "Enter deveria preparar o arquivo");
         assert!(status.untracked.is_empty());
 
         harness.state_mut().git.focused = true;
-        harness.run();
+        harness.run_steps(1);
         harness.key_press(egui::Key::Enter);
-        harness.run();
+        harness.run_steps(1);
 
         for _ in 0..200 {
             let unstaged = harness
@@ -4232,7 +4237,7 @@ mod tests {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
-            harness.run();
+            harness.run_steps(1);
         }
         let status = harness.state().git.status.clone().expect("status");
         assert!(

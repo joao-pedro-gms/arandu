@@ -20,7 +20,9 @@ use std::sync::OnceLock;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arandu_config::{Action, Config, KeyBinding, Keymap, Modifiers as KeyModifiers, Theme};
+use arandu_config::{
+    Action, Config, KeyBinding, Keymap, Modifiers as KeyModifiers, TagsStore, Theme,
+};
 use arandu_core::fs::{CoreError, Entry, format_size, list_dir};
 use arandu_core::ops::{self, Op, OpKind, OpsError, Progress};
 use arandu_core::preview::{PreviewContent, PreviewError, PreviewRequest, UnsupportedReason};
@@ -406,6 +408,16 @@ struct RenameDialog {
     error: Option<String>,
 }
 
+/// Editor de tags (F4).
+struct TagEditorState {
+    /// Caminhos que receberão a tag digitada.
+    paths: Vec<PathBuf>,
+    /// Tag em digitação.
+    input: String,
+    /// Mensagem de validação da última tentativa.
+    error: Option<String>,
+}
+
 /// Aplicação principal do Arandu.
 pub struct AranduApp {
     config: Config,
@@ -425,6 +437,10 @@ pub struct AranduApp {
     delete_confirm: Option<Vec<PathBuf>>,
     /// Renomeação em edição.
     rename: Option<RenameDialog>,
+    /// Editor de tags aberto (F4).
+    tag_editor: Option<TagEditorState>,
+    /// Tags dos arquivos, persistidas em `tags.toml`.
+    tags: TagsStore,
     /// Painel de pré-visualização (F3).
     preview: PreviewState,
     /// Tema resolvido (config + arquivo de tema), aplicado no primeiro frame.
@@ -456,6 +472,13 @@ impl AranduApp {
             eprintln!("arandu: keymap inválido, usando o preset padrão: {error}");
             Keymap::default()
         });
+        #[cfg(test)]
+        let tags = TagsStore::default();
+        #[cfg(not(test))]
+        let tags = TagsStore::load().unwrap_or_else(|error| {
+            eprintln!("arandu: tags inválidas, começando vazio: {error}");
+            TagsStore::default()
+        });
         let theme = config.resolved_theme();
         Self {
             config,
@@ -469,6 +492,8 @@ impl AranduApp {
             ops: OpsState::default(),
             delete_confirm: None,
             rename: None,
+            tag_editor: None,
+            tags,
             preview: PreviewState::default(),
             theme,
             keymap,
@@ -660,6 +685,18 @@ impl AranduApp {
         }
     }
 
+    /// Tags das entradas de um painel, resolvidas uma vez por frame.
+    fn tag_map_for(&self, panel: &PanelState) -> HashMap<String, Vec<String>> {
+        let mut map = HashMap::new();
+        for entry in &panel.entries {
+            let tags = self.tags.tags_of(&entry.path);
+            if !tags.is_empty() {
+                map.insert(entry.path.to_string_lossy().into_owned(), tags);
+            }
+        }
+        map
+    }
+
     /// Trata atalhos globais antes de desenhar os widgets, casando as teclas
     /// pressionadas no frame contra o `Keymap` efetivo.
     ///
@@ -685,8 +722,9 @@ impl AranduApp {
             return;
         }
 
-        // O `TextEdit` do diálogo de renomeação recebe a digitação.
-        if self.rename.is_some() {
+        // O `TextEdit` dos diálogos de renomeação/edição de tags recebe a
+        // digitação; os atalhos globais ficam suspensos.
+        if self.rename.is_some() || self.tag_editor.is_some() {
             return;
         }
 
@@ -718,6 +756,7 @@ impl AranduApp {
         let undo = self.action_pressed(Action::Undo, &pressed);
         let cycle_theme = self.action_pressed(Action::CycleTheme, &pressed);
         let quit = self.action_pressed(Action::Quit, &pressed);
+        let tag_files = self.action_pressed(Action::TagFiles, &pressed);
 
         if toggle_preview {
             self.preview.visible = !self.preview.visible;
@@ -750,6 +789,9 @@ impl AranduApp {
         }
         if rename {
             self.start_rename();
+        }
+        if tag_files {
+            self.start_tag_editor();
         }
         if delete {
             self.request_delete();
@@ -930,6 +972,27 @@ impl AranduApp {
         });
     }
 
+    /// Abre o editor de tags para a seleção do painel ativo (ou o item focado).
+    fn start_tag_editor(&mut self) {
+        let paths = self.active_panel().selected_paths();
+        if paths.is_empty() {
+            return;
+        }
+        self.tag_editor = Some(TagEditorState {
+            paths,
+            input: String::new(),
+            error: None,
+        });
+    }
+
+    /// Persiste as tags (em testes, não toca no disco real).
+    fn persist_tags(&self) {
+        #[cfg(not(test))]
+        if let Err(error) = self.tags.save() {
+            eprintln!("arandu: não foi possível salvar as tags: {error}");
+        }
+    }
+
     /// Pede confirmação para enviar a seleção à lixeira.
     fn request_delete(&mut self) {
         let paths = self.active_panel().selected_paths();
@@ -1057,7 +1120,6 @@ impl AranduApp {
                 Sense::CLICK | Sense::DRAG,
             )
             .on_hover_text(rust_i18n::t!("splitter_hint"));
-
         if splitter.double_clicked() {
             self.split = 0.5;
         }
@@ -1070,6 +1132,9 @@ impl AranduApp {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         }
 
+        let left_tags = self.tag_map_for(&self.left);
+        let right_tags = self.tag_map_for(&self.right);
+
         let left_interacted = draw_panel(
             ui,
             left_rect,
@@ -1077,6 +1142,7 @@ impl AranduApp {
             PanelSide::Left,
             self.active == PanelSide::Left,
             accent,
+            &left_tags,
         );
         let right_interacted = draw_panel(
             ui,
@@ -1085,6 +1151,7 @@ impl AranduApp {
             PanelSide::Right,
             self.active == PanelSide::Right,
             accent,
+            &right_tags,
         );
 
         if left_interacted {
@@ -1496,6 +1563,97 @@ impl AranduApp {
                 self.rename = Some(dialog);
             }
         }
+
+        if let Some(mut dialog) = self.tag_editor.take() {
+            // União das tags dos alvos, usada para exibir e remover.
+            let mut union = std::collections::BTreeSet::new();
+            for path in &dialog.paths {
+                union.extend(self.tags.tags_of(path));
+            }
+            let existing: Vec<String> = union.into_iter().collect();
+
+            let mut submit = false;
+            let mut cancel = false;
+            let mut remove: Option<String> = None;
+
+            egui::Modal::new(egui::Id::unique("tag-editor-dialog")).show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                ui.heading(rust_i18n::t!("tags_title"));
+                ui.add_space(6.0);
+                ui.label(rust_i18n::t!("tags_targets", count = dialog.paths.len()));
+                ui.add_space(6.0);
+
+                if existing.is_empty() {
+                    ui.label(
+                        RichText::new(rust_i18n::t!("tags_empty"))
+                            .color(ui.visuals().weak_text_color()),
+                    );
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        for tag in &existing {
+                            if ui.button(format!("{tag} ×")).clicked() {
+                                remove = Some(tag.clone());
+                            }
+                        }
+                    });
+                }
+
+                ui.add_space(8.0);
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut dialog.input)
+                        .hint_text(rust_i18n::t!("tags_input_placeholder"))
+                        .desired_width(f32::INFINITY),
+                );
+                if !response.has_focus() {
+                    response.request_focus();
+                }
+                if let Some(error) = dialog.error.take() {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+                if ui.input(|input| input.key_pressed(Key::Enter)) {
+                    submit = true;
+                }
+                if ui.input(|input| input.key_pressed(Key::Escape)) {
+                    cancel = true;
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button(rust_i18n::t!("cancel")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+            if let Some(tag) = remove {
+                for path in &dialog.paths {
+                    self.tags.remove(path, &tag);
+                }
+                self.persist_tags();
+            }
+
+            if submit {
+                let tag = dialog.input.trim().to_owned();
+                if tag.is_empty() {
+                    dialog.error = Some(rust_i18n::t!("tags_invalid").to_string());
+                    self.tag_editor = Some(dialog);
+                } else {
+                    let added = dialog
+                        .paths
+                        .iter()
+                        .try_for_each(|path| self.tags.add(path, &tag));
+                    if added.is_ok() {
+                        self.persist_tags();
+                        dialog.input.clear();
+                        dialog.error = None;
+                    } else {
+                        dialog.error = Some(rust_i18n::t!("tags_invalid").to_string());
+                    }
+                    self.tag_editor = Some(dialog);
+                }
+            } else if !cancel {
+                self.tag_editor = Some(dialog);
+            }
+        }
     }
 
     fn draw_status_bar(&mut self, ui: &mut Ui, rect: Rect) {
@@ -1633,6 +1791,7 @@ fn draw_panel(
     side: PanelSide,
     active: bool,
     accent: Color32,
+    tags: &HashMap<String, Vec<String>>,
 ) -> bool {
     let visuals = ui.visuals().clone();
     let mut interacted = false;
@@ -1751,7 +1910,9 @@ fn draw_panel(
                         accent,
                         dim: !active,
                     };
-                    if let Some(row_action) = draw_row(ui, entry, index, &style, &visuals, side) {
+                    if let Some(row_action) =
+                        draw_row(ui, entry, index, &style, &visuals, side, tags)
+                    {
                         action = Some(row_action);
                     }
                 }
@@ -1841,6 +2002,7 @@ fn draw_row(
     style: &RowStyle,
     visuals: &egui::Visuals,
     side: PanelSide,
+    tags: &HashMap<String, Vec<String>>,
 ) -> Option<RowAction> {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::hover());
@@ -1851,7 +2013,7 @@ fn draw_row(
     let right = rect.right() - 6.0;
     let modified_right = right;
     let size_right = modified_right - MODIFIED_COL_W;
-    let name_right = size_right - SIZE_COL_W - 8.0;
+    let mut name_right = size_right - SIZE_COL_W - 8.0;
 
     let text_color = visuals.text_color();
     let secondary = if style.dim {
@@ -1898,6 +2060,18 @@ fn draw_row(
         }
     }
 
+    if let Some(entry_tags) = tags.get(entry.path.to_string_lossy().as_ref()) {
+        name_right = draw_tag_chips(
+            ui,
+            left,
+            name_right,
+            rect.top(),
+            rect.bottom(),
+            entry_tags,
+            visuals,
+        );
+    }
+
     let name_rect = Rect::from_min_max(
         pos2(left, rect.top()),
         pos2(name_right.max(left + 1.0), rect.bottom()),
@@ -1928,6 +2102,80 @@ fn draw_row(
         return Some(RowAction::Click { index, ctrl });
     }
     None
+}
+
+/// Desenha chips de tags antes das colunas de Tamanho/Modificado.
+///
+/// Mostra no máximo três tags e um `+N` para o restante. Devolve a borda
+/// direita disponível para o nome; se não houver largura suficiente, não
+/// desenha nada e devolve `name_right` inalterado. As cores vêm de
+/// `visuals` (fundo `faint_bg_color`, texto fraco), como o resto da UI.
+fn draw_tag_chips(
+    ui: &mut Ui,
+    left: f32,
+    name_right: f32,
+    top: f32,
+    bottom: f32,
+    tags: &[String],
+    visuals: &egui::Visuals,
+) -> f32 {
+    const MAX_CHIPS: usize = 3;
+    const CHIP_H: f32 = 14.0;
+    const CHIP_PAD: f32 = 5.0;
+    const CHIP_GAP: f32 = 4.0;
+    const MIN_NAME_W: f32 = 80.0;
+
+    let mut labels: Vec<String> = tags.iter().take(MAX_CHIPS).cloned().collect();
+    if tags.len() > MAX_CHIPS {
+        labels.push(format!("+{}", tags.len() - MAX_CHIPS));
+    }
+    if labels.is_empty() {
+        return name_right;
+    }
+
+    let font = FontId::proportional(11.0);
+    let color = visuals.weak_text_color();
+    let widths: Vec<f32> = labels
+        .iter()
+        .map(|label| {
+            ui.painter()
+                .layout_no_wrap(label.clone(), font.clone(), color)
+                .size()
+                .x
+        })
+        .collect();
+    let total = widths
+        .iter()
+        .map(|width| width + 2.0 * CHIP_PAD)
+        .sum::<f32>()
+        + CHIP_GAP * labels.len().saturating_sub(1) as f32;
+
+    if name_right - total - 6.0 - left < MIN_NAME_W {
+        return name_right;
+    }
+
+    let mut x = name_right - total;
+    let center_y = (top + bottom) / 2.0;
+    {
+        let painter = ui.painter();
+        for (label, width) in labels.iter().zip(widths.iter()) {
+            let chip = Rect::from_min_size(
+                pos2(x, center_y - CHIP_H / 2.0),
+                vec2(width + 2.0 * CHIP_PAD, CHIP_H),
+            );
+            painter.rect_filled(chip, CHIP_H / 2.0, visuals.faint_bg_color);
+            painter.text(
+                chip.center(),
+                Align2::CENTER_CENTER,
+                label,
+                font.clone(),
+                color,
+            );
+            x += width + 2.0 * CHIP_PAD + CHIP_GAP;
+        }
+    }
+
+    name_right - total - 6.0
 }
 
 /// Card de metadados usado por diretórios, binários e erros de leitura.
@@ -2212,6 +2460,7 @@ fn action_description(action: Action) -> String {
         Action::CycleTheme => "action_cycle_theme",
         Action::Quit => "action_quit",
         Action::ShowHints => "action_show_hints",
+        Action::TagFiles => "action_tag_files",
     };
     rust_i18n::t!(key).into_owned()
 }
@@ -2278,6 +2527,12 @@ impl AranduApp {
     #[cfg(test)]
     fn preview_visible(&self) -> bool {
         self.preview.visible
+    }
+
+    /// Tags de um caminho — usado em testes.
+    #[cfg(test)]
+    fn tags_of(&self, path: &Path) -> Vec<String> {
+        self.tags.tags_of(path)
     }
 
     /// Chave do item focado quando ele é um arquivo elegível a preview.
@@ -2707,5 +2962,72 @@ mod tests {
             harness.query_all_by_label(&expected).count() >= 1,
             "esperava os hints dinâmicos na status bar: {expected}"
         );
+    }
+
+    #[test]
+    fn f4_opens_tag_editor_and_enter_adds_tag() {
+        let (dir, mut app) = fixture_app();
+        let index = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.name == "fixture-file.txt")
+            .expect("fixture tem fixture-file.txt");
+        app.left.select(index, false);
+        let path = dir.path().join("fixture-file.txt");
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        harness.key_press(egui::Key::F4);
+        harness.run();
+        assert!(
+            harness.state().tag_editor.is_some(),
+            "F4 deveria abrir o editor de tags"
+        );
+        let title = rust_i18n::t!("tags_title").to_string();
+        assert!(
+            harness.query_all_by_label(&title).count() >= 1,
+            "esperava o diálogo '{title}'"
+        );
+
+        // A digitação real vai para o `TextEdit`; aqui preenchemos o estado.
+        harness
+            .state_mut()
+            .tag_editor
+            .as_mut()
+            .expect("editor aberto")
+            .input
+            .push_str("urgente");
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+
+        assert_eq!(
+            harness.state().tags_of(&path),
+            vec!["urgente".to_owned()],
+            "Enter deveria adicionar a tag ao alvo"
+        );
+        assert!(
+            harness.state().tag_editor.is_some(),
+            "o editor continua aberto para adicionar mais tags"
+        );
+
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert!(harness.state().tag_editor.is_none());
+    }
+
+    #[test]
+    fn tag_map_resolves_tags_for_visible_entries() {
+        let (dir, mut app) = fixture_app();
+        let path = dir.path().join("fixture-file.txt");
+        app.tags.add(&path, "chip").expect("adiciona tag");
+
+        let map = app.tag_map_for(&app.left);
+        let key = path.to_string_lossy().into_owned();
+        assert_eq!(map.get(&key), Some(&vec!["chip".to_owned()]));
     }
 }

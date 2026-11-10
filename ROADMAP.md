@@ -8,8 +8,8 @@ O roadmap detalhado com justificativas vive em [SCOPE.md](SCOPE.md). Esta págin
 - [x] Workspace Cargo com crates `core`, `config`, `ui` (+ `git`/`index` reservados) <!-- PR #1 -->
 - [x] Navegação dual pane (splitter arrastável, foco por painel) <!-- PR #3 -->
 - [ ] Modos de visualização: ícones, lista, colunas (virtualização com `show_rows`) <!-- PR #3: lista; ícones/colunas pendentes -->
-- [ ] Operações: copiar/mover/renomear/deletar/criar com **fila + progresso**
-- [ ] **Undo/redo** de operações + **lixeira** do SO
+- [x] Operações: copiar/mover/renomear/deletar com **fila + progresso** <!-- PR #4 -->
+- [x] **Undo** de operações + **lixeira** do SO <!-- PR #4: undo sem redo (decisão) -->
 - [ ] Preview pane: texto com syntax highlight (syntect), imagens
 - [ ] Temas TOML + configuração + keymap redefinível (preset Vim)
 - [ ] i18n desde o dia 1 (todas as strings via sistema de tradução)

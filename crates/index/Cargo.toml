@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Indexação e busca global do Arandu (reservado para a fase 2)"
+description = "Indexação e busca global do Arandu"
 
 [dependencies]
+walkdir = "2"
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

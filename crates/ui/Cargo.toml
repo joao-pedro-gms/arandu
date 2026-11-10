@@ -17,8 +17,10 @@ rust-i18n.workspace = true
 arandu-config.workspace = true
 arandu-core.workspace = true
 arandu-git.workspace = true
+arandu-index.workspace = true
 syntect.workspace = true
 image.workspace = true
+egui_commonmark.workspace = true
 
 [dev-dependencies]
 egui_kittest = "0.37"

@@ -17,6 +17,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -28,9 +29,12 @@ use arandu_core::batch::apply_pattern;
 use arandu_core::fs::{CoreError, Entry, format_size, list_dir};
 use arandu_core::hash::{md5_file, sha256_file};
 use arandu_core::ops::{self, Op, OpKind, OpsError, Progress};
-use arandu_core::preview::{PreviewContent, PreviewError, PreviewRequest, UnsupportedReason};
+use arandu_core::preview::{
+    PreviewContent, PreviewError, PreviewRequest, UnsupportedReason, hex_row,
+};
 use arandu_core::queue::{OpQueue, QueueEvent, UndoStack};
 use arandu_git::{FileStatus, GitStatus, Repo};
+use arandu_index::{IndexEntry, IndexStore, Indexer};
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Key, Label, Layout, Modifiers, Rect, RichText,
     ScrollArea, Sense, Stroke, StrokeKind, TextFormat, TextStyle, Ui, UiBuilder, pos2, vec2,
@@ -83,7 +87,10 @@ const GIT_MAX_FRACTION: f32 = 0.5;
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 /// Altura reservada ao formulário de commit no painel Git.
 const GIT_COMMIT_H: f32 = 96.0;
-
+/// Bytes por linha no hex dump.
+const HEX_ROW_BYTES: usize = 16;
+/// Máximo de linhas de dados exibidas na tabela CSV.
+const CSV_MAX_ROWS: usize = 1000;
 /// Teto de linhas renderizadas com syntax highlight.
 ///
 /// Um arquivo de 1 MiB pode ter dezenas de milhares de linhas; construir e
@@ -100,6 +107,12 @@ const CELL_GAP: f32 = 8.0;
 const ICON_SIZE: f32 = 28.0;
 /// Altura reservada para o nome (duas linhas) no modo ícones.
 const GRID_NAME_H: f32 = 40.0;
+/// Máximo de resultados exibidos no quick-open (Ctrl+P).
+const QUICK_OPEN_MAX_RESULTS: usize = 20;
+/// Altura de uma linha de resultado no quick-open.
+const QUICK_OPEN_ROW_H: f32 = 22.0;
+/// Intervalo mínimo entre rescans automáticos do índice ao reabrir.
+const QUICK_OPEN_REFRESH: Duration = Duration::from_secs(300);
 
 /// Ações listadas na status bar, na ordem em que aparecem (as principais).
 const STATUS_HINTS: [Action; 7] = [
@@ -247,6 +260,22 @@ impl PanelState {
         if let Some(parent) = self.cwd.parent() {
             let parent = parent.to_path_buf();
             self.navigate_to(parent);
+        }
+    }
+
+    /// Navega para o diretório pai de `path` e foca a entrada, se presente.
+    ///
+    /// Usado pelo quick-open: o item vem do índice global e pode estar em
+    /// qualquer lugar da árvore.
+    fn reveal_path(&mut self, path: &Path) {
+        if let Some(parent) = path.parent()
+            && parent != self.cwd
+        {
+            self.navigate_to(parent.to_path_buf());
+        }
+        if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
+            self.select(index, false);
+            self.ensure_focus_visible();
         }
     }
 
@@ -466,8 +495,10 @@ struct PreviewState {
     receiver: Option<Receiver<(PreviewKey, Result<PreviewContent, PreviewError>)>>,
     /// Job de highlight do preview de texto atual.
     job: Option<(PreviewKey, bool, Arc<egui::text::LayoutJob>)>,
-    /// Textura da imagem atual.
+    /// Textura da imagem/PDF atual.
     texture: Option<(PreviewKey, egui::TextureHandle)>,
+    /// Cache de layout/renderização do Markdown.
+    markdown_cache: egui_commonmark::CommonMarkCache,
 }
 
 /// Conjunto padrão de sintaxes (carregado uma única vez).
@@ -593,6 +624,69 @@ enum GitSection {
     Untracked,
 }
 
+/// Evento enviado pela thread de indexação.
+enum IndexScanEvent {
+    /// Total de entradas já percorridas.
+    Progress(usize),
+    /// Scan concluído com o índice completo.
+    Done(Vec<IndexEntry>),
+}
+
+/// Estado do scan do índice global.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum IndexScanStatus {
+    /// Nenhum scan iniciado nesta sessão.
+    #[default]
+    Idle,
+    /// Scan em andamento em background.
+    Scanning,
+    /// Índice pronto para consultas.
+    Ready,
+}
+
+/// Overlay de quick-open (Ctrl+P).
+struct QuickOpenState {
+    open: bool,
+    query: String,
+    focus: usize,
+    results: Vec<(u32, IndexEntry)>,
+    /// Última consulta usada para preencher `results`.
+    last_query: String,
+    /// Pede recomputação dos resultados no próximo frame.
+    dirty: bool,
+    store: IndexStore,
+    receiver: Option<Receiver<IndexScanEvent>>,
+    /// Cancelamento compartilhado com a thread de scan.
+    cancel: Arc<AtomicBool>,
+    status: IndexScanStatus,
+    /// Entradas já percorridas no scan atual.
+    scanned: usize,
+    /// Fim do último scan bem-sucedido (para o refresh automático).
+    last_scan: Option<Instant>,
+    /// Pede foco no campo de busca no próximo frame.
+    needs_focus: bool,
+}
+
+impl Default for QuickOpenState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            query: String::new(),
+            focus: 0,
+            results: Vec::new(),
+            last_query: String::new(),
+            dirty: false,
+            store: IndexStore::new(),
+            receiver: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            status: IndexScanStatus::Idle,
+            scanned: 0,
+            last_scan: None,
+            needs_focus: false,
+        }
+    }
+}
+
 /// Aplicação principal do Arandu.
 pub struct AranduApp {
     config: Config,
@@ -636,6 +730,8 @@ pub struct AranduApp {
     keymap: Keymap,
     /// Cheatsheet de atalhos visível (F1).
     show_hints: bool,
+    /// Quick-open global (Ctrl+P).
+    quick_open: QuickOpenState,
     /// Congela a drenagem da fila em testes determinísticos de progresso.
     #[cfg(test)]
     injected_ops: bool,
@@ -691,6 +787,7 @@ impl AranduApp {
             theme,
             keymap,
             show_hints: false,
+            quick_open: QuickOpenState::default(),
             #[cfg(test)]
             injected_ops: false,
         }
@@ -718,6 +815,7 @@ impl AranduApp {
         self.pump_archive_jobs();
         self.pump_git();
         self.request_git_refresh(false);
+        self.pump_index_scan(&ctx);
         if self.compress_job.is_some() || self.extract_job.is_some() || self.git.receiver.is_some()
         {
             ctx.request_repaint();
@@ -756,6 +854,7 @@ impl AranduApp {
         }
         self.draw_status_bar(ui, status_rect);
         self.draw_hints_overlay(&ctx);
+        self.draw_quick_open(&ctx);
         self.draw_dialogs(&ctx);
     }
 
@@ -929,6 +1028,39 @@ impl AranduApp {
             return;
         }
 
+        // Quick-open: o campo de busca captura a digitação. Setas percorrem a
+        // lista, Enter ativa o item focado e Esc/Ctrl+P fecham o overlay.
+        if self.quick_open.open {
+            let pressed = pressed_keys(ctx);
+            let toggle = self.action_pressed(Action::ToggleQuickOpen, &pressed);
+            let (escape, up, down, enter) = ctx.input_mut(|input| {
+                (
+                    input.consume_key(Modifiers::NONE, Key::Escape),
+                    input.consume_key(Modifiers::NONE, Key::ArrowUp),
+                    input.consume_key(Modifiers::NONE, Key::ArrowDown),
+                    input.consume_key(Modifiers::NONE, Key::Enter),
+                )
+            });
+
+            if toggle || escape {
+                self.quick_open.open = false;
+                return;
+            }
+            if !self.quick_open.results.is_empty() {
+                let last = self.quick_open.results.len() - 1;
+                if up {
+                    self.quick_open.focus = self.quick_open.focus.saturating_sub(1);
+                }
+                if down {
+                    self.quick_open.focus = (self.quick_open.focus + 1).min(last);
+                }
+            }
+            if enter {
+                self.activate_quick_open();
+            }
+            return;
+        }
+
         // Diálogos das ferramentas: Esc (e, no caso dos checksums, a própria
         // ação) fecham; o restante da digitação/atalhos fica suspenso. O
         // cálculo em background pode terminar sozinho e o resultado é
@@ -971,6 +1103,11 @@ impl AranduApp {
         }
         if toggle_hints {
             self.show_hints = true;
+            return;
+        }
+
+        if self.action_pressed(Action::ToggleQuickOpen, &pressed) {
+            self.open_quick_open();
             return;
         }
 
@@ -1697,6 +1834,230 @@ impl AranduApp {
         }
     }
 
+    /// Abre o quick-open, iniciando o scan do `$HOME` no primeiro uso.
+    ///
+    /// Reabrir reaproveita o índice em memória; um rescans só acontece se o
+    /// último scan tiver mais de [`QUICK_OPEN_REFRESH`].
+    fn open_quick_open(&mut self) {
+        self.quick_open.open = true;
+        self.quick_open.needs_focus = true;
+        self.quick_open.query.clear();
+        self.quick_open.focus = 0;
+        self.quick_open.results.clear();
+        self.quick_open.last_query.clear();
+        self.quick_open.dirty = true;
+
+        let needs_scan = match self.quick_open.status {
+            IndexScanStatus::Idle => true,
+            IndexScanStatus::Scanning => false,
+            IndexScanStatus::Ready => self
+                .quick_open
+                .last_scan
+                .is_none_or(|last| last.elapsed() >= QUICK_OPEN_REFRESH),
+        };
+        if needs_scan {
+            self.start_index_scan();
+        }
+    }
+
+    /// Inicia o scan do diretório home em uma thread própria.
+    fn start_index_scan(&mut self) {
+        if self.quick_open.receiver.is_some() {
+            return;
+        }
+
+        let root = home_directory();
+        let cancel = Arc::clone(&self.quick_open.cancel);
+        cancel.store(false, Ordering::Relaxed);
+        let (sender, receiver) = mpsc::channel();
+        self.quick_open.receiver = Some(receiver);
+        self.quick_open.status = IndexScanStatus::Scanning;
+        self.quick_open.scanned = 0;
+
+        std::thread::spawn(move || {
+            let progress_sender = sender.clone();
+            let entries = Indexer::new().scan_with_progress(&root, &cancel, |count| {
+                let _ = progress_sender.send(IndexScanEvent::Progress(count));
+            });
+            // Canal descartado = app encerrado; a thread termina sozinha.
+            let _ = sender.send(IndexScanEvent::Done(entries));
+        });
+    }
+
+    /// Drena eventos do scan de índice sem bloquear a UI.
+    fn pump_index_scan(&mut self, ctx: &egui::Context) {
+        let mut progress = None;
+        let mut finished = None;
+
+        if let Some(receiver) = &self.quick_open.receiver {
+            while let Ok(event) = receiver.try_recv() {
+                match event {
+                    IndexScanEvent::Progress(count) => progress = Some(count),
+                    IndexScanEvent::Done(entries) => finished = Some(entries),
+                }
+            }
+        }
+
+        if let Some(count) = progress {
+            self.quick_open.scanned = count;
+        }
+
+        if let Some(entries) = finished {
+            self.quick_open.store.update(entries);
+            self.quick_open.status = IndexScanStatus::Ready;
+            self.quick_open.scanned = self.quick_open.store.len();
+            self.quick_open.receiver = None;
+            self.quick_open.last_scan = Some(Instant::now());
+            self.quick_open.dirty = true;
+        }
+
+        if self.quick_open.receiver.is_some() {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Recalcula os resultados quando a consulta/índice mudou.
+    fn refresh_quick_open_results(&mut self) {
+        if !self.quick_open.dirty && self.quick_open.query == self.quick_open.last_query {
+            return;
+        }
+
+        self.quick_open
+            .last_query
+            .clone_from(&self.quick_open.query);
+        self.quick_open.results = self
+            .quick_open
+            .store
+            .search(&self.quick_open.query, QUICK_OPEN_MAX_RESULTS);
+        self.quick_open.dirty = false;
+
+        if self.quick_open.results.is_empty() {
+            self.quick_open.focus = 0;
+        } else {
+            self.quick_open.focus = self.quick_open.focus.min(self.quick_open.results.len() - 1);
+        }
+    }
+
+    /// Ativa o resultado focado: navega o painel ativo e foca a entrada.
+    fn activate_quick_open(&mut self) {
+        let Some((_, entry)) = self.quick_open.results.get(self.quick_open.focus).cloned() else {
+            return;
+        };
+        self.quick_open.open = false;
+        self.active_panel_mut().reveal_path(&entry.path);
+    }
+
+    /// Overlay central de quick-open (Ctrl+P).
+    fn draw_quick_open(&mut self, ctx: &egui::Context) {
+        if !self.quick_open.open {
+            return;
+        }
+        self.refresh_quick_open_results();
+
+        let mut activate = false;
+        let mut clicked_row = None;
+        let quick = &mut self.quick_open;
+        let scanning = quick.status == IndexScanStatus::Scanning;
+        let scanned = quick.scanned;
+
+        let modal = egui::Modal::new(egui::Id::unique("quick-open")).show(ctx, |ui| {
+            ui.set_min_width(640.0);
+            ui.set_max_width(640.0);
+
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut quick.query)
+                    .hint_text(rust_i18n::t!("quick_open_placeholder"))
+                    .desired_width(f32::INFINITY),
+            );
+            if quick.needs_focus {
+                response.request_focus();
+                quick.needs_focus = false;
+            }
+            ui.add_space(6.0);
+
+            if quick.results.is_empty() {
+                let message = if scanning {
+                    rust_i18n::t!("quick_open_indexing", count => scanned).into_owned()
+                } else if quick.query.is_empty() {
+                    rust_i18n::t!("quick_open_start").into_owned()
+                } else {
+                    rust_i18n::t!("quick_open_empty").into_owned()
+                };
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new(message)
+                        .color(ui.visuals().weak_text_color())
+                        .italics(),
+                );
+                ui.add_space(12.0);
+            } else {
+                let visuals = ui.visuals().clone();
+                let weak = visuals.weak_text_color();
+                for (index, (_, entry)) in quick.results.iter().enumerate() {
+                    let selected = index == quick.focus;
+                    let (rect, row) = ui.allocate_exact_size(
+                        vec2(ui.available_width(), QUICK_OPEN_ROW_H),
+                        Sense::click(),
+                    );
+                    if selected {
+                        ui.painter()
+                            .rect_filled(rect, 3.0, visuals.selection.bg_fill);
+                    }
+                    let text_color = if selected {
+                        visuals.strong_text_color()
+                    } else {
+                        visuals.text_color()
+                    };
+                    let mut row_ui = ui.new_child(
+                        UiBuilder::new()
+                            .max_rect(rect.shrink2(vec2(8.0, 2.0)))
+                            .layout(Layout::left_to_right(Align::Center)),
+                    );
+                    row_ui.spacing_mut().item_spacing.x = 10.0;
+                    row_ui.label(RichText::new(&entry.name).strong().color(text_color));
+                    row_ui.add(
+                        Label::new(
+                            RichText::new(entry.path.display().to_string())
+                                .small()
+                                .color(weak),
+                        )
+                        .truncate(),
+                    );
+
+                    if row.clicked() {
+                        clicked_row = Some(index);
+                    }
+                    if row.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                }
+            }
+
+            ui.add_space(4.0);
+            let footer = if scanning {
+                rust_i18n::t!("quick_open_indexing", count => scanned).into_owned()
+            } else {
+                rust_i18n::t!("quick_open_footer", count => quick.store.len()).into_owned()
+            };
+            ui.label(
+                RichText::new(footer)
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+        });
+
+        if modal.should_close() {
+            self.quick_open.open = false;
+        }
+        if let Some(index) = clicked_row {
+            self.quick_open.focus = index;
+            activate = true;
+        }
+        if activate {
+            self.activate_quick_open();
+        }
+    }
+
     /// Persiste as tags (em testes, não toca no disco real).
     fn persist_tags(&self) {
         #[cfg(not(test))]
@@ -2197,6 +2558,7 @@ impl AranduApp {
             .into_iter()
             .next()
             .map(|binding| format!("{binding} {}", action_description(Action::TogglePreview)));
+        let kind_label = entry.and_then(|entry| self.preview_kind_label(entry));
         ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             let header = ui.allocate_ui_with_layout(
@@ -2204,6 +2566,18 @@ impl AranduApp {
                 Layout::left_to_right(Align::Center),
                 |ui| {
                     ui.label(RichText::new(rust_i18n::t!("preview_title")).strong());
+                    if let Some(kind) = &kind_label {
+                        ui.label(
+                            RichText::new("·")
+                                .size(12.5)
+                                .color(visuals.weak_text_color()),
+                        );
+                        ui.label(
+                            RichText::new(kind)
+                                .size(12.5)
+                                .color(visuals.weak_text_color()),
+                        );
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if let Some(hint) = &toggle_hint {
                             ui.label(
@@ -2270,8 +2644,25 @@ impl AranduApp {
                         syntax_name.as_deref(),
                     );
                 }
+                PreviewContent::Markdown { text, truncated } => {
+                    self.draw_preview_markdown(ui, body, text, *truncated);
+                }
+                PreviewContent::Hex {
+                    bytes, truncated, ..
+                } => {
+                    self.draw_preview_hex(ui, body, bytes, *truncated);
+                }
+                PreviewContent::Csv { text, truncated } => {
+                    self.draw_preview_csv(ui, body, text, *truncated);
+                }
+                PreviewContent::Json { text, truncated } => {
+                    self.draw_preview_text(ui, body, &key, text, *truncated, Some("json"));
+                }
                 PreviewContent::Image { image, .. } => {
                     self.draw_preview_image(ui, body, &key, image, visuals);
+                }
+                PreviewContent::Pdf { page, .. } => {
+                    self.draw_preview_rgba(ui, body, &key, page, visuals);
                 }
                 PreviewContent::Unsupported { reason } => {
                     ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
@@ -2354,12 +2745,171 @@ impl AranduApp {
         });
     }
 
+    /// Rótulo do tipo detectado exibido no header do painel.
+    fn preview_kind_label(&self, entry: &Entry) -> Option<String> {
+        if entry.is_dir {
+            return Some(rust_i18n::t!("preview_kind_directory").to_string());
+        }
+        let key = PreviewKey::for_entry(entry);
+        let PreviewEntry::Ready(content) = self.preview.cache.get(&key)? else {
+            return None;
+        };
+        Some(match &*content {
+            PreviewContent::Text { .. } => rust_i18n::t!("preview_kind_text").to_string(),
+            PreviewContent::Markdown { .. } => rust_i18n::t!("preview_kind_markdown").to_string(),
+            PreviewContent::Hex { .. } => rust_i18n::t!("preview_kind_hex").to_string(),
+            PreviewContent::Csv { .. } => rust_i18n::t!("preview_kind_csv").to_string(),
+            PreviewContent::Json { .. } => rust_i18n::t!("preview_kind_json").to_string(),
+            PreviewContent::Image { .. } => rust_i18n::t!("preview_kind_image").to_string(),
+            PreviewContent::Pdf { page_count, .. } => format!(
+                "{} — {}",
+                rust_i18n::t!("preview_kind_pdf"),
+                rust_i18n::t!("preview_pdf_pages", count => *page_count)
+            ),
+            PreviewContent::Unsupported { .. } => return None,
+        })
+    }
+
+    fn draw_preview_markdown(&mut self, ui: &mut Ui, body: Rect, text: &str, truncated: bool) {
+        let cache = &mut self.preview.markdown_cache;
+        ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
+            if truncated {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(rust_i18n::t!("preview_truncated"))
+                        .size(12.5)
+                        .color(ui.visuals().warn_fg_color),
+                );
+            }
+            ScrollArea::vertical()
+                .id_salt("preview-markdown")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add_space(4.0);
+                    egui_commonmark::CommonMarkViewer::new().show(ui, cache, text);
+                    ui.add_space(8.0);
+                });
+        });
+    }
+
+    fn draw_preview_hex(&mut self, ui: &mut Ui, body: Rect, bytes: &[u8], truncated: bool) {
+        ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
+            if truncated {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(rust_i18n::t!("preview_truncated"))
+                        .size(12.5)
+                        .color(ui.visuals().warn_fg_color),
+                );
+            }
+            let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+            let rows = bytes.len().div_ceil(HEX_ROW_BYTES);
+            let visuals = ui.visuals().clone();
+            ScrollArea::vertical()
+                .id_salt("preview-hex")
+                .auto_shrink([false, false])
+                .show_rows(ui, row_height, rows, |ui, row_range| {
+                    for row in row_range {
+                        let offset = row * HEX_ROW_BYTES;
+                        let end = (offset + HEX_ROW_BYTES).min(bytes.len());
+                        let (offset_text, hex_text, ascii_text) =
+                            hex_row(offset, &bytes[offset..end]);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 12.0;
+                            ui.label(
+                                RichText::new(offset_text)
+                                    .monospace()
+                                    .color(visuals.weak_text_color()),
+                            );
+                            ui.label(RichText::new(hex_text).monospace());
+                            ui.label(
+                                RichText::new(ascii_text)
+                                    .monospace()
+                                    .color(visuals.weak_text_color()),
+                            );
+                        });
+                    }
+                });
+        });
+    }
+
+    fn draw_preview_csv(&mut self, ui: &mut Ui, body: Rect, text: &str, truncated: bool) {
+        ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
+            if truncated {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(rust_i18n::t!("preview_truncated"))
+                        .size(12.5)
+                        .color(ui.visuals().warn_fg_color),
+                );
+            }
+            let mut lines = text.lines();
+            let Some(header) = lines.next() else {
+                return;
+            };
+            let delimiter = if header.contains('\t') && !header.contains(',') {
+                '\t'
+            } else {
+                ','
+            };
+            let headers = parse_csv_row(header, delimiter);
+            let rows: Vec<Vec<String>> = lines
+                .take(CSV_MAX_ROWS + 1)
+                .map(|line| parse_csv_row(line, delimiter))
+                .collect();
+            let capped = rows.len() > CSV_MAX_ROWS;
+            ScrollArea::both()
+                .id_salt("preview-csv")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::Grid::new("preview-csv-grid")
+                        .striped(true)
+                        .min_col_width(32.0)
+                        .show(ui, |ui| {
+                            for field in &headers {
+                                ui.label(RichText::new(field.as_str()).strong());
+                            }
+                            ui.end_row();
+                            for row in rows.iter().take(CSV_MAX_ROWS) {
+                                for field in row {
+                                    ui.label(if field.is_empty() { " " } else { field });
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    if capped {
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(rust_i18n::t!(
+                                "preview_csv_limit",
+                                count => CSV_MAX_ROWS
+                            ))
+                            .size(12.5)
+                            .color(ui.visuals().warn_fg_color),
+                        );
+                    }
+                });
+        });
+    }
+
     fn draw_preview_image(
         &mut self,
         ui: &mut Ui,
         body: Rect,
         key: &PreviewKey,
         image: &image::DynamicImage,
+        visuals: &egui::Visuals,
+    ) {
+        let rgba = image.to_rgba8();
+        self.draw_preview_rgba(ui, body, key, &rgba, visuals);
+    }
+
+    fn draw_preview_rgba(
+        &mut self,
+        ui: &mut Ui,
+        body: Rect,
+        key: &PreviewKey,
+        rgba: &image::RgbaImage,
         _visuals: &egui::Visuals,
     ) {
         let stale = self
@@ -2369,7 +2919,6 @@ impl AranduApp {
             .map(|(cached_key, _)| cached_key != key)
             .unwrap_or(true);
         if stale {
-            let rgba = image.to_rgba8();
             let color = egui::ColorImage::from_rgba_unmultiplied(
                 [rgba.width() as usize, rgba.height() as usize],
                 rgba.as_raw(),
@@ -2388,8 +2937,8 @@ impl AranduApp {
         let texture = texture.clone();
 
         let available = body.size() - vec2(0.0, 8.0);
-        let width = image.width() as f32;
-        let height = image.height() as f32;
+        let width = rgba.width() as f32;
+        let height = rgba.height() as f32;
         let scale = (available.x / width)
             .min(available.y / height)
             .clamp(0.01, 1.0);
@@ -3554,8 +4103,39 @@ fn preview_reason(reason: UnsupportedReason) -> String {
         UnsupportedReason::Directory => "preview_reason_directory",
         UnsupportedReason::Binary => "preview_reason_binary",
         UnsupportedReason::TooLarge => "preview_reason_too_large",
+        UnsupportedReason::Pdf => "preview_reason_pdf",
     };
     rust_i18n::t!(key).to_string()
+}
+
+/// Divide uma linha CSV/TSV em campos, tratando aspas duplas básicas.
+fn parse_csv_row(line: &str, delimiter: char) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if quoted {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    quoted = false;
+                }
+            } else {
+                field.push(ch);
+            }
+        } else if ch == '"' && field.is_empty() {
+            quoted = true;
+        } else if ch == delimiter {
+            fields.push(std::mem::take(&mut field));
+        } else {
+            field.push(ch);
+        }
+    }
+    fields.push(field);
+    fields
 }
 
 /// Constrói o `LayoutJob` com syntax highlight (ou monospace puro).
@@ -3767,6 +4347,15 @@ fn key_name(key: Key) -> String {
     }
 }
 
+/// Diretório home do usuário, com fallback para o diretório atual.
+fn home_directory() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
 /// Descrição i18n curta de uma ação (usada nos hints e no cheatsheet).
 fn action_description(action: Action) -> String {
     let key = match action {
@@ -3791,6 +4380,7 @@ fn action_description(action: Action) -> String {
         Action::Compress => "action_compress",
         Action::Extract => "action_extract",
         Action::ToggleViewMode => "action_toggle_view_mode",
+        Action::ToggleQuickOpen => "action_toggle_quick_open",
     };
     rust_i18n::t!(key).into_owned()
 }
@@ -4021,6 +4611,19 @@ impl AranduApp {
         }
     }
 
+    /// Markdown bruto do preview focado — usado em testes.
+    #[cfg(test)]
+    fn preview_markdown(&self) -> Option<String> {
+        let key = self.focused_preview_key()?;
+        match self.preview.cache.get(&key)? {
+            PreviewEntry::Ready(content) => match &*content {
+                PreviewContent::Markdown { text, .. } => Some(text.clone()),
+                _ => None,
+            },
+            PreviewEntry::Failed(_) => None,
+        }
+    }
+
     /// Se o cálculo de checksums terminou — usado em testes.
     #[cfg(test)]
     fn checksums_done(&self) -> bool {
@@ -4066,15 +4669,17 @@ mod tests {
 
     use arandu_config::Config;
     use arandu_core::ops::{OpKind, Progress};
+    use arandu_index::IndexEntry;
     use eframe::egui;
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
 
     use super::{
-        AranduApp, PanelSide, ViewMode, format_modified, parse_hex_color, visible_breadcrumb,
+        AranduApp, IndexScanStatus, PanelSide, ViewMode, format_modified, parse_hex_color,
+        visible_breadcrumb,
     };
     use std::path::PathBuf;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::{Duration, Instant, UNIX_EPOCH};
 
     fn fixture_app() -> (tempfile::TempDir, AranduApp) {
         let dir = tempfile::tempdir().expect("cria diretório temporário");
@@ -4285,6 +4890,57 @@ mod tests {
     }
 
     #[test]
+    fn quick_open_activation_navigates_and_focuses_file() {
+        let (dir, mut app) = fixture_app();
+        let target = dir.path().join("fixture-file.txt");
+        app.quick_open.store.update(vec![IndexEntry {
+            path: target.clone(),
+            name: "fixture-file.txt".to_owned(),
+            is_dir: false,
+            size: 8,
+            modified: UNIX_EPOCH,
+        }]);
+        app.quick_open.open = true;
+        app.quick_open.query = "fixture".to_owned();
+        app.refresh_quick_open_results();
+
+        assert_eq!(app.quick_open.results.len(), 1);
+        app.activate_quick_open();
+
+        assert!(!app.quick_open.open);
+        assert_eq!(app.left.cwd, dir.path());
+        let index = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.path == target)
+            .expect("arquivo visível no painel");
+        assert_eq!(app.left.focus, index);
+        assert_eq!(app.left.selected, Some(index));
+    }
+
+    #[test]
+    fn reopening_quick_open_reuses_ready_index() {
+        let (_dir, mut app) = fixture_app();
+        app.quick_open.status = IndexScanStatus::Ready;
+        app.quick_open.last_scan = Some(Instant::now());
+        app.quick_open.store.update(vec![IndexEntry {
+            path: PathBuf::from("/tmp/a.txt"),
+            name: "a.txt".to_owned(),
+            is_dir: false,
+            size: 0,
+            modified: UNIX_EPOCH,
+        }]);
+
+        app.open_quick_open();
+
+        assert!(app.quick_open.open);
+        assert!(app.quick_open.receiver.is_none());
+        assert_eq!(app.quick_open.store.len(), 1);
+        assert!(app.quick_open.query.is_empty());
+    }
+
+    #[test]
     fn enter_opens_selected_directory_and_backspace_goes_up() {
         let (dir, mut app) = fixture_app();
         let index = app
@@ -4465,6 +5121,101 @@ mod tests {
             0,
             "o painel de preview deveria sumir ao pressionar F3 novamente"
         );
+    }
+
+    #[test]
+    fn parse_csv_row_handles_quotes_and_delimiter() {
+        assert_eq!(
+            super::parse_csv_row("a,\"b,c\",\"d\"\"e\"", ','),
+            vec!["a", "b,c", "d\"e"]
+        );
+        assert_eq!(super::parse_csv_row("a\tb", '\t'), vec!["a", "b"]);
+    }
+
+    fn preview_app_for(name: &str, bytes: &[u8]) -> (tempfile::TempDir, AranduApp) {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        fs::write(dir.path().join(name), bytes).expect("cria arquivo de fixture");
+        let mut app = AranduApp::new_at(Config::default(), dir.path());
+        let index = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.name == name)
+            .expect("fixture contém o arquivo");
+        app.left.select(index, false);
+        (dir, app)
+    }
+
+    fn wait_for_preview(harness: &mut Harness<'_, AranduApp>) {
+        for _ in 0..200 {
+            if harness.state().preview_ready() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run();
+        }
+    }
+
+    #[test]
+    fn preview_markdown_shows_raw_text_and_kind() {
+        let (_dir, app) = preview_app_for("README.md", b"# Titulo\n\n- item\n");
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        harness.key_press(egui::Key::F3);
+        harness.run();
+        wait_for_preview(&mut harness);
+
+        assert_eq!(
+            harness.state().preview_markdown().as_deref(),
+            Some("# Titulo\n\n- item\n")
+        );
+        let kind = rust_i18n::t!("preview_kind_markdown").to_string();
+        assert!(
+            harness.query_all_by_label(&kind).count() >= 1,
+            "esperava o tipo '{kind}' no header do preview"
+        );
+    }
+
+    #[test]
+    fn preview_csv_draws_table_and_kind() {
+        let (_dir, app) = preview_app_for("dados.csv", b"nome,idade\nAna,30\n");
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        harness.key_press(egui::Key::F3);
+        harness.run();
+        wait_for_preview(&mut harness);
+
+        for label in ["nome", "idade", "Ana", "30"] {
+            assert!(
+                harness.query_all_by_label(label).count() >= 1,
+                "esperava a célula '{label}' na tabela CSV"
+            );
+        }
+        let kind = rust_i18n::t!("preview_kind_csv").to_string();
+        assert!(harness.query_all_by_label(&kind).count() >= 1);
+    }
+
+    #[test]
+    fn preview_hex_shows_offsets() {
+        let (_dir, app) = preview_app_for("dados.bin", &[0u8; 20]);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        harness.key_press(egui::Key::F3);
+        harness.run();
+        wait_for_preview(&mut harness);
+
+        for offset in ["00000000", "00000010"] {
+            assert!(
+                harness.query_all_by_label(offset).count() >= 1,
+                "esperava o offset '{offset}' no hex dump"
+            );
+        }
     }
 
     #[test]

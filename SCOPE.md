@@ -35,7 +35,7 @@ visualizações ricas voltadas a desenvolvedores e usuários avançados.
 |---|---|---|
 | Testes | **Unit + integration (tempfile) + screenshot tests (egui_kittest) desde o dia 1** | screenshot só fase 2 |
 | i18n | **Desde o dia 1** (sistema de tradução em todos os widgets) | hardcoded, retrofit fase 3 |
-| Preview PDF | **Nativo: mupdf ou pdfium** (decidir crate na fase 2) | poppler externo, puro Rust, adiar |
+| Preview PDF | **Nativo: `pdfrum`** (puro Rust, MIT/Apache-2.0, render CPU tiny-skia) | poppler externo, adiar |
 | Plugins (fase 3) | **Decisão adiada**; desenhar hook de arquitetura desde já | WASM (wasmtime), Lua (mlua), JS |
 | FS remoto | **Local direto no MVP**, refatorar para trait Vfs quando entrar | trait desde o início |
 | Metadados | **Tags no MVP** (armazenamento simples), **banco (sled/sqlite) fase 2**; favoritos/recentes no MVP | completo no MVP, só xattr |
@@ -120,7 +120,7 @@ arandu/
 - [x] ~~Nome do binário/crate: `arandu` está disponível no crates.io?~~ **Resolvido (sessão 2): livre, reservar na v0.1**
 - [x] ~~Estratégia de testes~~ **Resolvido (sessão 2): unit + integration + egui_kittest desde o dia 1**
 - [x] ~~i18n: entra em que fase?~~ **Resolvido (sessão 2): desde o dia 1**
-- [ ] Qual crate para PDF: mupdf (via `mupdf`?) vs pdfium (via `pdfium-render`)? — decidir na implementação (fase 2)
+- [x] ~~Qual crate para PDF: mupdf (via `mupdf`?) vs pdfium (via `pdfium-render`)?~~ **Resolvido (2026-11-10): `pdfrum`** — puro Rust, MIT/Apache-2.0 (mupdf é AGPL-3.0, incompatível), sem bundling de binário (pdfium quebraria o binário único), render CPU, SSIM ~0.99999 na suíte PDFium
 - [ ] Plugins WASM vs Lua — decisão adiada para fase 3, mas hook de arquitetura já no design
 - [x] ~~Remote FS (SSH/SFTP/FTP) — entra no escopo algum dia?~~ **Resolvido (sessão 2): local direto no MVP, refatorar para trait depois**
 - [x] ~~Tags/cores em arquivos, notas, favoritos~~ **Resolvido (sessão 2): tags no MVP com storage simples; banco fase 2**

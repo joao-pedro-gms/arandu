@@ -12,8 +12,12 @@ O roadmap detalhado com justificativas vive em [SCOPE.md](SCOPE.md). Esta págin
 - [ ] **Undo/redo** de operações + **lixeira** do SO
 - [ ] Preview pane: texto com syntax highlight (syntect), imagens
 - [ ] Temas TOML + configuração + keymap redefinível (preset Vim)
+- [ ] i18n desde o dia 1 (todas as strings via sistema de tradução)
+- [ ] Tags nos arquivos (storage simples; banco na fase 2)
+- [ ] Screenshot tests com egui_kittest no CI
 - [ ] Ferramentas: compressão (zip/tar/7z), checksums, rename em lote
-- [ ] CI verde: fmt, clippy `-D warnings`, testes (Ubuntu + Windows)
+- [ ] justfile (check, test, screenshot, release) + cargo-hack
+- [ ] CI verde: fmt, clippy `-D warnings`, testes (Ubuntu + Windows) + job MSRV (N-2) + cargo-deny
 
 ## Fase 2 — Diferenciais
 
@@ -30,11 +34,7 @@ O roadmap detalhado com justificativas vive em [SCOPE.md](SCOPE.md). Esta págin
 
 ## Decisões em aberto
 
-- [ ] Disponibilidade do crate `arandu` no crates.io
-- [ ] Estratégia de testes (screenshot tests egui?)
-- [ ] i18n — em que fase entra
-- [ ] Crate para preview de PDF
-- [ ] Plugins: WASM vs Lua
-- [ ] FS remoto (SSH/SFTP) no escopo?
-- [ ] Metadados próprios (tags, cores, notas, favoritos)
-- [ ] Telemetria/crash reports
+- [ ] Crate para PDF: mupdf vs pdfium (fase 2)
+- [ ] Plugins: WASM vs Lua (fase 3 — hook de arquitetura já desenhado)
+- [x] ~~Disponibilidade do crate `arandu`~~ livre no crates.io
+- [x] ~~Testes / i18n / telemetria / FS remoto / metadados~~ sessão 2

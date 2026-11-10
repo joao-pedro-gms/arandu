@@ -29,6 +29,23 @@ visualizações ricas voltadas a desenvolvedores e usuários avançados.
 | Atalhos | Modal + keymap 100% redefinível, preset Vim opcional | estilo Explorer, vim-first |
 | Estrutura | **Workspace Cargo multi-crate** | crate único |
 
+### Sessão 2 — práticas de projeto
+
+| Área | Decisão | Alternativas consideradas |
+|---|---|---|
+| Testes | **Unit + integration (tempfile) + screenshot tests (egui_kittest) desde o dia 1** | screenshot só fase 2 |
+| i18n | **Desde o dia 1** (sistema de tradução em todos os widgets) | hardcoded, retrofit fase 3 |
+| Preview PDF | **Nativo: mupdf ou pdfium** (decidir crate na fase 2) | poppler externo, puro Rust, adiar |
+| Plugins (fase 3) | **Decisão adiada**; desenhar hook de arquitetura desde já | WASM (wasmtime), Lua (mlua), JS |
+| FS remoto | **Local direto no MVP**, refatorar para trait Vfs quando entrar | trait desde o início |
+| Metadados | **Tags no MVP** (armazenamento simples), **banco (sled/sqlite) fase 2**; favoritos/recentes no MVP | completo no MVP, só xattr |
+| Telemetria | **Zero telemetria**; crash reports opt-in salvos localmente | opt-in anônima |
+| Dev local | **just + cargo-hack** (receitas `check`, `test`, `screenshot`, `release`) | cargo puro, cargo-make |
+| Releases | **SemVer 0.x + GitHub Releases** com changelog por commits convencionais | publish crates.io a cada release, sem releases |
+| Dependências | **Conservadora + cargo-deny**; nova dep exige justificativa na PR | liberal, minimalista radical |
+| MSRV | **N-2** (stable atual menos 2 releases), pin + job no CI | só latest, anual |
+| Governança | **SECURITY.md + CODE_OF_CONDUCT.md** (Contributor Covenant) | só SECURITY, nenhum |
+
 ### Por que egui e não iced
 
 Pesquisa comparativa (ver fontes na sessão 1): o requisito decisivo é a lista de
@@ -100,16 +117,21 @@ arandu/
 
 ## Open questions (próximas sessões de grill)
 
-- [ ] Nome do binário/crate: `arandu` está disponível no crates.io? (verificar)
-- [ ] Estratégia de testes: unitários por crate + integration tests de fs;
-      screenshot tests do egui?
-- [ ] i18n: entra em que fase? (egui tem suporte, mas afeta tudo)
-- [ ] Preview de PDF: qual crate? (pdfium vs mupdf vs render via poppler)
-- [ ] Plugins WASM vs Lua — decisão e sandboxing
-- [ ] Remote FS (SSH/SFTP/FTP) — entra no escopo algum dia?
-- [ ] Tags/cores em arquivos, notas, favoritos — metadados próprios?
-- [ ] CI: GitHub Actions com build Linux+Windows, clippy deny, rustfmt
-- [ ] Telemetria/crash reports: sim ou não?
+- [x] ~~Nome do binário/crate: `arandu` está disponível no crates.io?~~ **Resolvido (sessão 2): livre, reservar na v0.1**
+- [x] ~~Estratégia de testes~~ **Resolvido (sessão 2): unit + integration + egui_kittest desde o dia 1**
+- [x] ~~i18n: entra em que fase?~~ **Resolvido (sessão 2): desde o dia 1**
+- [ ] Qual crate para PDF: mupdf (via `mupdf`?) vs pdfium (via `pdfium-render`)? — decidir na implementação (fase 2)
+- [ ] Plugins WASM vs Lua — decisão adiada para fase 3, mas hook de arquitetura já no design
+- [x] ~~Remote FS (SSH/SFTP/FTP) — entra no escopo algum dia?~~ **Resolvido (sessão 2): local direto no MVP, refatorar para trait depois**
+- [x] ~~Tags/cores em arquivos, notas, favoritos~~ **Resolvido (sessão 2): tags no MVP com storage simples; banco fase 2**
+- [x] ~~CI: GitHub Actions com build Linux+Windows, clippy deny, rustfmt~~ **Resolvido (sessão 2): criado; adicionar job MSRV + cargo-deny quando houver Cargo.toml**
+- [x] ~~Telemetria/crash reports~~ **Resolvido (sessão 2): zero telemetria; crash reports opt-in locais**
+
+### Sessão 2 — 2026-11-10 — Práticas de projeto
+Rodadas: testes → i18n → PDF → plugins → FS remoto → metadados → telemetria →
+toolchain dev → versionamento → política de deps → MSRV → governança. Decisões
+na seção "Sessão 2" da tabela. Fechado também: crate `arandu` livre no
+crates.io (reservar na v0.1).
 
 ## Registro de sessões
 

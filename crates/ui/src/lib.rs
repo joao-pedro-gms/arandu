@@ -17,8 +17,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arandu_config::{
     Action, Config, KeyBinding, Keymap, Modifiers as KeyModifiers, TagsStore, Theme,
@@ -30,6 +31,7 @@ use arandu_core::hash::{md5_file, sha256_file};
 use arandu_core::ops::{self, Op, OpKind, OpsError, Progress};
 use arandu_core::preview::{PreviewContent, PreviewError, PreviewRequest, UnsupportedReason};
 use arandu_core::queue::{OpQueue, QueueEvent, UndoStack};
+use arandu_index::{IndexEntry, IndexStore, Indexer};
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Key, Label, Layout, Modifiers, Rect, RichText,
     ScrollArea, Sense, Stroke, StrokeKind, TextFormat, TextStyle, Ui, UiBuilder, pos2, vec2,
@@ -88,6 +90,12 @@ const CELL_GAP: f32 = 8.0;
 const ICON_SIZE: f32 = 28.0;
 /// Altura reservada para o nome (duas linhas) no modo ícones.
 const GRID_NAME_H: f32 = 40.0;
+/// Máximo de resultados exibidos no quick-open (Ctrl+P).
+const QUICK_OPEN_MAX_RESULTS: usize = 20;
+/// Altura de uma linha de resultado no quick-open.
+const QUICK_OPEN_ROW_H: f32 = 22.0;
+/// Intervalo mínimo entre rescans automáticos do índice ao reabrir.
+const QUICK_OPEN_REFRESH: Duration = Duration::from_secs(300);
 
 /// Ações listadas na status bar, na ordem em que aparecem (as principais).
 const STATUS_HINTS: [Action; 7] = [
@@ -235,6 +243,22 @@ impl PanelState {
         if let Some(parent) = self.cwd.parent() {
             let parent = parent.to_path_buf();
             self.navigate_to(parent);
+        }
+    }
+
+    /// Navega para o diretório pai de `path` e foca a entrada, se presente.
+    ///
+    /// Usado pelo quick-open: o item vem do índice global e pode estar em
+    /// qualquer lugar da árvore.
+    fn reveal_path(&mut self, path: &Path) {
+        if let Some(parent) = path.parent()
+            && parent != self.cwd
+        {
+            self.navigate_to(parent.to_path_buf());
+        }
+        if let Some(index) = self.entries.iter().position(|entry| entry.path == path) {
+            self.select(index, false);
+            self.ensure_focus_visible();
         }
     }
 
@@ -532,6 +556,69 @@ struct ArchiveJob {
     reload_dir: PathBuf,
 }
 
+/// Evento enviado pela thread de indexação.
+enum IndexScanEvent {
+    /// Total de entradas já percorridas.
+    Progress(usize),
+    /// Scan concluído com o índice completo.
+    Done(Vec<IndexEntry>),
+}
+
+/// Estado do scan do índice global.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum IndexScanStatus {
+    /// Nenhum scan iniciado nesta sessão.
+    #[default]
+    Idle,
+    /// Scan em andamento em background.
+    Scanning,
+    /// Índice pronto para consultas.
+    Ready,
+}
+
+/// Overlay de quick-open (Ctrl+P).
+struct QuickOpenState {
+    open: bool,
+    query: String,
+    focus: usize,
+    results: Vec<(u32, IndexEntry)>,
+    /// Última consulta usada para preencher `results`.
+    last_query: String,
+    /// Pede recomputação dos resultados no próximo frame.
+    dirty: bool,
+    store: IndexStore,
+    receiver: Option<Receiver<IndexScanEvent>>,
+    /// Cancelamento compartilhado com a thread de scan.
+    cancel: Arc<AtomicBool>,
+    status: IndexScanStatus,
+    /// Entradas já percorridas no scan atual.
+    scanned: usize,
+    /// Fim do último scan bem-sucedido (para o refresh automático).
+    last_scan: Option<Instant>,
+    /// Pede foco no campo de busca no próximo frame.
+    needs_focus: bool,
+}
+
+impl Default for QuickOpenState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            query: String::new(),
+            focus: 0,
+            results: Vec::new(),
+            last_query: String::new(),
+            dirty: false,
+            store: IndexStore::new(),
+            receiver: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            status: IndexScanStatus::Idle,
+            scanned: 0,
+            last_scan: None,
+            needs_focus: false,
+        }
+    }
+}
+
 /// Aplicação principal do Arandu.
 pub struct AranduApp {
     config: Config,
@@ -573,6 +660,8 @@ pub struct AranduApp {
     keymap: Keymap,
     /// Cheatsheet de atalhos visível (F1).
     show_hints: bool,
+    /// Quick-open global (Ctrl+P).
+    quick_open: QuickOpenState,
     /// Congela a drenagem da fila em testes determinísticos de progresso.
     #[cfg(test)]
     injected_ops: bool,
@@ -627,6 +716,7 @@ impl AranduApp {
             theme,
             keymap,
             show_hints: false,
+            quick_open: QuickOpenState::default(),
             #[cfg(test)]
             injected_ops: false,
         }
@@ -652,6 +742,7 @@ impl AranduApp {
         self.pump_preview();
         self.pump_checksums();
         self.pump_archive_jobs();
+        self.pump_index_scan(&ctx);
         if self.compress_job.is_some() || self.extract_job.is_some() {
             ctx.request_repaint();
         }
@@ -689,6 +780,7 @@ impl AranduApp {
         }
         self.draw_status_bar(ui, status_rect);
         self.draw_hints_overlay(&ctx);
+        self.draw_quick_open(&ctx);
         self.draw_dialogs(&ctx);
     }
 
@@ -862,6 +954,39 @@ impl AranduApp {
             return;
         }
 
+        // Quick-open: o campo de busca captura a digitação. Setas percorrem a
+        // lista, Enter ativa o item focado e Esc/Ctrl+P fecham o overlay.
+        if self.quick_open.open {
+            let pressed = pressed_keys(ctx);
+            let toggle = self.action_pressed(Action::ToggleQuickOpen, &pressed);
+            let (escape, up, down, enter) = ctx.input_mut(|input| {
+                (
+                    input.consume_key(Modifiers::NONE, Key::Escape),
+                    input.consume_key(Modifiers::NONE, Key::ArrowUp),
+                    input.consume_key(Modifiers::NONE, Key::ArrowDown),
+                    input.consume_key(Modifiers::NONE, Key::Enter),
+                )
+            });
+
+            if toggle || escape {
+                self.quick_open.open = false;
+                return;
+            }
+            if !self.quick_open.results.is_empty() {
+                let last = self.quick_open.results.len() - 1;
+                if up {
+                    self.quick_open.focus = self.quick_open.focus.saturating_sub(1);
+                }
+                if down {
+                    self.quick_open.focus = (self.quick_open.focus + 1).min(last);
+                }
+            }
+            if enter {
+                self.activate_quick_open();
+            }
+            return;
+        }
+
         // Diálogos das ferramentas: Esc (e, no caso dos checksums, a própria
         // ação) fecham; o restante da digitação/atalhos fica suspenso. O
         // cálculo em background pode terminar sozinho e o resultado é
@@ -899,6 +1024,11 @@ impl AranduApp {
         }
         if toggle_hints {
             self.show_hints = true;
+            return;
+        }
+
+        if self.action_pressed(Action::ToggleQuickOpen, &pressed) {
+            self.open_quick_open();
             return;
         }
 
@@ -1435,6 +1565,230 @@ impl AranduApp {
             if panel.cwd == dir {
                 panel.reload();
             }
+        }
+    }
+
+    /// Abre o quick-open, iniciando o scan do `$HOME` no primeiro uso.
+    ///
+    /// Reabrir reaproveita o índice em memória; um rescans só acontece se o
+    /// último scan tiver mais de [`QUICK_OPEN_REFRESH`].
+    fn open_quick_open(&mut self) {
+        self.quick_open.open = true;
+        self.quick_open.needs_focus = true;
+        self.quick_open.query.clear();
+        self.quick_open.focus = 0;
+        self.quick_open.results.clear();
+        self.quick_open.last_query.clear();
+        self.quick_open.dirty = true;
+
+        let needs_scan = match self.quick_open.status {
+            IndexScanStatus::Idle => true,
+            IndexScanStatus::Scanning => false,
+            IndexScanStatus::Ready => self
+                .quick_open
+                .last_scan
+                .is_none_or(|last| last.elapsed() >= QUICK_OPEN_REFRESH),
+        };
+        if needs_scan {
+            self.start_index_scan();
+        }
+    }
+
+    /// Inicia o scan do diretório home em uma thread própria.
+    fn start_index_scan(&mut self) {
+        if self.quick_open.receiver.is_some() {
+            return;
+        }
+
+        let root = home_directory();
+        let cancel = Arc::clone(&self.quick_open.cancel);
+        cancel.store(false, Ordering::Relaxed);
+        let (sender, receiver) = mpsc::channel();
+        self.quick_open.receiver = Some(receiver);
+        self.quick_open.status = IndexScanStatus::Scanning;
+        self.quick_open.scanned = 0;
+
+        std::thread::spawn(move || {
+            let progress_sender = sender.clone();
+            let entries = Indexer::new().scan_with_progress(&root, &cancel, |count| {
+                let _ = progress_sender.send(IndexScanEvent::Progress(count));
+            });
+            // Canal descartado = app encerrado; a thread termina sozinha.
+            let _ = sender.send(IndexScanEvent::Done(entries));
+        });
+    }
+
+    /// Drena eventos do scan de índice sem bloquear a UI.
+    fn pump_index_scan(&mut self, ctx: &egui::Context) {
+        let mut progress = None;
+        let mut finished = None;
+
+        if let Some(receiver) = &self.quick_open.receiver {
+            while let Ok(event) = receiver.try_recv() {
+                match event {
+                    IndexScanEvent::Progress(count) => progress = Some(count),
+                    IndexScanEvent::Done(entries) => finished = Some(entries),
+                }
+            }
+        }
+
+        if let Some(count) = progress {
+            self.quick_open.scanned = count;
+        }
+
+        if let Some(entries) = finished {
+            self.quick_open.store.update(entries);
+            self.quick_open.status = IndexScanStatus::Ready;
+            self.quick_open.scanned = self.quick_open.store.len();
+            self.quick_open.receiver = None;
+            self.quick_open.last_scan = Some(Instant::now());
+            self.quick_open.dirty = true;
+        }
+
+        if self.quick_open.receiver.is_some() {
+            ctx.request_repaint();
+        }
+    }
+
+    /// Recalcula os resultados quando a consulta/índice mudou.
+    fn refresh_quick_open_results(&mut self) {
+        if !self.quick_open.dirty && self.quick_open.query == self.quick_open.last_query {
+            return;
+        }
+
+        self.quick_open
+            .last_query
+            .clone_from(&self.quick_open.query);
+        self.quick_open.results = self
+            .quick_open
+            .store
+            .search(&self.quick_open.query, QUICK_OPEN_MAX_RESULTS);
+        self.quick_open.dirty = false;
+
+        if self.quick_open.results.is_empty() {
+            self.quick_open.focus = 0;
+        } else {
+            self.quick_open.focus = self.quick_open.focus.min(self.quick_open.results.len() - 1);
+        }
+    }
+
+    /// Ativa o resultado focado: navega o painel ativo e foca a entrada.
+    fn activate_quick_open(&mut self) {
+        let Some((_, entry)) = self.quick_open.results.get(self.quick_open.focus).cloned() else {
+            return;
+        };
+        self.quick_open.open = false;
+        self.active_panel_mut().reveal_path(&entry.path);
+    }
+
+    /// Overlay central de quick-open (Ctrl+P).
+    fn draw_quick_open(&mut self, ctx: &egui::Context) {
+        if !self.quick_open.open {
+            return;
+        }
+        self.refresh_quick_open_results();
+
+        let mut activate = false;
+        let mut clicked_row = None;
+        let quick = &mut self.quick_open;
+        let scanning = quick.status == IndexScanStatus::Scanning;
+        let scanned = quick.scanned;
+
+        let modal = egui::Modal::new(egui::Id::unique("quick-open")).show(ctx, |ui| {
+            ui.set_min_width(640.0);
+            ui.set_max_width(640.0);
+
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut quick.query)
+                    .hint_text(rust_i18n::t!("quick_open_placeholder"))
+                    .desired_width(f32::INFINITY),
+            );
+            if quick.needs_focus {
+                response.request_focus();
+                quick.needs_focus = false;
+            }
+            ui.add_space(6.0);
+
+            if quick.results.is_empty() {
+                let message = if scanning {
+                    rust_i18n::t!("quick_open_indexing", count => scanned).into_owned()
+                } else if quick.query.is_empty() {
+                    rust_i18n::t!("quick_open_start").into_owned()
+                } else {
+                    rust_i18n::t!("quick_open_empty").into_owned()
+                };
+                ui.add_space(12.0);
+                ui.label(
+                    RichText::new(message)
+                        .color(ui.visuals().weak_text_color())
+                        .italics(),
+                );
+                ui.add_space(12.0);
+            } else {
+                let visuals = ui.visuals().clone();
+                let weak = visuals.weak_text_color();
+                for (index, (_, entry)) in quick.results.iter().enumerate() {
+                    let selected = index == quick.focus;
+                    let (rect, row) = ui.allocate_exact_size(
+                        vec2(ui.available_width(), QUICK_OPEN_ROW_H),
+                        Sense::click(),
+                    );
+                    if selected {
+                        ui.painter()
+                            .rect_filled(rect, 3.0, visuals.selection.bg_fill);
+                    }
+                    let text_color = if selected {
+                        visuals.strong_text_color()
+                    } else {
+                        visuals.text_color()
+                    };
+                    let mut row_ui = ui.new_child(
+                        UiBuilder::new()
+                            .max_rect(rect.shrink2(vec2(8.0, 2.0)))
+                            .layout(Layout::left_to_right(Align::Center)),
+                    );
+                    row_ui.spacing_mut().item_spacing.x = 10.0;
+                    row_ui.label(RichText::new(&entry.name).strong().color(text_color));
+                    row_ui.add(
+                        Label::new(
+                            RichText::new(entry.path.display().to_string())
+                                .small()
+                                .color(weak),
+                        )
+                        .truncate(),
+                    );
+
+                    if row.clicked() {
+                        clicked_row = Some(index);
+                    }
+                    if row.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                }
+            }
+
+            ui.add_space(4.0);
+            let footer = if scanning {
+                rust_i18n::t!("quick_open_indexing", count => scanned).into_owned()
+            } else {
+                rust_i18n::t!("quick_open_footer", count => quick.store.len()).into_owned()
+            };
+            ui.label(
+                RichText::new(footer)
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+        });
+
+        if modal.should_close() {
+            self.quick_open.open = false;
+        }
+        if let Some(index) = clicked_row {
+            self.quick_open.focus = index;
+            activate = true;
+        }
+        if activate {
+            self.activate_quick_open();
         }
     }
 
@@ -3243,6 +3597,15 @@ fn key_name(key: Key) -> String {
     }
 }
 
+/// Diretório home do usuário, com fallback para o diretório atual.
+fn home_directory() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
 /// Descrição i18n curta de uma ação (usada nos hints e no cheatsheet).
 fn action_description(action: Action) -> String {
     let key = match action {
@@ -3266,6 +3629,7 @@ fn action_description(action: Action) -> String {
         Action::Compress => "action_compress",
         Action::Extract => "action_extract",
         Action::ToggleViewMode => "action_toggle_view_mode",
+        Action::ToggleQuickOpen => "action_toggle_quick_open",
     };
     rust_i18n::t!(key).into_owned()
 }
@@ -3541,15 +3905,17 @@ mod tests {
 
     use arandu_config::Config;
     use arandu_core::ops::{OpKind, Progress};
+    use arandu_index::IndexEntry;
     use eframe::egui;
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
 
     use super::{
-        AranduApp, PanelSide, ViewMode, format_modified, parse_hex_color, visible_breadcrumb,
+        AranduApp, IndexScanStatus, PanelSide, ViewMode, format_modified, parse_hex_color,
+        visible_breadcrumb,
     };
     use std::path::PathBuf;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::{Duration, Instant, UNIX_EPOCH};
 
     fn fixture_app() -> (tempfile::TempDir, AranduApp) {
         let dir = tempfile::tempdir().expect("cria diretório temporário");
@@ -3633,6 +3999,57 @@ mod tests {
         assert_eq!(app.active_selected_count(), 2);
         app.left.select(1, true);
         assert_eq!(app.active_selected_count(), 1);
+    }
+
+    #[test]
+    fn quick_open_activation_navigates_and_focuses_file() {
+        let (dir, mut app) = fixture_app();
+        let target = dir.path().join("fixture-file.txt");
+        app.quick_open.store.update(vec![IndexEntry {
+            path: target.clone(),
+            name: "fixture-file.txt".to_owned(),
+            is_dir: false,
+            size: 8,
+            modified: UNIX_EPOCH,
+        }]);
+        app.quick_open.open = true;
+        app.quick_open.query = "fixture".to_owned();
+        app.refresh_quick_open_results();
+
+        assert_eq!(app.quick_open.results.len(), 1);
+        app.activate_quick_open();
+
+        assert!(!app.quick_open.open);
+        assert_eq!(app.left.cwd, dir.path());
+        let index = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.path == target)
+            .expect("arquivo visível no painel");
+        assert_eq!(app.left.focus, index);
+        assert_eq!(app.left.selected, Some(index));
+    }
+
+    #[test]
+    fn reopening_quick_open_reuses_ready_index() {
+        let (_dir, mut app) = fixture_app();
+        app.quick_open.status = IndexScanStatus::Ready;
+        app.quick_open.last_scan = Some(Instant::now());
+        app.quick_open.store.update(vec![IndexEntry {
+            path: PathBuf::from("/tmp/a.txt"),
+            name: "a.txt".to_owned(),
+            is_dir: false,
+            size: 0,
+            modified: UNIX_EPOCH,
+        }]);
+
+        app.open_quick_open();
+
+        assert!(app.quick_open.open);
+        assert!(app.quick_open.receiver.is_none());
+        assert_eq!(app.quick_open.store.len(), 1);
+        assert!(app.quick_open.query.is_empty());
     }
 
     #[test]

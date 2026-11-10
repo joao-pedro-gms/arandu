@@ -28,11 +28,19 @@ action_batch_rename = "Batch rename"
 action_compress = "Compress"
 action_extract = "Extract"
 action_toggle_view_mode = "View mode"
+action_toggle_quick_open = "Quick open"
 
 view_mode_list = "List"
 view_mode_icons = "Icons"
 
 hints_title = "Shortcuts"
+
+quick_open_title = "Quick open"
+quick_open_placeholder = "Type to search files…"
+quick_open_start = "Start typing to search the index."
+quick_open_empty = "No results."
+quick_open_indexing = "Indexing… %{count} items"
+quick_open_footer = "%{count} indexed items · Enter opens · Esc closes"
 
 column_name = "Name"
 column_size = "Size"

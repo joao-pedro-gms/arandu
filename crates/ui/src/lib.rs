@@ -19,6 +19,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arandu_config::Config;
 use arandu_core::fs::{CoreError, Entry, format_size, list_dir};
+use arandu_core::ops::{self, Op, OpKind, OpsError, Progress};
+use arandu_core::queue::{OpQueue, QueueEvent, UndoStack};
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Key, Label, Layout, Modifiers, Rect, RichText,
     ScrollArea, Sense, Stroke, StrokeKind, TextStyle, Ui, UiBuilder, pos2, vec2,
@@ -37,6 +39,8 @@ const COLUMN_HEADER_H: f32 = 22.0;
 const TOOLBAR_H: f32 = 32.0;
 /// Altura da status bar.
 const STATUS_H: f32 = 24.0;
+/// Altura da barra de operações (acima da status bar).
+const OPS_H: f32 = 28.0;
 /// Área de hit do splitter (linha desenhada tem 1pt).
 const SPLITTER_HIT: f32 = 6.0;
 /// Largura mínima de cada painel.
@@ -227,10 +231,65 @@ impl PanelState {
         self.multi.len()
     }
 
+    /// Caminhos selecionados; sem seleção explícita, usa o item focado.
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        let indices: Vec<usize> = if self.multi.is_empty() {
+            if self.entries.is_empty() {
+                Vec::new()
+            } else {
+                vec![self.focus]
+            }
+        } else {
+            self.multi.iter().copied().collect()
+        };
+        indices
+            .into_iter()
+            .filter_map(|index| self.entries.get(index))
+            .map(|entry| entry.path.clone())
+            .collect()
+    }
+
     /// Diretório atual e listagem, para a status bar.
     fn item_count(&self) -> usize {
         self.entries.len()
     }
+}
+
+/// Operação em destaque na barra de progresso.
+struct CurrentOp {
+    kind: OpKind,
+    name: String,
+    progress: Option<Progress>,
+}
+
+/// Mensagem efêmera exibida na status bar.
+struct Notice {
+    text: String,
+    error: bool,
+}
+
+impl Notice {
+    fn info(text: String) -> Self {
+        Self { text, error: false }
+    }
+
+    fn error(text: String) -> Self {
+        Self { text, error: true }
+    }
+}
+
+/// Estado da barra de operações.
+#[derive(Default)]
+struct OpsState {
+    current: Option<CurrentOp>,
+    notice: Option<Notice>,
+}
+
+/// Diálogo de renomeação.
+struct RenameDialog {
+    path: PathBuf,
+    name: String,
+    error: Option<String>,
 }
 
 /// Aplicação principal do Arandu.
@@ -242,6 +301,19 @@ pub struct AranduApp {
     /// Fração da largura útil ocupada pelo painel esquerdo (0.0..=1.0).
     split: f32,
     initialized: bool,
+    /// Fila sequencial em background.
+    queue: OpQueue,
+    /// Operações desfazíveis (últimas 50).
+    undo: UndoStack,
+    /// Estado da barra de operações e avisos.
+    ops: OpsState,
+    /// Exclusões aguardando confirmação.
+    delete_confirm: Option<Vec<PathBuf>>,
+    /// Renomeação em edição.
+    rename: Option<RenameDialog>,
+    /// Congela a drenagem da fila em testes determinísticos de progresso.
+    #[cfg(test)]
+    injected_ops: bool,
 }
 
 impl AranduApp {
@@ -262,6 +334,13 @@ impl AranduApp {
             active: PanelSide::Left,
             split: 0.5,
             initialized: false,
+            queue: OpQueue::new(),
+            undo: UndoStack::default(),
+            ops: OpsState::default(),
+            delete_confirm: None,
+            rename: None,
+            #[cfg(test)]
+            injected_ops: false,
         }
     }
 
@@ -281,26 +360,41 @@ impl AranduApp {
             self.initialized = true;
         }
 
+        self.pump_queue();
         self.handle_keyboard(&ctx);
 
         // O `Ui` entregue pelo eframe 0.37 não tem margem nem fundo: pintamos o
-        // fundo do painel e dividimos a área em toolbar / conteúdo / status.
+        // fundo do painel e dividimos a área em toolbar / conteúdo / fila /
+        // status.
         let full = ui.max_rect();
         ui.painter().rect_filled(full, 0.0, ui.visuals().panel_fill);
 
         let toolbar_rect = Rect::from_min_size(full.min, vec2(full.width(), TOOLBAR_H));
+        let ops_h = if self.ops.current.is_some() {
+            OPS_H
+        } else {
+            0.0
+        };
         let status_rect = Rect::from_min_max(
             pos2(full.left(), full.bottom() - STATUS_H),
             pos2(full.right(), full.bottom()),
         );
+        let ops_rect = Rect::from_min_max(
+            pos2(full.left(), full.bottom() - STATUS_H - ops_h),
+            pos2(full.right(), full.bottom() - STATUS_H),
+        );
         let content = Rect::from_min_max(
             pos2(full.left(), full.top() + TOOLBAR_H),
-            pos2(full.right(), full.bottom() - STATUS_H),
+            pos2(full.right(), full.bottom() - STATUS_H - ops_h),
         );
 
         self.draw_toolbar(ui, toolbar_rect);
         self.draw_content(ui, content);
+        if ops_h > 0.0 {
+            self.draw_ops_bar(ui, ops_rect);
+        }
         self.draw_status_bar(ui, status_rect);
+        self.draw_dialogs(&ctx);
     }
 
     fn apply_theme(&self, ctx: &egui::Context) {
@@ -359,34 +453,215 @@ impl AranduApp {
     /// Nenhum widget desta etapa usa `Sense::click()`/`menu_button` (todos os
     /// clicáveis são `Label` com `Sense::CLICK`, não focáveis), então o Tab do
     /// egui não tem widgets para onde pular e podemos consumi-lo com segurança.
+    /// Com um diálogo aberto, os atalhos globais ficam suspensos.
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
+        if self.delete_confirm.is_some() {
+            let (enter, escape) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(Modifiers::NONE, Key::Enter),
+                    i.consume_key(Modifiers::NONE, Key::Escape),
+                )
+            });
+            if enter {
+                self.confirm_delete();
+            } else if escape {
+                self.delete_confirm = None;
+            }
+            return;
+        }
+
+        // O `TextEdit` do diálogo de renomeação recebe a digitação.
+        if self.rename.is_some() {
+            return;
+        }
+
         let tab = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab));
         if tab {
             self.active = self.active.other();
             return;
         }
 
-        let (up, down, enter, back) = ctx.input_mut(|i| {
+        let (up, down, enter, back, copy, moving, rename, delete, undo) = ctx.input_mut(|i| {
             (
                 i.consume_key(Modifiers::NONE, Key::ArrowUp),
                 i.consume_key(Modifiers::NONE, Key::ArrowDown),
                 i.consume_key(Modifiers::NONE, Key::Enter),
                 i.consume_key(Modifiers::NONE, Key::Backspace),
+                i.consume_key(Modifiers::NONE, Key::F5),
+                i.consume_key(Modifiers::NONE, Key::F6),
+                i.consume_key(Modifiers::NONE, Key::F2),
+                i.consume_key(Modifiers::NONE, Key::Delete),
+                i.consume_key(Modifiers::CTRL, Key::Z),
             )
         });
 
-        let panel = self.active_panel_mut();
-        if up {
-            panel.move_focus(-1);
+        {
+            let panel = self.active_panel_mut();
+            if up {
+                panel.move_focus(-1);
+            }
+            if down {
+                panel.move_focus(1);
+            }
+            if enter {
+                panel.open_focused();
+            }
+            if back {
+                panel.go_up();
+            }
         }
-        if down {
-            panel.move_focus(1);
+
+        if copy {
+            self.start_transfer(OpKind::Copy);
         }
-        if enter {
-            panel.open_focused();
+        if moving {
+            self.start_transfer(OpKind::Move);
         }
-        if back {
-            panel.go_up();
+        if rename {
+            self.start_rename();
+        }
+        if delete {
+            self.request_delete();
+        }
+        if undo {
+            self.undo_last();
+        }
+    }
+
+    /// Drena eventos da fila sem bloquear a UI.
+    fn pump_queue(&mut self) {
+        #[cfg(test)]
+        if self.injected_ops {
+            return;
+        }
+
+        while let Some(event) = self.queue.try_recv() {
+            match event {
+                QueueEvent::Started(op) => {
+                    self.ops.current = Some(CurrentOp {
+                        kind: op.kind,
+                        name: op
+                            .params
+                            .src
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| op.params.src.display().to_string()),
+                        progress: None,
+                    });
+                    self.ops.notice = None;
+                }
+                QueueEvent::Progress(progress) => {
+                    if let Some(current) = &mut self.ops.current {
+                        current.progress = Some(progress);
+                    }
+                }
+                QueueEvent::Done(result) => match result.outcome {
+                    Ok(completed) => {
+                        if completed.kind.undoable() {
+                            self.undo.push(completed);
+                        }
+                        self.reload_after(&result.op);
+                    }
+                    Err(OpsError::Cancelled) => {}
+                    Err(err) => {
+                        self.ops.notice = Some(Notice::error(
+                            rust_i18n::t!("op_failed", error = err.to_string()).to_string(),
+                        ));
+                    }
+                },
+                QueueEvent::FinishedQueue => {
+                    self.ops.current = None;
+                }
+                QueueEvent::Cancelled => {
+                    self.ops.current = None;
+                    self.ops.notice = Some(Notice::info(rust_i18n::t!("op_cancelled").to_string()));
+                }
+            }
+        }
+    }
+
+    /// Recarrega os painéis cujo diretório foi afetado pela operação.
+    fn reload_after(&mut self, op: &Op) {
+        let mut affected = Vec::new();
+        if let Some(parent) = op.params.src.parent() {
+            affected.push(parent.to_path_buf());
+        }
+        if matches!(op.kind, OpKind::Copy | OpKind::Move)
+            && let Some(dest) = &op.params.dest
+        {
+            affected.push(dest.clone());
+        }
+        for panel in [&mut self.left, &mut self.right] {
+            if affected.contains(&panel.cwd) {
+                panel.reload();
+            }
+        }
+    }
+
+    /// Diretório do painel oposto ao ativo.
+    fn other_cwd(&self) -> PathBuf {
+        match self.active {
+            PanelSide::Left => self.right.cwd.clone(),
+            PanelSide::Right => self.left.cwd.clone(),
+        }
+    }
+
+    /// Enfileira cópia/movimento da seleção ativa para o painel oposto.
+    fn start_transfer(&mut self, kind: OpKind) {
+        let paths = self.active_panel().selected_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let target = self.other_cwd();
+        for path in paths {
+            let _ = self
+                .queue
+                .enqueue(Op::new(kind, path, Some(target.clone())));
+        }
+        self.ops.notice = None;
+    }
+
+    /// Abre o diálogo de renomeação para o primeiro item selecionado.
+    fn start_rename(&mut self) {
+        let Some(path) = self.active_panel().selected_paths().into_iter().next() else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.rename = Some(RenameDialog {
+            path,
+            name,
+            error: None,
+        });
+    }
+
+    /// Pede confirmação para enviar a seleção à lixeira.
+    fn request_delete(&mut self) {
+        let paths = self.active_panel().selected_paths();
+        if !paths.is_empty() {
+            self.delete_confirm = Some(paths);
+        }
+    }
+
+    /// Confirma a exclusão pendente (não desfazível).
+    fn confirm_delete(&mut self) {
+        if let Some(paths) = self.delete_confirm.take() {
+            for path in paths {
+                let _ = self.queue.enqueue(Op::new(OpKind::Delete, path, None));
+            }
+        }
+    }
+
+    /// Desfaz a última operação desfazível, se houver.
+    fn undo_last(&mut self) {
+        let Some(completed) = self.undo.pop() else {
+            return;
+        };
+        if let Some(op) = ops::undo(&completed) {
+            let _ = self.queue.enqueue(op);
+            self.ops.notice = Some(Notice::info(rust_i18n::t!("undo_done").to_string()));
         }
     }
 
@@ -504,6 +779,154 @@ impl AranduApp {
         );
     }
 
+    fn draw_ops_bar(&mut self, ui: &mut Ui, rect: Rect) {
+        let visuals = ui.visuals().clone();
+        ui.painter().rect_filled(rect, 0.0, visuals.faint_bg_color);
+        ui.painter().hline(
+            rect.x_range(),
+            rect.top(),
+            visuals.widgets.noninteractive.bg_stroke,
+        );
+
+        let Some(current) = &self.ops.current else {
+            return;
+        };
+        let kind = current.kind;
+        let name = current.name.clone();
+        let progress = current.progress.clone();
+        let percent = progress
+            .as_ref()
+            .map(|progress| (progress.fraction() * 100.0).round() as u32)
+            .unwrap_or(0);
+        let fraction = progress
+            .as_ref()
+            .map(Progress::fraction)
+            .unwrap_or_default();
+        let verb = match kind {
+            OpKind::Copy => rust_i18n::t!("copying"),
+            OpKind::Move => rust_i18n::t!("moving"),
+            OpKind::Delete => rust_i18n::t!("deleting"),
+            OpKind::Rename => rust_i18n::t!("renaming"),
+        };
+        let label = format!("{verb} {name} — {percent}%");
+        let mut cancel = false;
+
+        ui.scope_builder(
+            UiBuilder::new().max_rect(rect.shrink2(vec2(10.0, 0.0))),
+            |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.add(Label::new(RichText::new(label).size(13.0)).truncate());
+                    ui.add_space(8.0);
+                    ui.add(
+                        egui::ProgressBar::new(fraction)
+                            .desired_width(200.0)
+                            .text(format!("{percent}%")),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .button(rust_i18n::t!("cancel_operation"))
+                            .on_hover_text(rust_i18n::t!("cancel_operation"))
+                            .clicked()
+                        {
+                            cancel = true;
+                        }
+                    });
+                });
+            },
+        );
+
+        if cancel {
+            self.queue.cancel();
+        }
+    }
+
+    fn draw_dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(paths) = self.delete_confirm.clone() {
+            let mut confirm = false;
+            let mut cancel = false;
+            egui::Modal::new(egui::Id::unique("delete-confirm")).show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                ui.heading(rust_i18n::t!("delete_confirm_title"));
+                ui.add_space(6.0);
+                let body = if paths.len() == 1 {
+                    let name = paths[0]
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| paths[0].display().to_string());
+                    rust_i18n::t!("delete_confirm_body", name = name)
+                } else {
+                    rust_i18n::t!("delete_confirm_body_many", count = paths.len())
+                };
+                ui.label(body);
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button(rust_i18n::t!("delete_confirm_ok")).clicked() {
+                        confirm = true;
+                    }
+                    if ui.button(rust_i18n::t!("cancel")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+            if confirm {
+                self.confirm_delete();
+            } else if cancel {
+                self.delete_confirm = None;
+            }
+        }
+
+        if let Some(mut dialog) = self.rename.take() {
+            let mut submit = false;
+            let mut cancel = false;
+            egui::Modal::new(egui::Id::unique("rename-dialog")).show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                ui.heading(rust_i18n::t!("rename_title"));
+                ui.add_space(6.0);
+                ui.label(rust_i18n::t!("rename_label"));
+                let response = ui
+                    .add(egui::TextEdit::singleline(&mut dialog.name).desired_width(f32::INFINITY));
+                if !response.has_focus() {
+                    response.request_focus();
+                }
+                if let Some(error) = &dialog.error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+                if ui.input(|input| input.key_pressed(Key::Enter)) {
+                    submit = true;
+                }
+                if ui.input(|input| input.key_pressed(Key::Escape)) {
+                    cancel = true;
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button(rust_i18n::t!("rename_ok")).clicked() {
+                        submit = true;
+                    }
+                    if ui.button(rust_i18n::t!("cancel")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+            if submit {
+                let name = dialog.name.trim().to_owned();
+                if name.is_empty() {
+                    dialog.error = Some(rust_i18n::t!("rename_empty").to_string());
+                    self.rename = Some(dialog);
+                } else {
+                    let _ = self.queue.enqueue(Op::new(
+                        OpKind::Rename,
+                        dialog.path,
+                        Some(PathBuf::from(name)),
+                    ));
+                    self.ops.notice = None;
+                }
+            } else if !cancel {
+                self.rename = Some(dialog);
+            }
+        }
+    }
+
     fn draw_status_bar(&mut self, ui: &mut Ui, rect: Rect) {
         let visuals = ui.visuals().clone();
         ui.painter().rect_filled(rect, 0.0, visuals.faint_bg_color);
@@ -517,6 +940,14 @@ impl AranduApp {
         let items = rust_i18n::t!("items_count", count = panel.item_count());
         let selected = rust_i18n::t!("selected_count", count = panel.selected_count());
         let path = panel.cwd.display().to_string();
+        let notice = self.ops.notice.as_ref().map(|notice| {
+            let color = if notice.error {
+                visuals.error_fg_color
+            } else {
+                visuals.text_color()
+            };
+            (notice.text.clone(), color)
+        });
         let weak = visuals.weak_text_color();
 
         ui.scope_builder(
@@ -526,6 +957,11 @@ impl AranduApp {
                     ui.label(RichText::new(format!("{items}, {selected}")).color(weak));
                     ui.add_space(12.0);
                     ui.add(Label::new(RichText::new(path).color(weak)).truncate());
+                    if let Some((text, color)) = notice {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.add(Label::new(RichText::new(text).color(color)).truncate());
+                        });
+                    }
                 });
             },
         );
@@ -989,6 +1425,18 @@ impl AranduApp {
     fn active_selected_count(&self) -> usize {
         self.active_panel().selected_count()
     }
+
+    /// Injeta uma operação em andamento para testar a barra de progresso sem
+    /// depender do escalonamento da thread da fila.
+    #[cfg(test)]
+    fn inject_running_op(&mut self, kind: OpKind, name: &str, progress: Option<Progress>) {
+        self.injected_ops = true;
+        self.ops.current = Some(CurrentOp {
+            kind,
+            name: name.to_owned(),
+            progress,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -996,6 +1444,7 @@ mod tests {
     use std::fs;
 
     use arandu_config::Config;
+    use arandu_core::ops::{OpKind, Progress};
     use eframe::egui;
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
@@ -1144,5 +1593,68 @@ mod tests {
         assert_eq!(visible.len(), 4);
         assert_eq!(visible[0], PathBuf::from("/seg0"));
         assert_eq!(visible[3], PathBuf::from("/seg7"));
+    }
+
+    #[test]
+    fn delete_key_opens_trash_confirmation_modal() {
+        let (_dir, mut app) = fixture_app();
+        let file = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| !entry.is_dir)
+            .expect("fixture tem um arquivo");
+        app.left.select(file, false);
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        harness.key_press(egui::Key::Delete);
+        harness.run();
+
+        let title = rust_i18n::t!("delete_confirm_title").to_string();
+        assert!(
+            harness.query_all_by_label(&title).count() >= 1,
+            "esperava o modal de confirmação '{title}'"
+        );
+        let body = rust_i18n::t!("delete_confirm_body", name = "fixture-file.txt").to_string();
+        assert!(
+            harness.query_all_by_label(&body).count() >= 1,
+            "esperava o aviso de lixeira não desfazível"
+        );
+        assert!(harness.state().delete_confirm.is_some());
+    }
+
+    #[test]
+    fn progress_bar_appears_for_running_copy() {
+        let (_dir, mut app) = fixture_app();
+        app.inject_running_op(
+            OpKind::Copy,
+            "grande.bin",
+            Some(Progress {
+                current: PathBuf::from("/tmp/grande.bin"),
+                bytes_done: 45,
+                bytes_total: 100,
+                files_done: 45,
+                files_total: 100,
+            }),
+        );
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        let cancel = rust_i18n::t!("cancel_operation").to_string();
+        assert!(
+            harness.query_all_by_label(&cancel).count() >= 1,
+            "esperava o botão de cancelar na barra de operações"
+        );
+        assert!(
+            harness.query_all_by_label("45%").count() >= 1,
+            "esperava a ProgressBar em 45%"
+        );
     }
 }

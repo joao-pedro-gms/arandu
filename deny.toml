@@ -1,0 +1,39 @@
+[advisories]
+version = 2
+yanked = "warn"
+# Transitórios do eframe/winit/egui sem substituto disponível:
+# - ttf-parser: fontes embutidas do egui (epaint_default_fonts)
+# - zbus/zvariant/zbus_names: stack Wayland do winit
+ignore = [
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; via epaint_default_fonts/egui, sem substituto" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained; via zbus/winit (Wayland), sem substituto" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained; via zbus/winit (Wayland), sem substituto" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained; via zbus/winit (Wayland), sem substituto" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "BSL-1.0", # error-code (via arboard/egui-winit), OSI + FSF livre
+    "OFL-1.1", # fontes embutidas do egui (epaint_default_fonts), OSI + FSF livre
+    "Ubuntu-font-1.0", # fonte Ubuntu embutida no egui
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

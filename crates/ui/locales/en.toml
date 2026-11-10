@@ -1,0 +1,4 @@
+_version = 1
+
+welcome = "Welcome to Arandu"
+welcome_hint = "Your customizable file manager. Press Ctrl+Q to quit."

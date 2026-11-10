@@ -13,7 +13,8 @@ usuários avançados.
 ## Status
 
 🧠 **Fase de definição de escopo** — veja [SCOPE.md](SCOPE.md) para as decisões
-fechadas de arquitetura e o roadmap em três fases. Código ainda não iniciado.
+fechadas de arquitetura e o roadmap em três fases. Scaffold do workspace Cargo
+em andamento (`core`, `config`, `ui`, `git` e `index`).
 
 ## Diferenciais planejados
 

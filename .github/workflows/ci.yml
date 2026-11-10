@@ -7,8 +7,6 @@ on:
 
 jobs:
   rust:
-    # Só roda quando o workspace Rust existir (fase de código ainda não iniciou)
-    if: hashFiles('Cargo.toml') != ''
     strategy:
       fail-fast: false
       matrix:
@@ -34,3 +32,32 @@ jobs:
 
       - name: build
         run: cargo build --workspace --release
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ler rust-version do workspace
+        id: msrv
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "arandu") | .rust_version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "MSRV do workspace: $version"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: check
+        run: cargo check --workspace
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EmbarkStudios/cargo-deny-action@v2

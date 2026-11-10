@@ -43,7 +43,7 @@ visualizações ricas voltadas a desenvolvedores e usuários avançados.
 | Dev local | **just + cargo-hack** (receitas `check`, `test`, `screenshot`, `release`) | cargo puro, cargo-make |
 | Releases | **SemVer 0.x + GitHub Releases** com changelog por commits convencionais | publish crates.io a cada release, sem releases |
 | Dependências | **Conservadora + cargo-deny**; nova dep exige justificativa na PR | liberal, minimalista radical |
-| MSRV | **N-2** (stable atual menos 2 releases), pin + job no CI | só latest, anual |
+| MSRV | **N-2** (stable atual menos 2 releases), pin + job no CI. Floor atual: **1.95**, imposto pelo eframe 0.37 | só latest, anual |
 | Governança | **SECURITY.md + CODE_OF_CONDUCT.md** (Contributor Covenant) | só SECURITY, nenhum |
 
 ### Por que egui e não iced

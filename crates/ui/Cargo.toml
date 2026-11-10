@@ -1,0 +1,14 @@
+[package]
+name = "arandu-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Interface egui do Arandu"
+
+[dependencies]
+eframe.workspace = true
+rust-i18n.workspace = true
+arandu-config.workspace = true

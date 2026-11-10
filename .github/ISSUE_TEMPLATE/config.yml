@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📋 Decisões de escopo
+    url: https://github.com/joao-pedro-gms/arandu/blob/main/SCOPE.md
+    about: Antes de abrir issue, veja o que já foi decidido e o que está em aberto
+  - name: 🗺️ Roadmap
+    url: https://github.com/joao-pedro-gms/arandu/blob/main/ROADMAP.md
+    about: Checklist de progresso por fase

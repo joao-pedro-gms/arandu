@@ -13,18 +13,26 @@
 
 rust_i18n::i18n!("locales", fallback = "en");
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arandu_config::Config;
 use arandu_core::fs::{CoreError, Entry, format_size, list_dir};
 use arandu_core::ops::{self, Op, OpKind, OpsError, Progress};
+use arandu_core::preview::{PreviewContent, PreviewError, PreviewRequest, UnsupportedReason};
 use arandu_core::queue::{OpQueue, QueueEvent, UndoStack};
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Key, Label, Layout, Modifiers, Rect, RichText,
-    ScrollArea, Sense, Stroke, StrokeKind, TextStyle, Ui, UiBuilder, pos2, vec2,
+    ScrollArea, Sense, Stroke, StrokeKind, TextFormat, TextStyle, Ui, UiBuilder, pos2, vec2,
 };
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{FontStyle, ThemeSet};
+use syntect::parsing::SyntaxSet;
+use syntect::util::LinesWithEndings;
 
 /// Nome exibido da aplicação.
 pub const APP_NAME: &str = "Arandu";
@@ -51,6 +59,20 @@ const SIZE_COL_W: f32 = 72.0;
 const MODIFIED_COL_W: f32 = 140.0;
 /// Cor de fundo da seleção: accent a ~25% de alpha.
 const SELECTION_ALPHA: u8 = 64;
+/// Fração inicial da área útil ocupada pelo painel de preview.
+const PREVIEW_FRACTION: f32 = 0.4;
+/// Largura mínima do painel de preview.
+const PREVIEW_MIN_W: f32 = 200.0;
+/// Fração máxima da área útil ocupada pelo painel de preview.
+const PREVIEW_MAX_FRACTION: f32 = 0.6;
+/// Entradas mantidas no cache de preview (LRU simples).
+const PREVIEW_CACHE_CAP: usize = 20;
+/// Teto de linhas renderizadas com syntax highlight.
+///
+/// Um arquivo de 1 MiB pode ter dezenas de milhares de linhas; construir e
+/// dispor um `LayoutJob` completo a cada frame travaria a UI. O texto inteiro
+/// continua disponível no cache, apenas a renderização é limitada.
+const MAX_HIGHLIGHT_LINES: usize = 2000;
 
 /// Painel esquerdo ou direito.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -285,6 +307,88 @@ struct OpsState {
     notice: Option<Notice>,
 }
 
+/// Chave de cache do preview: caminho + mtime.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PreviewKey {
+    path: PathBuf,
+    modified: SystemTime,
+}
+
+impl PreviewKey {
+    fn for_entry(entry: &Entry) -> Self {
+        Self {
+            path: entry.path.clone(),
+            modified: entry.modified,
+        }
+    }
+}
+
+/// Resultado cacheado de um preview (conteúdo ou erro).
+#[derive(Clone)]
+enum PreviewEntry {
+    Ready(Arc<PreviewContent>),
+    Failed(Arc<String>),
+}
+
+/// Cache LRU simples (mapa + ordem de inserção/uso).
+#[derive(Default)]
+struct PreviewCache {
+    map: HashMap<PreviewKey, PreviewEntry>,
+    order: Vec<PreviewKey>,
+}
+
+impl PreviewCache {
+    fn get(&self, key: &PreviewKey) -> Option<PreviewEntry> {
+        self.map.get(key).cloned()
+    }
+
+    /// Marca a chave como usada recentemente (move para o fim da ordem).
+    fn touch(&mut self, key: &PreviewKey) {
+        if !self.map.contains_key(key) {
+            return;
+        }
+        self.order.retain(|item| item != key);
+        self.order.push(key.clone());
+    }
+
+    fn insert(&mut self, key: PreviewKey, entry: PreviewEntry) {
+        self.touch(&key);
+        self.map.insert(key, entry);
+        while self.order.len() > PREVIEW_CACHE_CAP {
+            let oldest = self.order.remove(0);
+            self.map.remove(&oldest);
+        }
+    }
+}
+
+/// Estado do painel de preview (F3).
+#[derive(Default)]
+struct PreviewState {
+    /// Painel visível (F3 alterna).
+    visible: bool,
+    cache: PreviewCache,
+    /// Chave cuja leitura está em andamento.
+    pending: Option<PreviewKey>,
+    /// Canal da leitura em background (uma por vez).
+    receiver: Option<Receiver<(PreviewKey, Result<PreviewContent, PreviewError>)>>,
+    /// Job de highlight do preview de texto atual.
+    job: Option<(PreviewKey, bool, Arc<egui::text::LayoutJob>)>,
+    /// Textura da imagem atual.
+    texture: Option<(PreviewKey, egui::TextureHandle)>,
+}
+
+/// Conjunto padrão de sintaxes (carregado uma única vez).
+fn syntax_set() -> &'static SyntaxSet {
+    static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
+    SYNTAXES.get_or_init(SyntaxSet::load_defaults_newlines)
+}
+
+/// Temas padrão do syntect (carregados uma única vez).
+fn theme_set() -> &'static ThemeSet {
+    static THEMES: OnceLock<ThemeSet> = OnceLock::new();
+    THEMES.get_or_init(ThemeSet::load_defaults)
+}
+
 /// Diálogo de renomeação.
 struct RenameDialog {
     path: PathBuf,
@@ -311,6 +415,8 @@ pub struct AranduApp {
     delete_confirm: Option<Vec<PathBuf>>,
     /// Renomeação em edição.
     rename: Option<RenameDialog>,
+    /// Painel de pré-visualização (F3).
+    preview: PreviewState,
     /// Congela a drenagem da fila em testes determinísticos de progresso.
     #[cfg(test)]
     injected_ops: bool,
@@ -339,6 +445,7 @@ impl AranduApp {
             ops: OpsState::default(),
             delete_confirm: None,
             rename: None,
+            preview: PreviewState::default(),
             #[cfg(test)]
             injected_ops: false,
         }
@@ -361,6 +468,7 @@ impl AranduApp {
         }
 
         self.pump_queue();
+        self.pump_preview();
         self.handle_keyboard(&ctx);
 
         // O `Ui` entregue pelo eframe 0.37 não tem margem nem fundo: pintamos o
@@ -475,6 +583,11 @@ impl AranduApp {
             return;
         }
 
+        let toggle_preview = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F3));
+        if toggle_preview {
+            self.preview.visible = !self.preview.visible;
+        }
+
         let tab = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab));
         if tab {
             self.active = self.active.other();
@@ -578,6 +691,62 @@ impl AranduApp {
                 }
             }
         }
+    }
+
+    /// Drena o resultado da leitura de preview em background.
+    fn pump_preview(&mut self) {
+        let received = self
+            .preview
+            .receiver
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok());
+        let Some((key, result)) = received else {
+            return;
+        };
+        self.preview.receiver = None;
+        if self.preview.pending.as_ref() == Some(&key) {
+            self.preview.pending = None;
+        }
+        let entry = match result {
+            Ok(content) => PreviewEntry::Ready(Arc::new(content)),
+            Err(error) => PreviewEntry::Failed(Arc::new(error.to_string())),
+        };
+        self.preview.cache.insert(key, entry);
+    }
+
+    /// Dispara (se necessário) a leitura do item focado.
+    ///
+    /// Diretórios não são lidos: o painel mostra apenas o card de metadados.
+    fn ensure_preview(&mut self, entry: Option<&Entry>) {
+        let Some(entry) = entry else {
+            return;
+        };
+        if entry.is_dir {
+            return;
+        }
+
+        let key = PreviewKey::for_entry(entry);
+        if self.preview.cache.get(&key).is_some() {
+            self.preview.cache.touch(&key);
+            return;
+        }
+        if self.preview.pending.as_ref() == Some(&key) {
+            return;
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        self.preview.receiver = Some(receiver);
+        self.preview.pending = Some(key.clone());
+
+        let request = PreviewRequest {
+            path: entry.path.clone(),
+            size_hint: entry.size,
+        };
+        // Preview é leitura pura: não passa pela fila de operações.
+        std::thread::spawn(move || {
+            let result = request.load();
+            let _ = sender.send((key, result));
+        });
     }
 
     /// Recarrega os painéis cujo diretório foi afetado pela operação.
@@ -710,18 +879,39 @@ impl AranduApp {
         let visuals = ui.visuals().clone();
         let accent = accent_color(&self.config, &visuals);
 
-        let avail = (content.width() - SPLITTER_HIT).max(1.0);
+        // O preview fica fixo à direita; os dois painéis dividem o restante.
+        let preview_w = if self.preview.visible {
+            let max_w = content.width() * PREVIEW_MAX_FRACTION;
+            (content.width() * PREVIEW_FRACTION)
+                .max(PREVIEW_MIN_W.min(max_w))
+                .min(max_w)
+        } else {
+            0.0
+        };
+        let panes_rect = Rect::from_min_max(
+            content.min,
+            pos2(
+                (content.right() - preview_w).max(content.left() + 1.0),
+                content.bottom(),
+            ),
+        );
+
+        let avail = (panes_rect.width() - SPLITTER_HIT).max(1.0);
         let min_w = MIN_PANEL_W.min(avail / 2.0);
         let left_w = (self.split * avail).clamp(min_w, avail - min_w);
 
-        let left_rect =
-            Rect::from_min_max(content.min, pos2(content.left() + left_w, content.bottom()));
-        let splitter_rect = Rect::from_min_max(
-            pos2(left_rect.right(), content.top()),
-            pos2(left_rect.right() + SPLITTER_HIT, content.bottom()),
+        let left_rect = Rect::from_min_max(
+            panes_rect.min,
+            pos2(panes_rect.left() + left_w, panes_rect.bottom()),
         );
-        let right_rect =
-            Rect::from_min_max(pos2(splitter_rect.right(), content.top()), content.max);
+        let splitter_rect = Rect::from_min_max(
+            pos2(left_rect.right(), panes_rect.top()),
+            pos2(left_rect.right() + SPLITTER_HIT, panes_rect.bottom()),
+        );
+        let right_rect = Rect::from_min_max(
+            pos2(splitter_rect.right(), panes_rect.top()),
+            panes_rect.max,
+        );
 
         let splitter = ui
             .interact(
@@ -737,7 +927,7 @@ impl AranduApp {
         if splitter.dragged() {
             if let Some(pos) = ui.ctx().pointer_interact_pos() {
                 let min_w = MIN_PANEL_W.min(avail / 2.0);
-                let new_left = (pos.x - content.left()).clamp(min_w, avail - min_w);
+                let new_left = (pos.x - panes_rect.left()).clamp(min_w, avail - min_w);
                 self.split = new_left / avail;
             }
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
@@ -774,8 +964,243 @@ impl AranduApp {
         };
         ui.painter().vline(
             splitter_rect.center().x,
-            content.y_range(),
+            panes_rect.y_range(),
             Stroke::new(1.0, splitter_color),
+        );
+
+        if self.preview.visible {
+            let preview_rect =
+                Rect::from_min_max(pos2(panes_rect.right(), content.top()), content.max);
+            let focused = self
+                .active_panel()
+                .entries
+                .get(self.active_panel().focus)
+                .cloned();
+            self.ensure_preview(focused.as_ref());
+            self.draw_preview(ui, preview_rect, focused.as_ref(), &visuals);
+        }
+    }
+
+    /// Desenha o painel de preview completo (header + corpo).
+    fn draw_preview(
+        &mut self,
+        ui: &mut Ui,
+        rect: Rect,
+        entry: Option<&Entry>,
+        visuals: &egui::Visuals,
+    ) {
+        ui.painter().rect_filled(rect, 0.0, visuals.faint_bg_color);
+
+        let inner = Rect::from_min_max(
+            pos2(rect.left() + 8.0, rect.top()),
+            pos2(rect.right() - 8.0, rect.bottom()),
+        );
+        ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let header = ui.allocate_ui_with_layout(
+                vec2(ui.available_width(), HEADER_H),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.label(RichText::new(rust_i18n::t!("preview_title")).strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(rust_i18n::t!("preview_hint"))
+                                .size(12.5)
+                                .color(visuals.weak_text_color()),
+                        );
+                    });
+                },
+            );
+            ui.painter().hline(
+                header.response.rect.x_range(),
+                header.response.rect.bottom(),
+                visuals.widgets.noninteractive.bg_stroke,
+            );
+
+            let body =
+                Rect::from_min_max(pos2(inner.left(), header.response.rect.bottom()), inner.max);
+            self.draw_preview_body(ui, body, entry, visuals);
+        });
+
+        ui.painter().vline(
+            rect.left(),
+            rect.y_range(),
+            visuals.widgets.noninteractive.bg_stroke,
+        );
+    }
+
+    fn draw_preview_body(
+        &mut self,
+        ui: &mut Ui,
+        body: Rect,
+        entry: Option<&Entry>,
+        visuals: &egui::Visuals,
+    ) {
+        let Some(entry) = entry else {
+            draw_preview_centered(ui, body, rust_i18n::t!("preview_empty"), visuals);
+            return;
+        };
+
+        // Diretórios: apenas metadados (tamanho indisponível).
+        if entry.is_dir {
+            ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
+                draw_preview_metadata(ui, entry);
+            });
+            return;
+        }
+
+        let key = PreviewKey::for_entry(entry);
+        match self.preview.cache.get(&key) {
+            Some(PreviewEntry::Ready(content)) => match &*content {
+                PreviewContent::Text {
+                    text,
+                    truncated,
+                    syntax_name,
+                } => {
+                    self.draw_preview_text(
+                        ui,
+                        body,
+                        &key,
+                        text,
+                        *truncated,
+                        syntax_name.as_deref(),
+                    );
+                }
+                PreviewContent::Image { image, .. } => {
+                    self.draw_preview_image(ui, body, &key, image, visuals);
+                }
+                PreviewContent::Unsupported { reason } => {
+                    ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
+                        draw_preview_metadata(ui, entry);
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new(rust_i18n::t!("preview_unavailable"))
+                                .color(visuals.warn_fg_color),
+                        );
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(preview_reason(*reason)).color(visuals.weak_text_color()),
+                        );
+                    });
+                }
+            },
+            Some(PreviewEntry::Failed(error)) => {
+                ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
+                    draw_preview_metadata(ui, entry);
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(rust_i18n::t!("preview_unavailable"))
+                            .color(visuals.warn_fg_color),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(RichText::new(error.as_str()).color(visuals.weak_text_color()));
+                });
+            }
+            None => {
+                draw_preview_centered(ui, body, rust_i18n::t!("preview_loading"), visuals);
+            }
+        }
+    }
+
+    fn draw_preview_text(
+        &mut self,
+        ui: &mut Ui,
+        body: Rect,
+        key: &PreviewKey,
+        text: &str,
+        truncated: bool,
+        syntax_name: Option<&str>,
+    ) {
+        let dark = ui.visuals().dark_mode;
+        let rebuild = match &self.preview.job {
+            Some((cached_key, cached_dark, _)) => cached_key != key || *cached_dark != dark,
+            None => true,
+        };
+        if rebuild {
+            self.preview.job = Some((
+                key.clone(),
+                dark,
+                Arc::new(build_text_job(text, syntax_name, dark)),
+            ));
+        }
+        let job = self
+            .preview
+            .job
+            .as_ref()
+            .map(|(_, _, job)| Arc::clone(job))
+            .expect("job recém-construído");
+
+        ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
+            if truncated {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(rust_i18n::t!("preview_truncated"))
+                        .size(12.5)
+                        .color(ui.visuals().warn_fg_color),
+                );
+                ui.add_space(4.0);
+            }
+            ScrollArea::both()
+                .id_salt("preview-text")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    ui.add(Label::new(job).selectable(false));
+                });
+        });
+    }
+
+    fn draw_preview_image(
+        &mut self,
+        ui: &mut Ui,
+        body: Rect,
+        key: &PreviewKey,
+        image: &image::DynamicImage,
+        _visuals: &egui::Visuals,
+    ) {
+        let stale = self
+            .preview
+            .texture
+            .as_ref()
+            .map(|(cached_key, _)| cached_key != key)
+            .unwrap_or(true);
+        if stale {
+            let rgba = image.to_rgba8();
+            let color = egui::ColorImage::from_rgba_unmultiplied(
+                [rgba.width() as usize, rgba.height() as usize],
+                rgba.as_raw(),
+            );
+            let texture = ui.ctx().load_texture(
+                format!("preview:{}", key.path.display()),
+                color,
+                egui::TextureOptions::LINEAR,
+            );
+            self.preview.texture = Some((key.clone(), texture));
+        }
+
+        let Some((_, texture)) = &self.preview.texture else {
+            return;
+        };
+        let texture = texture.clone();
+
+        let available = body.size() - vec2(0.0, 8.0);
+        let width = image.width() as f32;
+        let height = image.height() as f32;
+        let scale = (available.x / width)
+            .min(available.y / height)
+            .clamp(0.01, 1.0);
+        let size = vec2(width * scale, height * scale);
+
+        ui.scope_builder(
+            UiBuilder::new()
+                .max_rect(body)
+                .layout(Layout::centered_and_justified(egui::Direction::TopDown)),
+            |ui| {
+                ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                    texture.id(),
+                    size,
+                )));
+            },
         );
     }
 
@@ -957,11 +1382,20 @@ impl AranduApp {
                     ui.label(RichText::new(format!("{items}, {selected}")).color(weak));
                     ui.add_space(12.0);
                     ui.add(Label::new(RichText::new(path).color(weak)).truncate());
-                    if let Some((text, color)) = notice {
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add(
+                            Label::new(
+                                RichText::new(rust_i18n::t!("preview_hint"))
+                                    .size(12.5)
+                                    .color(weak),
+                            )
+                            .truncate(),
+                        );
+                        if let Some((text, color)) = notice {
+                            ui.add_space(12.0);
                             ui.add(Label::new(RichText::new(text).color(color)).truncate());
-                        });
-                    }
+                        }
+                    });
                 });
             },
         );
@@ -1285,6 +1719,129 @@ fn draw_row(
     None
 }
 
+/// Card de metadados usado por diretórios, binários e erros de leitura.
+fn draw_preview_metadata(ui: &mut Ui, entry: &Entry) {
+    ui.add_space(8.0);
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new(&entry.name).size(15.0).strong());
+        ui.add_space(4.0);
+        let weak = ui.visuals().weak_text_color();
+        let size = if entry.is_dir {
+            String::from("—")
+        } else {
+            format_size(entry.size)
+        };
+        ui.label(
+            RichText::new(format!("{}: {size}", rust_i18n::t!("preview_size")))
+                .size(12.5)
+                .color(weak),
+        );
+        ui.label(
+            RichText::new(format!(
+                "{}: {}",
+                rust_i18n::t!("preview_modified"),
+                format_modified(entry.modified)
+            ))
+            .size(12.5)
+            .color(weak),
+        );
+    });
+}
+
+/// Mensagem centralizada (carregando / nenhum item focado).
+fn draw_preview_centered(
+    ui: &mut Ui,
+    body: Rect,
+    text: impl Into<String>,
+    visuals: &egui::Visuals,
+) {
+    ui.scope_builder(
+        UiBuilder::new()
+            .max_rect(body)
+            .layout(Layout::centered_and_justified(egui::Direction::TopDown)),
+        |ui| {
+            ui.label(RichText::new(text.into()).color(visuals.weak_text_color()));
+        },
+    );
+}
+
+fn preview_reason(reason: UnsupportedReason) -> String {
+    let key = match reason {
+        UnsupportedReason::Directory => "preview_reason_directory",
+        UnsupportedReason::Binary => "preview_reason_binary",
+        UnsupportedReason::TooLarge => "preview_reason_too_large",
+    };
+    rust_i18n::t!(key).to_string()
+}
+
+/// Constrói o `LayoutJob` com syntax highlight (ou monospace puro).
+///
+/// Limitado a [`MAX_HIGHLIGHT_LINES`] para manter o frame barato.
+fn build_text_job(text: &str, syntax_name: Option<&str>, dark: bool) -> egui::text::LayoutJob {
+    let base = TextFormat {
+        font_id: FontId::monospace(12.0),
+        color: if dark {
+            Color32::from_rgb(0xd4, 0xd4, 0xd4)
+        } else {
+            Color32::from_rgb(0x24, 0x24, 0x24)
+        },
+        ..Default::default()
+    };
+
+    let syntaxes = syntax_set();
+    let syntax = syntax_name.and_then(|name| syntaxes.find_syntax_by_extension(name));
+    let Some(syntax) = syntax else {
+        return plain_text_job(text, base);
+    };
+
+    let themes = theme_set();
+    let theme_name = if dark {
+        "base16-ocean.dark"
+    } else {
+        "InspiredGitHub"
+    };
+    let Some(theme) = themes.themes.get(theme_name) else {
+        return plain_text_job(text, base);
+    };
+
+    let mut job = egui::text::LayoutJob::default();
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    for line in LinesWithEndings::from(text).take(MAX_HIGHLIGHT_LINES) {
+        match highlighter.highlight_line(line, syntaxes) {
+            Ok(ranges) => {
+                for (style, piece) in ranges {
+                    job.append(
+                        piece,
+                        0.0,
+                        TextFormat {
+                            font_id: FontId::monospace(12.0),
+                            color: Color32::from_rgb(
+                                style.foreground.r,
+                                style.foreground.g,
+                                style.foreground.b,
+                            ),
+                            italics: style.font_style.contains(FontStyle::ITALIC),
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            Err(_) => job.append(line, 0.0, base.clone()),
+        }
+    }
+    job
+}
+
+fn plain_text_job(text: &str, format: TextFormat) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    for line in text.lines().take(MAX_HIGHLIGHT_LINES) {
+        job.append(line, 0.0, format.clone());
+        job.append("\n", 0.0, format.clone());
+    }
+    job
+}
+
 fn draw_empty(ui: &mut Ui, visuals: &egui::Visuals) {
     let body = ui.available_rect_before_wrap();
     ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
@@ -1424,6 +1981,44 @@ impl AranduApp {
     #[cfg(test)]
     fn active_selected_count(&self) -> usize {
         self.active_panel().selected_count()
+    }
+
+    /// Se o painel de preview está aberto — usado em testes.
+    #[cfg(test)]
+    fn preview_visible(&self) -> bool {
+        self.preview.visible
+    }
+
+    /// Chave do item focado quando ele é um arquivo elegível a preview.
+    #[cfg(test)]
+    fn focused_preview_key(&self) -> Option<PreviewKey> {
+        let panel = self.active_panel();
+        panel
+            .entries
+            .get(panel.focus)
+            .filter(|entry| !entry.is_dir)
+            .map(PreviewKey::for_entry)
+    }
+
+    /// Se o preview do item focado já terminou de carregar — usado em testes.
+    #[cfg(test)]
+    fn preview_ready(&self) -> bool {
+        self.focused_preview_key()
+            .and_then(|key| self.preview.cache.get(&key))
+            .is_some()
+    }
+
+    /// Texto do preview focado, quando for texto — usado em testes.
+    #[cfg(test)]
+    fn preview_text(&self) -> Option<String> {
+        let key = self.focused_preview_key()?;
+        match self.preview.cache.get(&key)? {
+            PreviewEntry::Ready(content) => match &*content {
+                PreviewContent::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            },
+            PreviewEntry::Failed(_) => None,
+        }
     }
 
     /// Injeta uma operação em andamento para testar a barra de progresso sem
@@ -1655,6 +2250,68 @@ mod tests {
         assert!(
             harness.query_all_by_label("45%").count() >= 1,
             "esperava a ProgressBar em 45%"
+        );
+    }
+
+    fn fixture_preview_app() -> (tempfile::TempDir, AranduApp) {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        fs::write(
+            dir.path().join("main.rs"),
+            b"fn main() {\n    println!(\"oi\");\n}\n",
+        )
+        .expect("cria main.rs");
+        let mut app = AranduApp::new_at(Config::default(), dir.path());
+        let index = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.name == "main.rs")
+            .expect("fixture tem main.rs");
+        app.left.select(index, false);
+        (dir, app)
+    }
+
+    #[test]
+    fn f3_toggles_preview_and_loads_focused_text() {
+        let (_dir, app) = fixture_preview_app();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        assert!(!harness.state().preview_visible());
+
+        harness.key_press(egui::Key::F3);
+        harness.run();
+        assert!(harness.state().preview_visible());
+
+        let title = rust_i18n::t!("preview_title").to_string();
+        assert!(
+            harness.query_all_by_label(&title).count() >= 1,
+            "esperava o título '{title}' do painel de preview"
+        );
+
+        // A leitura acontece em `std::thread`; bombeamos frames até concluir.
+        for _ in 0..200 {
+            if harness.state().preview_ready() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run();
+        }
+        assert!(
+            harness.state().preview_ready(),
+            "o preview de texto deveria carregar em background"
+        );
+        let text = harness.state().preview_text().expect("preview de texto");
+        assert!(text.contains("fn main"), "conteúdo inesperado: {text:?}");
+
+        harness.key_press(egui::Key::F3);
+        harness.run();
+        assert!(!harness.state().preview_visible());
+        assert_eq!(
+            harness.query_all_by_label(&title).count(),
+            0,
+            "o painel de preview deveria sumir ao pressionar F3 novamente"
         );
     }
 }

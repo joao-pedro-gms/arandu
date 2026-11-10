@@ -2,4 +2,5 @@
 
 pub mod fs;
 pub mod ops;
+pub mod preview;
 pub mod queue;

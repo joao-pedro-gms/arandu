@@ -9,6 +9,8 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained; via zbus/winit (Wayland), sem substituto" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained; via zbus/winit (Wayland), sem substituto" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained; via zbus/winit (Wayland), sem substituto" },
+    { id = "RUSTSEC-2024-0320", reason = "yaml-rust unmaintained; via syntect (parsing de syntaxes), sem substituto direto" },
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained; via syntect (deserialização de syntax dumps), sem substituto direto" },
 ]
 
 [licenses]

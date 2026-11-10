@@ -272,6 +272,7 @@ version = "0.1.0"
 dependencies = [
  "arandu-config",
  "arandu-core",
+ "arandu-git",
  "eframe",
  "egui_kittest",
  "image",

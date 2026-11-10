@@ -22,6 +22,7 @@ use crate::ConfigError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     TogglePreview,
+    ToggleGitPanel,
     TogglePanel,
     NavigateUp,
     NavigateDown,
@@ -47,6 +48,7 @@ impl Action {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::TogglePreview => "toggle_preview",
+            Self::ToggleGitPanel => "toggle_git_panel",
             Self::TogglePanel => "toggle_panel",
             Self::NavigateUp => "navigate_up",
             Self::NavigateDown => "navigate_down",
@@ -69,8 +71,9 @@ impl Action {
     }
 
     /// Todas as ações, na ordem canônica do arquivo.
-    pub const ALL: [Action; 19] = [
+    pub const ALL: [Action; 20] = [
         Self::TogglePreview,
+        Self::ToggleGitPanel,
         Self::TogglePanel,
         Self::NavigateUp,
         Self::NavigateDown,
@@ -345,6 +348,7 @@ fn ctrl(key: &str) -> KeyBinding {
 fn default_bindings(action: Action) -> Vec<KeyBinding> {
     match action {
         Action::TogglePreview => vec![kb("F3")],
+        Action::ToggleGitPanel => vec![ctrl("G")],
         Action::TogglePanel => vec![kb("Tab")],
         Action::NavigateUp => vec![kb("ArrowUp")],
         Action::NavigateDown => vec![kb("ArrowDown")],
@@ -369,6 +373,7 @@ fn default_bindings(action: Action) -> Vec<KeyBinding> {
 fn vim_bindings(action: Action) -> Vec<KeyBinding> {
     match action {
         Action::TogglePreview => vec![kb("P")],
+        Action::ToggleGitPanel => vec![ctrl("G")],
         Action::TogglePanel => vec![kb("Tab")],
         Action::NavigateUp => vec![kb("K")],
         Action::NavigateDown => vec![kb("J")],
@@ -597,6 +602,20 @@ mod tests {
             Action::from_name("extract").expect("extract"),
             Action::Extract
         );
+    }
+
+    #[test]
+    fn git_panel_uses_ctrl_g_in_both_presets() {
+        for preset in ["default", "vim"] {
+            let keymap = Keymap {
+                preset: preset.to_owned(),
+                ..Keymap::default()
+            };
+            assert_eq!(
+                keymap.effective(Action::ToggleGitPanel),
+                vec![KeyBinding::with_mods(Modifiers::CTRL, "G")]
+            );
+        }
     }
 
     #[test]

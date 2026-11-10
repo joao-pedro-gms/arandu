@@ -13,6 +13,7 @@ eframe.workspace = true
 rust-i18n.workspace = true
 arandu-config.workspace = true
 arandu-core.workspace = true
+arandu-git.workspace = true
 syntect.workspace = true
 image.workspace = true
 

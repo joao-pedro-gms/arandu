@@ -16,6 +16,8 @@ sha2.workspace = true
 md-5.workspace = true
 zip.workspace = true
 tar.workspace = true
+serde_json.workspace = true
+pdfrum.workspace = true
 
 [dev-dependencies]
 tempfile = "3.27.0"

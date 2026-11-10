@@ -19,6 +19,7 @@ arandu-core.workspace = true
 arandu-index.workspace = true
 syntect.workspace = true
 image.workspace = true
+egui_commonmark.workspace = true
 
 [dev-dependencies]
 egui_kittest = "0.37"

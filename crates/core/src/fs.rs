@@ -47,6 +47,16 @@ pub enum CoreError {
         #[source]
         source: std::io::Error,
     },
+
+    /// Falha ao criar ou extrair um arquivo compactado (zip/tar).
+    #[error("erro de compactação em {path}")]
+    Archive {
+        /// Caminho do arquivo compactado ou da origem afetada.
+        path: PathBuf,
+        /// Erro original do backend de compactação.
+        #[source]
+        source: crate::archive::ArchiveError,
+    },
 }
 
 impl CoreError {

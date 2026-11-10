@@ -43,6 +43,7 @@ toml = "1"
 directories = "6"
 eframe = "0.37"
 rust-i18n = "4.2"
+trash = "5"
 
 arandu-core = { path = "crates/core" }
 arandu-config = { path = "crates/config" }

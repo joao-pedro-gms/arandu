@@ -14,16 +14,16 @@ O roadmap detalhado com justificativas vive em [SCOPE.md](SCOPE.md). Esta págin
 - [x] Temas TOML + configuração + keymap redefinível (preset Vim)
 - [x] i18n desde o dia 1 (todas as strings via sistema de tradução) <!-- PR #1: rust-i18n en/pt-BR -->
 - [x] Tags nos arquivos (storage simples; banco na fase 2) <!-- PR #8: TagsStore TOML, editor F4, chips -->
-- [ ] Screenshot tests com egui_kittest no CI
+- [x] Screenshot tests com egui_kittest no CI <!-- PR #11 -->
 - [x] Ferramentas: compressão (zip/tar), checksums (SHA-256/MD5), rename em lote <!-- PRs #9 e #10; 7z fora: sem crate madura -->
-- [ ] justfile (check, test, screenshot, release) + cargo-hack
+- [x] justfile (check, test, screenshot, release) + cargo-hack <!-- PR #11 -->
 - [x] CI verde: fmt, clippy `-D warnings`, testes (Ubuntu + Windows) + job MSRV (N-2) + cargo-deny <!-- PR #1 -->
 
 ## Fase 2 — Diferenciais
 
-- [ ] Painel Git completo (gix): status, staging visual, branches, blame, log gráfico, stashes
-- [ ] Indexação global: walker em background (walkdir + notify) + fuzzy (nucleo)
-- [ ] Preview ampliado: markdown, PDF, hex, CSV/JSON
+- [ ] Painel Git completo (gix): ~~status, staging visual~~ ✅ (PR #13); branches, blame, log gráfico, stashes pendentes
+- [x] Indexação global: walker em background (walkdir; notify p/ fase 3) + fuzzy estilo fzf (PR #14)
+- [x] Preview ampliado: markdown, PDF (pdfrum), hex, CSV/JSON (PR #15)
 - [ ] Visualizadores por tipo de arquivo
 
 ## Fase 3 — Extensibilidade
@@ -34,7 +34,7 @@ O roadmap detalhado com justificativas vive em [SCOPE.md](SCOPE.md). Esta págin
 
 ## Decisões em aberto
 
-- [ ] Crate para PDF: mupdf vs pdfium (fase 2)
+- [x] ~~Crate para PDF: mupdf vs pdfium (fase 2)~~ → pdfrum (SCOPE.md)
 - [ ] Plugins: WASM vs Lua (fase 3 — hook de arquitetura já desenhado)
 - [x] ~~Disponibilidade do crate `arandu`~~ livre no crates.io
 - [x] ~~Testes / i18n / telemetria / FS remoto / metadados~~ sessão 2

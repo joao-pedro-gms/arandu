@@ -8,6 +8,10 @@ authors.workspace = true
 repository.workspace = true
 description = "Interface egui do Arandu"
 
+[features]
+# Habilita os testes de snapshot de tela (exigem um backend wgpu headless).
+screenshot-tests = []
+
 [dependencies]
 eframe.workspace = true
 # Habilita o Noto Emoji monoespaçado para os glifos de pasta/arquivo do modo
@@ -23,5 +27,13 @@ image.workspace = true
 egui_commonmark.workspace = true
 
 [dev-dependencies]
-egui_kittest = "0.37"
+# `wgpu` + `snapshot` são necessários para `Harness::snapshot*`. Dev-deps não
+# podem ser opcionais, então o wgpu compila nos jobs de teste mesmo quando a
+# feature `screenshot-tests` está desligada (os snapshots só rodam com ela).
+egui_kittest = { version = "0.37", features = ["wgpu", "snapshot"] }
+filetime = "0.2"
 tempfile = "3.27.0"
+
+[[test]]
+name = "screenshots"
+required-features = ["screenshot-tests"]

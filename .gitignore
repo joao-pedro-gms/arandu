@@ -22,3 +22,6 @@ target/
 .DS_Store
 Thumbs.db
 dist/
+crates/ui/tests/snapshots/*.diff.png
+crates/ui/tests/snapshots/*.new.png
+crates/ui/tests/snapshots/*.old.png

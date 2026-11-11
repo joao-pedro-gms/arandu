@@ -746,8 +746,6 @@ impl AranduApp {
 
     /// Cria a aplicação com um diretório inicial explícito (útil em testes).
     pub fn new_at(config: Config, dir: impl Into<PathBuf>) -> Self {
-        rust_i18n::set_locale(&config.locale);
-        let dir = dir.into();
         #[cfg(test)]
         let keymap = Keymap::default();
         #[cfg(not(test))]
@@ -762,6 +760,27 @@ impl AranduApp {
             eprintln!("arandu: tags inválidas, começando vazio: {error}");
             TagsStore::default()
         });
+
+        Self::with_state(config, dir, keymap, tags)
+    }
+
+    /// Variante determinística para testes headless (ex.: snapshots de tela).
+    ///
+    /// Usa o keymap e o armazenamento de tags padrão em vez de ler a
+    /// configuração do usuário, mantendo a renderização reprodutível.
+    #[doc(hidden)]
+    pub fn new_at_isolated(config: Config, dir: impl Into<PathBuf>) -> Self {
+        Self::with_state(config, dir, Keymap::default(), TagsStore::default())
+    }
+
+    fn with_state(
+        config: Config,
+        dir: impl Into<PathBuf>,
+        keymap: Keymap,
+        tags: TagsStore,
+    ) -> Self {
+        rust_i18n::set_locale(&config.locale);
+        let dir = dir.into();
         let theme = config.resolved_theme();
         Self {
             config,

@@ -182,6 +182,16 @@ impl ViewMode {
     }
 }
 
+/// Cache do mapa `caminho -> tags` de um painel.
+///
+/// Evita `canonicalize` por entrada a cada frame: o mapa só é recalculado
+/// quando as entradas do painel ou o `TagsStore` mudam.
+struct TagCache {
+    entries_generation: u64,
+    tags_generation: u64,
+    map: HashMap<String, Vec<String>>,
+}
+
 /// Estado de um painel.
 pub struct PanelState {
     /// Diretório atual do painel.
@@ -209,6 +219,8 @@ pub struct PanelState {
     viewport_h: f32,
     /// Offset solicitado para o próximo frame (auto-scroll do foco).
     pending_scroll: Option<f32>,
+    /// Incrementada a cada recarga; invalida caches derivados das entradas.
+    entries_generation: u64,
 }
 
 impl PanelState {
@@ -226,6 +238,7 @@ impl PanelState {
             scroll_offset: 0.0,
             viewport_h: 0.0,
             pending_scroll: None,
+            entries_generation: 0,
         };
         panel.reload();
         panel
@@ -233,6 +246,7 @@ impl PanelState {
 
     /// Recarrega a listagem do diretório atual.
     fn reload(&mut self) {
+        self.entries_generation = self.entries_generation.wrapping_add(1);
         match list_dir(&self.cwd) {
             Ok(entries) => {
                 self.entries = entries;
@@ -907,6 +921,11 @@ pub struct AranduApp {
     open_executor: Arc<dyn OpenExecutor>,
     /// Tags dos arquivos, persistidas em `tags.toml`.
     tags: TagsStore,
+    /// Incrementada a cada edição de tags; invalida [`TagCache`].
+    tags_generation: u64,
+    /// Mapa de tags em cache por painel.
+    tag_cache_left: Option<TagCache>,
+    tag_cache_right: Option<TagCache>,
     /// Painel de pré-visualização (F3).
     preview: PreviewState,
     /// Painel Git (Ctrl+G).
@@ -932,6 +951,9 @@ pub struct AranduApp {
     /// Congela a drenagem da fila em testes determinísticos de progresso.
     #[cfg(test)]
     injected_ops: bool,
+    /// Quantas vezes o mapa de tags foi recalculado (testes de cache).
+    #[cfg(test)]
+    tag_cache_computations: usize,
 }
 
 impl AranduApp {
@@ -1000,6 +1022,9 @@ impl AranduApp {
             open_with_dialog: None,
             open_executor: Arc::new(SystemOpenExecutor),
             tags,
+            tags_generation: 0,
+            tag_cache_left: None,
+            tag_cache_right: None,
             preview: PreviewState::default(),
             git: GitState::default(),
             theme,
@@ -1013,6 +1038,8 @@ impl AranduApp {
             plugin_dir: None,
             #[cfg(test)]
             injected_ops: false,
+            #[cfg(test)]
+            tag_cache_computations: 0,
         }
     }
 
@@ -1232,8 +1259,23 @@ impl AranduApp {
         }
     }
 
-    /// Tags das entradas de um painel, resolvidas uma vez por frame.
-    fn tag_map_for(&self, panel: &PanelState) -> HashMap<String, Vec<String>> {
+    /// Tags das entradas de um painel, recalculadas só quando as entradas ou
+    /// o armazenamento de tags mudam (sem `canonicalize` por frame).
+    fn tag_map_for(&mut self, side: PanelSide) -> HashMap<String, Vec<String>> {
+        let (panel, cache) = match side {
+            PanelSide::Left => (&self.left, &mut self.tag_cache_left),
+            PanelSide::Right => (&self.right, &mut self.tag_cache_right),
+        };
+        let entries_generation = panel.entries_generation;
+        let tags_generation = self.tags_generation;
+        if let Some(cache) = cache.as_ref() {
+            if cache.entries_generation == entries_generation
+                && cache.tags_generation == tags_generation
+            {
+                return cache.map.clone();
+            }
+        }
+
         let mut map = HashMap::new();
         for entry in &panel.entries {
             let tags = self.tags.tags_of(&entry.path);
@@ -1241,7 +1283,21 @@ impl AranduApp {
                 map.insert(entry.path.to_string_lossy().into_owned(), tags);
             }
         }
+        *cache = Some(TagCache {
+            entries_generation,
+            tags_generation,
+            map: map.clone(),
+        });
+        #[cfg(test)]
+        {
+            self.tag_cache_computations += 1;
+        }
         map
+    }
+
+    /// Invalida os caches de tags após uma edição.
+    fn tags_changed(&mut self) {
+        self.tags_generation = self.tags_generation.wrapping_add(1);
     }
 
     /// Trata atalhos globais antes de desenhar os widgets, casando as teclas
@@ -3297,8 +3353,8 @@ impl AranduApp {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         }
 
-        let left_tags = self.tag_map_for(&self.left);
-        let right_tags = self.tag_map_for(&self.right);
+        let left_tags = self.tag_map_for(PanelSide::Left);
+        let right_tags = self.tag_map_for(PanelSide::Right);
 
         let left_interacted = draw_panel(
             ui,
@@ -4493,6 +4549,7 @@ impl AranduApp {
                 for path in &dialog.paths {
                     self.tags.remove(path, &tag);
                 }
+                self.tags_changed();
                 self.persist_tags();
             }
 
@@ -4507,6 +4564,7 @@ impl AranduApp {
                         .iter()
                         .try_for_each(|path| self.tags.add(path, &tag));
                     if added.is_ok() {
+                        self.tags_changed();
                         self.persist_tags();
                         dialog.input.clear();
                         dialog.error = None;
@@ -7562,9 +7620,39 @@ mod tests {
         let path = dir.path().join("fixture-file.txt");
         app.tags.add(&path, "chip").expect("adiciona tag");
 
-        let map = app.tag_map_for(&app.left);
+        let map = app.tag_map_for(PanelSide::Left);
         let key = path.to_string_lossy().into_owned();
         assert_eq!(map.get(&key), Some(&vec!["chip".to_owned()]));
+    }
+
+    #[test]
+    fn tag_map_reuses_cache_until_tags_or_entries_change() {
+        let (dir, mut app) = fixture_app();
+        let path = dir.path().join("fixture-file.txt");
+        app.tags.add(&path, "chip").expect("adiciona tag");
+
+        let key = path.to_string_lossy().into_owned();
+        let first = app.tag_map_for(PanelSide::Left);
+        assert_eq!(first.get(&key), Some(&vec!["chip".to_owned()]));
+        assert_eq!(app.tag_cache_computations, 1);
+
+        // Frame seguinte sem mudanças: cache reutilizado (sem canonicalize).
+        let again = app.tag_map_for(PanelSide::Left);
+        assert_eq!(again.get(&key), Some(&vec!["chip".to_owned()]));
+        assert_eq!(
+            app.tag_cache_computations, 1,
+            "o mapa não deve ser recalculado por frame"
+        );
+
+        // Edição de tags invalida o cache e reflete o novo valor.
+        app.tags.add(&path, "nova").expect("adiciona tag");
+        app.tags_changed();
+        let updated = app.tag_map_for(PanelSide::Left);
+        assert_eq!(
+            updated.get(&key),
+            Some(&vec!["chip".to_owned(), "nova".to_owned()])
+        );
+        assert_eq!(app.tag_cache_computations, 2);
     }
 
     #[test]

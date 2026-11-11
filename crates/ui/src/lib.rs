@@ -746,8 +746,10 @@ struct StashDialog {
 }
 
 /// Confirmação de uma ação destrutiva no painel Git.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum GitConfirm {
+    /// Troca de branch: altera o worktree, então pede confirmação antes.
+    CheckoutBranch(String),
     DeleteBranch(String),
     PopStash(String),
 }
@@ -1595,6 +1597,14 @@ impl AranduApp {
                     self.git.focus = 0;
                     git_navigated = true;
                 }
+                // Delete pertence ao painel Git: nas abas sem ação de exclusão
+                // ele é consumido e avisa o usuário em vez de excluir arquivos.
+                if delete && !matches!(self.git.tab, GitTab::Branches | GitTab::Stashes) {
+                    git_consumed_delete = true;
+                    self.ops.notice = Some(Notice::info(
+                        rust_i18n::t!("git_delete_unavailable").to_string(),
+                    ));
+                }
                 match self.git.tab {
                     GitTab::Status => {
                         let rows = self.git_rows();
@@ -1642,8 +1652,12 @@ impl AranduApp {
                                 .branches
                                 .get(self.git.focus.min(self.git.branches.len() - 1))
                                 .cloned();
-                            if enter && let Some(branch) = &selected {
-                                self.git_checkout(&branch.name);
+                            if enter
+                                && let Some(branch) = &selected
+                                && !branch.current
+                            {
+                                self.git.confirm =
+                                    Some(GitConfirm::CheckoutBranch(branch.name.clone()));
                             }
                             if let Some(branch) = &selected {
                                 if delete && !branch.current {
@@ -4599,7 +4613,7 @@ impl AranduApp {
         if let Some(paths) = self.delete_confirm.clone() {
             let mut confirm = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::unique("delete-confirm")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("delete-confirm")).show(ctx, |ui| {
                 ui.set_min_width(380.0);
                 ui.heading(rust_i18n::t!("delete_confirm_title"));
                 ui.add_space(6.0);
@@ -4623,6 +4637,9 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                cancel = true;
+            }
             if confirm {
                 self.confirm_delete();
             } else if cancel {
@@ -4633,7 +4650,7 @@ impl AranduApp {
         if let Some(mut dialog) = self.rename.take() {
             let mut submit = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::unique("rename-dialog")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("rename-dialog")).show(ctx, |ui| {
                 ui.set_min_width(380.0);
                 ui.heading(rust_i18n::t!("rename_title"));
                 ui.add_space(6.0);
@@ -4662,6 +4679,9 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                cancel = true;
+            }
 
             if submit {
                 let name = dialog.name.trim().to_owned();
@@ -4693,7 +4713,7 @@ impl AranduApp {
             let mut cancel = false;
             let mut remove: Option<String> = None;
 
-            egui::Modal::new(egui::Id::unique("tag-editor-dialog")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("tag-editor-dialog")).show(ctx, |ui| {
                 ui.set_min_width(380.0);
                 ui.heading(rust_i18n::t!("tags_title"));
                 ui.add_space(6.0);
@@ -4740,6 +4760,9 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                cancel = true;
+            }
 
             if let Some(tag) = remove {
                 for path in &dialog.paths {
@@ -4777,7 +4800,7 @@ impl AranduApp {
         if let Some(mut dialog) = self.compress.take() {
             let mut submit = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::unique("compress-dialog")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("compress-dialog")).show(ctx, |ui| {
                 ui.set_min_width(420.0);
                 ui.heading(rust_i18n::t!("compress_title"));
                 ui.add_space(6.0);
@@ -4820,6 +4843,9 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                cancel = true;
+            }
 
             let name = dialog.name.trim().to_owned();
             if submit && archive::detect_format(Path::new(&name)).is_some() {
@@ -4839,7 +4865,7 @@ impl AranduApp {
             let mut submit = false;
             let mut use_default = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::unique("open-with-dialog")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("open-with-dialog")).show(ctx, |ui| {
                 ui.set_min_width(460.0);
                 ui.heading(rust_i18n::t!("open_with_title"));
                 ui.add_space(6.0);
@@ -4910,6 +4936,9 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                cancel = true;
+            }
 
             if use_default {
                 self.open_paths_default(&dialog.paths);
@@ -4929,7 +4958,7 @@ impl AranduApp {
 
         if let Some(dialog) = self.checksums.take() {
             let mut close = false;
-            egui::Modal::new(egui::Id::unique("checksums-dialog")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("checksums-dialog")).show(ctx, |ui| {
                 ui.set_min_width(640.0);
                 ui.heading(rust_i18n::t!("checksums_title"));
                 ui.add_space(6.0);
@@ -4974,6 +5003,9 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                close = true;
+            }
             if !close {
                 self.checksums = Some(dialog);
             }
@@ -4985,7 +5017,7 @@ impl AranduApp {
             let mut submit = false;
             let mut cancel = false;
 
-            egui::Modal::new(egui::Id::unique("batch-rename-dialog")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("batch-rename-dialog")).show(ctx, |ui| {
                 ui.set_min_width(580.0);
                 ui.heading(rust_i18n::t!("batch_rename_title"));
                 ui.add_space(6.0);
@@ -5078,6 +5110,9 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                cancel = true;
+            }
 
             if submit && validation.is_none() && !dialog.running && dialog.result.is_none() {
                 let pairs = renames
@@ -5094,7 +5129,7 @@ impl AranduApp {
         if let Some(mut dialog) = self.git.branch_dialog.take() {
             let mut submit = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::unique("git-branch-dialog")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("git-branch-dialog")).show(ctx, |ui| {
                 ui.set_min_width(380.0);
                 ui.heading(rust_i18n::t!("git_branch_new_title"));
                 ui.add_space(6.0);
@@ -5123,6 +5158,9 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                cancel = true;
+            }
 
             if submit {
                 let name = dialog.name.trim().to_owned();
@@ -5141,7 +5179,7 @@ impl AranduApp {
         if let Some(mut dialog) = self.git.stash_dialog.take() {
             let mut submit = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::unique("git-stash-dialog")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("git-stash-dialog")).show(ctx, |ui| {
                 ui.set_min_width(380.0);
                 ui.heading(rust_i18n::t!("git_stash_push_title"));
                 ui.add_space(6.0);
@@ -5173,6 +5211,9 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                cancel = true;
+            }
 
             if submit {
                 let message = dialog.message.trim().to_owned();
@@ -5190,9 +5231,17 @@ impl AranduApp {
         if let Some(pending) = self.git.confirm.clone() {
             let mut confirm = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::unique("git-action-confirm")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("git-action-confirm")).show(ctx, |ui| {
                 ui.set_min_width(380.0);
                 match &pending {
+                    GitConfirm::CheckoutBranch(name) => {
+                        ui.heading(rust_i18n::t!("git_branch_checkout_title"));
+                        ui.add_space(6.0);
+                        ui.label(rust_i18n::t!(
+                            "git_branch_checkout_body",
+                            name = name.as_str()
+                        ));
+                    }
                     GitConfirm::DeleteBranch(name) => {
                         ui.heading(rust_i18n::t!("git_branch_delete_title"));
                         ui.add_space(6.0);
@@ -5220,10 +5269,14 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                cancel = true;
+            }
 
             if confirm {
                 self.git.confirm = None;
                 match pending {
+                    GitConfirm::CheckoutBranch(name) => self.git_checkout(&name),
                     GitConfirm::DeleteBranch(name) => {
                         if let Err(error) = self.git_delete_branch(&name) {
                             self.git.notice = Some(error);
@@ -5238,7 +5291,7 @@ impl AranduApp {
 
         if let Some(notice) = self.git.notice.clone() {
             let mut close = false;
-            egui::Modal::new(egui::Id::unique("git-notice")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("git-notice")).show(ctx, |ui| {
                 ui.set_min_width(380.0);
                 ui.heading(rust_i18n::t!("git_action_failed"));
                 ui.add_space(6.0);
@@ -5253,6 +5306,9 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                close = true;
+            }
             if close {
                 self.git.notice = None;
             }
@@ -5311,10 +5367,50 @@ impl AranduApp {
         );
     }
 
-    /// Hints compactos das ações principais, gerados do keymap efetivo:
+    /// Indica se algum modal está aberto; nesse caso os hints da status bar
+    /// continuam mostrando as ações do painel de arquivos.
+    fn modal_open(&self) -> bool {
+        self.delete_confirm.is_some()
+            || self.rename.is_some()
+            || self.tag_editor.is_some()
+            || self.checksums.is_some()
+            || self.batch_rename.is_some()
+            || self.compress.is_some()
+            || self.open_with_dialog.is_some()
+            || self.git.branch_dialog.is_some()
+            || self.git.stash_dialog.is_some()
+            || self.git.confirm.is_some()
+            || self.git.notice.is_some()
+            || self.quick_open.open
+            || self.show_hints
+    }
+
+    /// Hints compactos da status bar, decididos pelo estado atual:
+    /// painel Git focado (ações da aba), modal aberto (hints padrão) ou as
+    /// ações principais do painel de arquivos.
+    fn status_hints(&self) -> String {
+        if !self.modal_open() && self.git.visible && self.git.focused {
+            return match self.git.tab {
+                GitTab::Branches => rust_i18n::t!("git_branches_hint").to_string(),
+                GitTab::Stashes => rust_i18n::t!("git_stashes_hint").to_string(),
+                _ => self
+                    .keymap
+                    .effective(Action::ToggleGitPanel)
+                    .into_iter()
+                    .next()
+                    .map(|binding| {
+                        format!("{binding} {}", action_description(Action::ToggleGitPanel))
+                    })
+                    .unwrap_or_else(|| action_description(Action::ToggleGitPanel).to_owned()),
+            };
+        }
+        self.default_status_hints()
+    }
+
+    /// Hints das ações principais, gerados do keymap efetivo:
     /// `F3 Preview · F5 Copy · ...`. Ações sem binding (ex.: `move` no preset
     /// vim) são omitidas.
-    fn status_hints(&self) -> String {
+    fn default_status_hints(&self) -> String {
         STATUS_HINTS
             .iter()
             .filter_map(|action| {
@@ -6673,7 +6769,7 @@ impl AranduApp {
 mod tests {
     use std::fs;
 
-    use arandu_config::Config;
+    use arandu_config::{Action, Config};
     use arandu_core::ops::{OpKind, Progress};
     use arandu_index::IndexEntry;
     use eframe::egui;
@@ -6681,9 +6777,9 @@ mod tests {
     use egui_kittest::kittest::Queryable;
 
     use super::{
-        AranduApp, BatchRenameDialog, GitTab, IndexScanStatus, OpenExecutor, PanelSide,
-        PreviewContent, PreviewKey, ViewMode, build_open_invocations, format_modified,
-        parse_hex_color, visible_breadcrumb,
+        AranduApp, BatchRenameDialog, GitConfirm, GitTab, IndexScanStatus, OpenExecutor, PanelSide,
+        PreviewContent, PreviewKey, ViewMode, action_description, build_open_invocations,
+        format_modified, parse_hex_color, visible_breadcrumb,
     };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
@@ -8412,6 +8508,186 @@ mod tests {
         assert_eq!(
             harness.state().notice_text().as_deref(),
             Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn status_hints_follow_focused_git_tab() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        init_git_repo(dir.path());
+        fs::write(dir.path().join("a.txt"), b"a").expect("escreve arquivo");
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "inicial"]);
+
+        let app = AranduApp::new_at(Config::default(), dir.path());
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        // Painel fechado: hints padrão do painel de arquivos.
+        assert_eq!(
+            harness.state().status_hints(),
+            harness.state().default_status_hints()
+        );
+
+        harness.state_mut().git.visible = true;
+        harness.state_mut().git.focused = true;
+        harness.state_mut().git.tab = GitTab::Branches;
+        harness.run_steps(1);
+        assert_eq!(
+            harness.state().status_hints(),
+            rust_i18n::t!("git_branches_hint").to_string()
+        );
+
+        harness.state_mut().git.tab = GitTab::Stashes;
+        harness.run_steps(1);
+        assert_eq!(
+            harness.state().status_hints(),
+            rust_i18n::t!("git_stashes_hint").to_string()
+        );
+
+        // Outras abas não mostram ações de arquivo, só o toggle do painel.
+        harness.state_mut().git.tab = GitTab::Log;
+        harness.run_steps(1);
+        let hints = harness.state().status_hints();
+        assert_ne!(hints, harness.state().default_status_hints());
+        assert!(
+            hints.contains(&action_description(Action::ToggleGitPanel)),
+            "hints da aba Log deveriam citar o toggle do painel: {hints:?}"
+        );
+
+        // Painel visível mas sem foco volta aos hints padrão.
+        harness.state_mut().git.focused = false;
+        harness.run_steps(1);
+        assert_eq!(
+            harness.state().status_hints(),
+            harness.state().default_status_hints()
+        );
+    }
+
+    #[test]
+    fn git_checkout_enter_opens_confirmation_modal() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        init_git_repo(dir.path());
+        fs::write(dir.path().join("a.txt"), b"a").expect("escreve arquivo");
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "inicial"]);
+        run_git(dir.path(), &["branch", "feature"]);
+
+        let app = AranduApp::new_at(Config::default(), dir.path());
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        open_git_panel(&mut harness);
+
+        harness.state_mut().git.tab = GitTab::Branches;
+        harness.state_mut().git.focused = true;
+        for _ in 0..200 {
+            if harness.state().git.branches.len() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run_steps(1);
+        }
+        let index = harness
+            .state()
+            .git
+            .branches
+            .iter()
+            .position(|branch| branch.name == "feature")
+            .expect("branch feature na lista");
+        harness.state_mut().git.focus = index;
+
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(1);
+        let confirm = harness.state().git.confirm.clone();
+        assert!(
+            matches!(&confirm, Some(GitConfirm::CheckoutBranch(name)) if name == "feature"),
+            "Enter deveria pedir confirmação antes do checkout, veio {confirm:?}"
+        );
+        // Nada foi trocado ainda: a branch atual continua sendo main.
+        let main = harness
+            .state()
+            .git
+            .branches
+            .iter()
+            .find(|branch| branch.name == "main")
+            .expect("branch main");
+        assert!(
+            main.current,
+            "checkout não deveria acontecer sem confirmação"
+        );
+        assert_eq!(
+            harness
+                .query_all_by_label(&rust_i18n::t!("git_branch_checkout_title"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn git_delete_on_log_tab_shows_unavailable_notice() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        init_git_repo(dir.path());
+        fs::write(dir.path().join("a.txt"), b"a").expect("escreve arquivo");
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "inicial"]);
+
+        let app = AranduApp::new_at(Config::default(), dir.path());
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        open_git_panel(&mut harness);
+
+        harness.state_mut().git.tab = GitTab::Log;
+        harness.state_mut().git.focused = true;
+        harness.run_steps(1);
+
+        harness.key_press(egui::Key::Delete);
+        harness.run_steps(1);
+        assert!(
+            harness.state().delete_confirm.is_none(),
+            "Delete na aba Log não pode cair na exclusão de arquivo"
+        );
+        assert_eq!(
+            harness.state().notice_text().as_deref(),
+            Some(rust_i18n::t!("git_delete_unavailable").to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn rename_modal_closes_on_outside_click() {
+        let (_dir, app) = fixture_app();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        harness
+            .query_all_by_label("fixture-file.txt")
+            .next()
+            .expect("linha do fixture")
+            .click();
+        harness.run_steps(1);
+        harness.key_press(egui::Key::F2);
+        harness.run_steps(1);
+        assert!(
+            harness.state().rename.is_some(),
+            "F2 deveria abrir o rename"
+        );
+
+        // Clique no fundo, longe do modal centrado.
+        let outside = egui::pos2(8.0, 8.0);
+        harness.hover_at(outside);
+        harness.drag_at(outside);
+        harness.drop_at(outside);
+        harness.run_steps(3);
+        assert!(
+            harness.state().rename.is_none(),
+            "clique fora deveria fechar o modal de rename"
         );
     }
 

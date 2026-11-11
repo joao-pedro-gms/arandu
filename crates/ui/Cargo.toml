@@ -22,6 +22,7 @@ arandu-config.workspace = true
 arandu-core.workspace = true
 arandu-git.workspace = true
 arandu-index.workspace = true
+arandu-plugin.workspace = true
 syntect.workspace = true
 image.workspace = true
 egui_commonmark.workspace = true

@@ -38,6 +38,7 @@ use arandu_git::{
     GitStatus, Repo, StashInfo, render_graph,
 };
 use arandu_index::{IndexEntry, IndexStore, Indexer};
+use arandu_plugin::{PluginContext, PluginManager, default_plugin_dir};
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Key, Label, Layout, Modifiers, Rect, RichText,
     ScrollArea, Sense, Stroke, StrokeKind, TextFormat, TextStyle, Ui, UiBuilder, pos2, vec2,
@@ -88,6 +89,8 @@ const GIT_MIN_W: f32 = 220.0;
 const GIT_MAX_FRACTION: f32 = 0.5;
 /// Intervalo do refresh automático do status Git.
 const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+/// Tempo que uma mensagem de plugin permanece na status bar.
+const PLUGIN_NOTICE_TTL: Duration = Duration::from_secs(5);
 /// Altura reservada ao formulário de commit no painel Git.
 const GIT_COMMIT_H: f32 = 96.0;
 /// Bytes por linha no hex dump.
@@ -413,15 +416,39 @@ struct CurrentOp {
 struct Notice {
     text: String,
     error: bool,
+    /// Instante em que a mensagem some; `None` significa persistente até a
+    /// próxima operação.
+    expires_at: Option<Instant>,
 }
 
 impl Notice {
     fn info(text: String) -> Self {
-        Self { text, error: false }
+        Self {
+            text,
+            error: false,
+            expires_at: None,
+        }
     }
 
     fn error(text: String) -> Self {
-        Self { text, error: true }
+        Self {
+            text,
+            error: true,
+            expires_at: None,
+        }
+    }
+
+    /// Mensagem informativa que desaparece após `ttl`.
+    fn temporary(text: String, ttl: Duration) -> Self {
+        Self {
+            text,
+            error: false,
+            expires_at: Some(Instant::now() + ttl),
+        }
+    }
+
+    fn expired(&self) -> bool {
+        self.expires_at.is_some_and(|at| Instant::now() >= at)
     }
 }
 
@@ -875,6 +902,10 @@ pub struct AranduApp {
     show_hints: bool,
     /// Quick-open global (Ctrl+P).
     quick_open: QuickOpenState,
+    /// Plugins carregados preguiçosamente no primeiro acesso ao menu.
+    plugins: Option<PluginManager>,
+    /// Diretório de plugins alternativo (testes/headless).
+    plugin_dir: Option<PathBuf>,
     /// Congela a drenagem da fila em testes determinísticos de progresso.
     #[cfg(test)]
     injected_ops: bool,
@@ -952,6 +983,8 @@ impl AranduApp {
             keymap,
             show_hints: false,
             quick_open: QuickOpenState::default(),
+            plugins: None,
+            plugin_dir: None,
             #[cfg(test)]
             injected_ops: false,
         }
@@ -980,6 +1013,18 @@ impl AranduApp {
         self.pump_git();
         self.request_git_refresh(false);
         self.pump_index_scan(&ctx);
+        // Mensagens temporárias (plugins) somem sozinhas após o TTL.
+        if self.ops.notice.as_ref().is_some_and(Notice::expired) {
+            self.ops.notice = None;
+        }
+        if self
+            .ops
+            .notice
+            .as_ref()
+            .is_some_and(|notice| notice.expires_at.is_some())
+        {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
         if self.compress_job.is_some()
             || self.extract_job.is_some()
             || self.git.receiver.is_some()
@@ -2909,6 +2954,18 @@ impl AranduApp {
                         self.toggle_git_panel();
                     }
 
+                    let plugins_button = ui
+                        .add(
+                            egui::Button::new(RichText::new(rust_i18n::t!("plugins")).size(14.0))
+                                .frame(false)
+                                .min_size(vec2(0.0, CONTROL_H)),
+                        )
+                        .on_hover_text(rust_i18n::t!("plugins_hint"));
+                    if plugins_button.clicked() {
+                        self.ensure_plugins();
+                    }
+                    self.draw_plugins_menu(&plugins_button);
+
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let theme_button = ui
                             .add(
@@ -2972,6 +3029,120 @@ impl AranduApp {
                 });
             },
         );
+    }
+
+    /// Define um diretório alternativo de plugins (uso em testes/headless).
+    #[doc(hidden)]
+    pub fn set_plugin_dir(&mut self, dir: impl Into<PathBuf>) {
+        self.plugin_dir = Some(dir.into());
+        self.plugins = None;
+    }
+
+    /// Carrega os plugins no primeiro acesso ao menu (lazy).
+    fn ensure_plugins(&mut self) {
+        if self.plugins.is_some() {
+            return;
+        }
+        let manager = match self.plugin_dir.clone().or_else(default_plugin_dir) {
+            Some(dir) => PluginManager::load_dir(&dir),
+            None => PluginManager::empty(),
+        };
+        self.install_plugins(manager);
+    }
+
+    /// Recarrega os plugins do disco, refletindo altas/baixas de arquivos.
+    fn reload_plugins(&mut self) {
+        let manager = match self.plugin_dir.clone().or_else(default_plugin_dir) {
+            Some(dir) => PluginManager::load_dir(&dir),
+            None => PluginManager::empty(),
+        };
+        self.install_plugins(manager);
+    }
+
+    /// Instala um gerenciador recém-carregado e reporta o resultado uma vez.
+    fn install_plugins(&mut self, manager: PluginManager) {
+        for (name, error) in &manager.errors {
+            eprintln!("arandu: plugin '{name}' ignorado: {error}");
+        }
+        let count = manager.commands().len();
+        if let Some((name, error)) = manager.errors.first() {
+            self.ops.notice = Some(Notice::temporary(
+                rust_i18n::t!(
+                    "plugins_error",
+                    name = name.clone(),
+                    error = error.to_string()
+                )
+                .to_string(),
+                PLUGIN_NOTICE_TTL,
+            ));
+        } else {
+            self.ops.notice = Some(Notice::temporary(
+                rust_i18n::t!("plugins_loaded", count = count).to_string(),
+                PLUGIN_NOTICE_TTL,
+            ));
+        }
+        self.plugins = Some(manager);
+    }
+
+    /// Menu suspenso com os comandos registrados e a ação de recarregar.
+    fn draw_plugins_menu(&mut self, button: &egui::Response) {
+        let mut run: Option<String> = None;
+        let mut reload = false;
+        egui::Popup::menu(button).show(|ui| {
+            ui.set_min_width(220.0);
+            let commands = self
+                .plugins
+                .as_ref()
+                .map(PluginManager::commands)
+                .unwrap_or_default();
+            if commands.is_empty() {
+                ui.add_enabled(false, egui::Button::new(rust_i18n::t!("plugins_empty")));
+            } else {
+                for command in commands {
+                    if ui.button(command.as_str()).clicked() {
+                        run = Some(command);
+                    }
+                }
+            }
+            ui.separator();
+            if ui.button(rust_i18n::t!("plugins_reload")).clicked() {
+                reload = true;
+            }
+        });
+
+        if let Some(name) = run {
+            self.run_plugin_command(&name);
+        }
+        if reload {
+            self.reload_plugins();
+        }
+    }
+
+    /// Executa um comando de plugin com o contexto do painel ativo.
+    fn run_plugin_command(&mut self, name: &str) {
+        let panel = self.active_panel();
+        let ctx = PluginContext {
+            paths: panel.selected_paths(),
+            current_dir: panel.cwd.clone(),
+        };
+        let Some(manager) = self.plugins.as_mut() else {
+            return;
+        };
+        let text = match manager.run_command(name, &ctx) {
+            Ok(()) => {
+                let messages = manager.take_output();
+                if messages.is_empty() {
+                    rust_i18n::t!("plugin_ran", name = name).to_string()
+                } else {
+                    messages.join(" · ")
+                }
+            }
+            Err(error) => {
+                manager.take_output();
+                rust_i18n::t!("plugin_failed", name = name, error = error.to_string()).to_string()
+            }
+        };
+        self.ops.notice = Some(Notice::temporary(text, PLUGIN_NOTICE_TTL));
     }
 
     fn draw_content(&mut self, ui: &mut Ui, content: Rect) {
@@ -4725,14 +4896,19 @@ impl AranduApp {
         let items = rust_i18n::t!("items_count", count = panel.item_count());
         let selected = rust_i18n::t!("selected_count", count = panel.selected_count());
         let path = panel.cwd.display().to_string();
-        let notice = self.ops.notice.as_ref().map(|notice| {
-            let color = if notice.error {
-                visuals.error_fg_color
-            } else {
-                visuals.text_color()
-            };
-            (notice.text.clone(), color)
-        });
+        let notice = self
+            .ops
+            .notice
+            .as_ref()
+            .filter(|n| !n.expired())
+            .map(|notice| {
+                let color = if notice.error {
+                    visuals.error_fg_color
+                } else {
+                    visuals.text_color()
+                };
+                (notice.text.clone(), color)
+            });
         let weak = visuals.weak_text_color();
         let hints = self.status_hints();
 
@@ -6010,6 +6186,12 @@ impl AranduApp {
     #[cfg(test)]
     fn tags_of(&self, path: &Path) -> Vec<String> {
         self.tags.tags_of(path)
+    }
+
+    /// Texto da mensagem de status atual — usado em testes.
+    #[cfg(test)]
+    fn notice_text(&self) -> Option<String> {
+        self.ops.notice.as_ref().map(|notice| notice.text.clone())
     }
 
     /// Chave do item focado quando ele é um arquivo elegível a preview.
@@ -7658,5 +7840,65 @@ mod tests {
                     .into_owned()
             ]
         );
+    }
+
+    #[test]
+    fn plugins_menu_lists_and_runs_registered_command() {
+        let (dir, mut app) = fixture_app();
+        let plugin_dir = tempfile::TempDir::new().expect("cria diretório de plugins");
+        fs::write(
+            plugin_dir.path().join("ola.lua"),
+            r#"arandu.register_command("ola", function(ctx)
+                   arandu.notify("plugin ok: " .. ctx.current_dir)
+               end)"#,
+        )
+        .expect("escreve plugin");
+        app.set_plugin_dir(plugin_dir.path());
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run_steps(2);
+
+        harness.get_by_label("Plugins").click();
+        harness.run_steps(2);
+
+        harness.get_by_label("ola").click();
+        harness.run_steps(2);
+
+        let expected = format!("plugin ok: {}", dir.path().display());
+        assert_eq!(
+            harness.state().notice_text().as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn plugins_menu_shows_empty_state_and_reload() {
+        let (_dir, mut app) = fixture_app();
+        let plugin_dir = tempfile::TempDir::new().expect("cria diretório de plugins");
+        app.set_plugin_dir(plugin_dir.path());
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run_steps(2);
+
+        harness.get_by_label("Plugins").click();
+        harness.run_steps(2);
+        assert_eq!(harness.query_all_by_label("No plugin commands").count(), 1);
+
+        // Um plugin novo no disco aparece após recarregar o menu.
+        fs::write(
+            plugin_dir.path().join("novo.lua"),
+            r#"arandu.register_command("novo", function(_ctx) end)"#,
+        )
+        .expect("escreve plugin");
+        harness.run_steps(1);
+        harness.get_by_label("Reload plugins").click();
+        harness.run_steps(2);
+        harness.get_by_label("Plugins").click();
+        harness.run_steps(2);
+        assert_eq!(harness.query_all_by_label("novo").count(), 1);
     }
 }

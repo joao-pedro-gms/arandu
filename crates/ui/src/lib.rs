@@ -541,6 +541,9 @@ struct CsvPreview {
     capped: bool,
 }
 
+/// Mensagem enviada pela thread de leitura de preview.
+type PreviewJobMessage = (u64, PreviewKey, Result<PreviewContent, PreviewError>);
+
 /// Estado do painel de preview (F3).
 #[derive(Default)]
 struct PreviewState {
@@ -550,7 +553,11 @@ struct PreviewState {
     /// Chave cuja leitura está em andamento.
     pending: Option<PreviewKey>,
     /// Canal da leitura em background (uma por vez).
-    receiver: Option<Receiver<(PreviewKey, Result<PreviewContent, PreviewError>)>>,
+    receiver: Option<Receiver<PreviewJobMessage>>,
+    /// Sinaliza à thread anterior que a requisição foi substituída.
+    cancel: Arc<AtomicBool>,
+    /// Geração da requisição atual (incrementa a cada nova leitura).
+    generation: u64,
     /// Job de highlight do preview de texto atual.
     job: Option<(PreviewKey, bool, Arc<egui::text::LayoutJob>)>,
     /// Textura da imagem/PDF atual.
@@ -615,6 +622,21 @@ struct ChecksumsDialog {
 struct BatchRenameDialog {
     paths: Vec<PathBuf>,
     pattern: String,
+    /// Renomeações em andamento em background.
+    running: bool,
+    /// Resultado da última execução (mostrado no próprio modal).
+    result: Option<BatchRenameOutcome>,
+}
+
+/// Resultado de uma renomeação em lote.
+struct BatchRenameOutcome {
+    succeeded: usize,
+    failures: Vec<(PathBuf, String)>,
+}
+
+/// Renomeação em lote em andamento.
+struct BatchRenameJob {
+    receiver: Receiver<(BatchRenameOutcome, Vec<PathBuf>)>,
 }
 
 /// Diálogo de compressão (F8).
@@ -982,6 +1004,8 @@ pub struct AranduApp {
     checksums: Option<ChecksumsDialog>,
     /// Diálogo de renomeação em lote aberto (F7).
     batch_rename: Option<BatchRenameDialog>,
+    /// Renomeação em lote em andamento (background).
+    batch_rename_job: Option<BatchRenameJob>,
     /// Diálogo de compressão aberto (F8).
     compress: Option<CompressDialog>,
     /// Compressão em andamento (background).
@@ -1089,6 +1113,7 @@ impl AranduApp {
             tag_editor: None,
             checksums: None,
             batch_rename: None,
+            batch_rename_job: None,
             compress: None,
             compress_job: None,
             extract_job: None,
@@ -1135,6 +1160,7 @@ impl AranduApp {
         self.pump_queue();
         self.pump_preview();
         self.pump_checksums();
+        self.pump_batch_rename();
         self.pump_archive_jobs();
         self.pump_git();
         self.request_git_refresh(false);
@@ -1154,6 +1180,7 @@ impl AranduApp {
         }
         if self.compress_job.is_some()
             || self.extract_job.is_some()
+            || self.batch_rename_job.is_some()
             || self.git.receiver.is_some()
             || self.git.log_receiver.is_some()
             || self.git.blame_receiver.is_some()
@@ -1341,12 +1368,11 @@ impl AranduApp {
         };
         let entries_generation = panel.entries_generation;
         let tags_generation = self.tags_generation;
-        if let Some(cache) = cache.as_ref() {
-            if cache.entries_generation == entries_generation
-                && cache.tags_generation == tags_generation
-            {
-                return cache.map.clone();
-            }
+        if let Some(cache) = cache.as_ref()
+            && cache.entries_generation == entries_generation
+            && cache.tags_generation == tags_generation
+        {
+            return cache.map.clone();
         }
 
         let mut map = HashMap::new();
@@ -1803,9 +1829,14 @@ impl AranduApp {
             .receiver
             .as_ref()
             .and_then(|receiver| receiver.try_recv().ok());
-        let Some((key, result)) = received else {
+        let Some((generation, key, result)) = received else {
             return;
         };
+        // Resposta de uma requisição já substituída: descarta.
+        if generation != self.preview.generation {
+            self.preview.receiver = None;
+            return;
+        }
         self.preview.receiver = None;
         if self.preview.pending.as_ref() == Some(&key) {
             self.preview.pending = None;
@@ -1837,6 +1868,14 @@ impl AranduApp {
             return;
         }
 
+        // Cancela a leitura anterior: navegar rápido não deve empilhar threads
+        // nem deixar resultados obsoletos chegarem ao cache.
+        self.preview.cancel.store(true, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.preview.cancel = Arc::clone(&cancel);
+        self.preview.generation = self.preview.generation.wrapping_add(1);
+        let generation = self.preview.generation;
+
         let (sender, receiver) = mpsc::channel();
         self.preview.receiver = Some(receiver);
         self.preview.pending = Some(key.clone());
@@ -1847,8 +1886,14 @@ impl AranduApp {
         };
         // Preview é leitura pura: não passa pela fila de operações.
         std::thread::spawn(move || {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
             let result = request.load();
-            let _ = sender.send((key, result));
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let _ = sender.send((generation, key, result));
         });
     }
 
@@ -2000,47 +2045,85 @@ impl AranduApp {
         self.batch_rename = Some(BatchRenameDialog {
             paths,
             pattern: "{name}{ext}".to_owned(),
+            running: false,
+            result: None,
         });
         self.ops.notice = None;
     }
 
-    /// Executa as renomeações confirmadas, agregando sucessos e falhas.
+    /// Executa as renomeações confirmadas em background, agregando resultados.
     fn apply_batch_rename(&mut self, renames: Vec<(PathBuf, String)>) {
-        let mut succeeded = 0_usize;
-        let mut failed = 0_usize;
-        let mut touched: Vec<PathBuf> = Vec::new();
-
-        for (path, new_name) in renames {
-            let Some(parent) = path.parent() else {
-                failed += 1;
-                continue;
-            };
-            let target = parent.join(new_name.trim());
-            if target == path {
-                succeeded += 1;
-                continue;
-            }
-            match std::fs::rename(&path, &target) {
-                Ok(()) => {
-                    succeeded += 1;
-                    if !touched.iter().any(|dir| dir == parent) {
-                        touched.push(parent.to_path_buf());
-                    }
-                }
-                Err(_) => failed += 1,
-            }
+        if self.batch_rename_job.is_some() {
+            return;
         }
+        let (sender, receiver) = mpsc::channel();
+        self.batch_rename_job = Some(BatchRenameJob { receiver });
+        std::thread::spawn(move || {
+            let mut succeeded = 0_usize;
+            let mut failures: Vec<(PathBuf, String)> = Vec::new();
+            let mut touched: Vec<PathBuf> = Vec::new();
 
+            for (path, new_name) in renames {
+                let Some(parent) = path.parent() else {
+                    failures.push((path, "caminho sem diretório pai".to_owned()));
+                    continue;
+                };
+                let target = parent.join(new_name.trim());
+                if target == path {
+                    succeeded += 1;
+                    continue;
+                }
+                match std::fs::rename(&path, &target) {
+                    Ok(()) => {
+                        succeeded += 1;
+                        if !touched.iter().any(|dir| dir == parent) {
+                            touched.push(parent.to_path_buf());
+                        }
+                    }
+                    Err(error) => failures.push((path, error.to_string())),
+                }
+            }
+
+            let _ = sender.send((
+                BatchRenameOutcome {
+                    succeeded,
+                    failures,
+                },
+                touched,
+            ));
+        });
+        if let Some(dialog) = self.batch_rename.as_mut() {
+            dialog.running = true;
+            dialog.result = None;
+        }
+    }
+
+    /// Drena o resultado da renomeação em lote em background.
+    fn pump_batch_rename(&mut self) {
+        let received = self
+            .batch_rename_job
+            .as_ref()
+            .and_then(|job| job.receiver.try_recv().ok());
+        let Some((outcome, touched)) = received else {
+            return;
+        };
+        self.batch_rename_job = None;
         for dir in touched {
             self.reload_dir(&dir);
         }
-        let text = rust_i18n::t!("batch_rename_done", ok = succeeded, errors = failed).to_string();
-        self.ops.notice = Some(if failed == 0 {
-            Notice::info(text)
+        let failed = outcome.failures.len();
+        let text =
+            rust_i18n::t!("batch_rename_done", ok = outcome.succeeded, errors = failed).to_string();
+        if let Some(dialog) = self.batch_rename.as_mut() {
+            dialog.running = false;
+            dialog.result = Some(outcome);
         } else {
-            Notice::error(text)
-        });
-        self.batch_rename = None;
+            self.ops.notice = Some(if failed == 0 {
+                Notice::info(text)
+            } else {
+                Notice::error(text)
+            });
+        }
     }
 
     /// Abre o diálogo de compressão para a seleção do painel ativo.
@@ -4937,6 +5020,36 @@ impl AranduApp {
                 if let Some(error) = &validation {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 }
+                if dialog.running {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(rust_i18n::t!("batch_rename_running"));
+                    });
+                } else if let Some(result) = &dialog.result {
+                    let text = rust_i18n::t!(
+                        "batch_rename_done",
+                        ok => result.succeeded,
+                        errors => result.failures.len()
+                    );
+                    if result.failures.is_empty() {
+                        ui.label(text.to_string());
+                    } else {
+                        ui.colored_label(ui.visuals().error_fg_color, text.to_string());
+                        // Mostra até 5 falhas com o arquivo e o erro do sistema.
+                        for (path, error) in result.failures.iter().take(5) {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}: {error}",
+                                    truncate_for_display(&path.to_string_lossy(), 60)
+                                ))
+                                .text_style(TextStyle::Monospace),
+                            );
+                        }
+                        if result.failures.len() > 5 {
+                            ui.label("…");
+                        }
+                    }
+                }
                 if ui.input(|input| input.key_pressed(Key::Enter)) {
                     submit = true;
                 }
@@ -4945,26 +5058,33 @@ impl AranduApp {
                 }
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(
-                            validation.is_none(),
-                            egui::Button::new(rust_i18n::t!("batch_rename_ok")),
-                        )
-                        .clicked()
-                    {
-                        submit = true;
-                    }
-                    if ui.button(rust_i18n::t!("cancel")).clicked() {
-                        cancel = true;
+                    if dialog.running || dialog.result.is_some() {
+                        if ui.button(rust_i18n::t!("batch_rename_close")).clicked() {
+                            cancel = true;
+                        }
+                    } else {
+                        if ui
+                            .add_enabled(
+                                validation.is_none(),
+                                egui::Button::new(rust_i18n::t!("batch_rename_ok")),
+                            )
+                            .clicked()
+                        {
+                            submit = true;
+                        }
+                        if ui.button(rust_i18n::t!("cancel")).clicked() {
+                            cancel = true;
+                        }
                     }
                 });
             });
 
-            if submit && validation.is_none() {
+            if submit && validation.is_none() && !dialog.running && dialog.result.is_none() {
                 let pairs = renames
                     .into_iter()
                     .map(|(path, _, new_name)| (path, new_name))
                     .collect();
+                self.batch_rename = Some(dialog);
                 self.apply_batch_rename(pairs);
             } else if !cancel {
                 self.batch_rename = Some(dialog);
@@ -6561,10 +6681,13 @@ mod tests {
     use egui_kittest::kittest::Queryable;
 
     use super::{
-        AranduApp, GitTab, IndexScanStatus, OpenExecutor, PanelSide, ViewMode,
-        build_open_invocations, format_modified, parse_hex_color, visible_breadcrumb,
+        AranduApp, BatchRenameDialog, GitTab, IndexScanStatus, OpenExecutor, PanelSide,
+        PreviewContent, PreviewKey, ViewMode, build_open_invocations, format_modified,
+        parse_hex_color, visible_breadcrumb,
     };
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -7465,6 +7588,117 @@ mod tests {
         }
         let kind = rust_i18n::t!("preview_kind_csv").to_string();
         assert!(harness.query_all_by_label(&kind).count() >= 1);
+    }
+
+    #[test]
+    fn preview_switch_cancels_previous_request() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        fs::write(dir.path().join("a.txt"), b"AAAA").expect("cria a");
+        fs::write(dir.path().join("b.txt"), b"BBBB").expect("cria b");
+        let mut app = AranduApp::new_at(Config::default(), dir.path());
+        let a = app
+            .left
+            .entries
+            .iter()
+            .find(|entry| entry.name == "a.txt")
+            .cloned()
+            .expect("a.txt listado");
+        let b = app
+            .left
+            .entries
+            .iter()
+            .find(|entry| entry.name == "b.txt")
+            .cloned()
+            .expect("b.txt listado");
+
+        app.ensure_preview(Some(&a));
+        let first_generation = app.preview.generation;
+        let first_cancel = Arc::clone(&app.preview.cancel);
+        let key_a = PreviewKey::for_entry(&a);
+
+        // Troca rápida: a requisição anterior é cancelada e substituída.
+        app.ensure_preview(Some(&b));
+        assert_eq!(app.preview.generation, first_generation + 1);
+        assert_eq!(
+            app.preview.pending.as_ref(),
+            Some(&PreviewKey::for_entry(&b))
+        );
+        assert!(
+            first_cancel.load(Ordering::Relaxed),
+            "a requisição anterior deveria ter sido sinalizada para cancelar"
+        );
+
+        // Uma resposta de geração antiga é descartada em vez de ir ao cache.
+        let (sender, receiver) = mpsc::channel();
+        app.preview.receiver = Some(receiver);
+        sender
+            .send((
+                first_generation,
+                key_a.clone(),
+                Ok(PreviewContent::Text {
+                    text: "obsoleto".to_owned(),
+                    truncated: false,
+                    syntax_name: None,
+                }),
+            ))
+            .expect("envia resposta obsoleta");
+        app.pump_preview();
+        assert!(
+            app.preview.cache.get(&key_a).is_none(),
+            "resultado de requisição cancelada não deveria entrar no cache"
+        );
+    }
+
+    #[test]
+    fn batch_rename_runs_in_background_and_reports_failures() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        fs::write(dir.path().join("antigo.txt"), b"x").expect("cria arquivo");
+        let mut app = AranduApp::new_at(Config::default(), dir.path());
+        let old = dir.path().join("antigo.txt");
+        let missing = dir.path().join("sumiu.txt");
+        app.batch_rename = Some(BatchRenameDialog {
+            paths: vec![old.clone(), missing.clone()],
+            pattern: String::new(),
+            running: false,
+            result: None,
+        });
+
+        app.apply_batch_rename(vec![
+            (old.clone(), "novo.txt".to_owned()),
+            (missing.clone(), "destino.txt".to_owned()),
+        ]);
+        assert!(
+            app.batch_rename
+                .as_ref()
+                .is_some_and(|dialog| dialog.running),
+            "o modal deveria indicar execução em andamento"
+        );
+        for _ in 0..200 {
+            if app.batch_rename_job.is_none() {
+                break;
+            }
+            app.pump_batch_rename();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.batch_rename_job.is_none(), "job deveria terminar");
+
+        let dialog = app.batch_rename.as_ref().expect("modal permanece aberto");
+        assert!(!dialog.running);
+        let outcome = dialog.result.as_ref().expect("resultado exibido no modal");
+        assert_eq!(outcome.succeeded, 1);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].0, missing);
+        assert!(
+            !outcome.failures[0].1.is_empty(),
+            "erro do sistema preservado"
+        );
+        assert!(dir.path().join("novo.txt").exists());
+        assert!(
+            app.left
+                .entries
+                .iter()
+                .any(|entry| entry.name == "novo.txt")
+        );
     }
 
     #[test]

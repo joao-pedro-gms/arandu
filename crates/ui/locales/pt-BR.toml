@@ -119,6 +119,8 @@ batch_rename_duplicate = "Dois arquivos terminariam com o mesmo nome: %{name}"
 batch_rename_exists = "Já existe um arquivo chamado \"%{name}\"."
 batch_rename_ok = "Renomear"
 batch_rename_done = "%{ok} renomeados, %{errors} falhas."
+batch_rename_running = "Renomeando em segundo plano…"
+batch_rename_close = "Fechar"
 
 compress_title = "Comprimir"
 compress_output_label = "Nome do arquivo"

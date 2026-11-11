@@ -36,7 +36,7 @@ visualizações ricas voltadas a desenvolvedores e usuários avançados.
 | Testes | **Unit + integration (tempfile) + screenshot tests (egui_kittest) desde o dia 1** | screenshot só fase 2 |
 | i18n | **Desde o dia 1** (sistema de tradução em todos os widgets) | hardcoded, retrofit fase 3 |
 | Preview PDF | **Nativo: `pdfrum`** (puro Rust, MIT/Apache-2.0, render CPU tiny-skia) | poppler externo, adiar |
-| Plugins (fase 3) | **Decisão adiada**; desenhar hook de arquitetura desde já | WASM (wasmtime), Lua (mlua), JS |
+| Plugins (fase 3) | **Lua via `mlua` (feature `luau`)** — estaticamente linkado (vendored), MIT, sandboxável, mantém o binário único | WASM (wasmtime), LuaJIT, JS |
 | FS remoto | **Local direto no MVP**, refatorar para trait Vfs quando entrar | trait desde o início |
 | Metadados | **Tags no MVP** (armazenamento simples), **banco (sled/sqlite) fase 2**; favoritos/recentes no MVP | completo no MVP, só xattr |
 | Telemetria | **Zero telemetria**; crash reports opt-in salvos localmente | opt-in anônima |
@@ -81,8 +81,8 @@ Elm/testabilidade acima de tudo.
 
 ### Fase 3 — Extensibilidade
 
-1. API de plugins (candidatos: WASM ou Lua) — desenhar a API desde a Fase 1,
-   implementar depois
+1. API de plugins em Lua/Luau (`mlua`) — decisão fechada, primeira versão
+   implementada na branch `feat/plugins`
 2. Sync de config entre máquinas (dotfiles)
 3. macOS, se houver demanda
 
@@ -121,7 +121,7 @@ arandu/
 - [x] ~~Estratégia de testes~~ **Resolvido (sessão 2): unit + integration + egui_kittest desde o dia 1**
 - [x] ~~i18n: entra em que fase?~~ **Resolvido (sessão 2): desde o dia 1**
 - [x] ~~Qual crate para PDF: mupdf (via `mupdf`?) vs pdfium (via `pdfium-render`)?~~ **Resolvido (2026-11-10): `pdfrum`** — puro Rust, MIT/Apache-2.0 (mupdf é AGPL-3.0, incompatível), sem bundling de binário (pdfium quebraria o binário único), render CPU, SSIM ~0.99999 na suíte PDFium
-- [ ] Plugins WASM vs Lua — decisão adiada para fase 3, mas hook de arquitetura já no design
+- [x] ~~Plugins WASM vs Lua — decisão adiada para fase 3, mas hook de arquitetura já no design~~ **Resolvido (2026-11-10): Lua via `mlua` com feature `luau`** — estaticamente linkado (vendored), MIT, sandboxável, mantém o binário único
 - [x] ~~Remote FS (SSH/SFTP/FTP) — entra no escopo algum dia?~~ **Resolvido (sessão 2): local direto no MVP, refatorar para trait depois**
 - [x] ~~Tags/cores em arquivos, notas, favoritos~~ **Resolvido (sessão 2): tags no MVP com storage simples; banco fase 2**
 - [x] ~~CI: GitHub Actions com build Linux+Windows, clippy deny, rustfmt~~ **Resolvido (sessão 2): criado; adicionar job MSRV + cargo-deny quando houver Cargo.toml**

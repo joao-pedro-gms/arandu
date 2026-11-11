@@ -35,7 +35,7 @@ use arandu_core::preview::{
 use arandu_core::queue::{OpQueue, QueueEvent, UndoStack};
 use arandu_git::{
     BlameLine, BranchInfo, CommitInfo, DEFAULT_BLAME_LINES, DEFAULT_LOG_LIMIT, FileStatus,
-    GitStatus, Repo, StashInfo, render_graph,
+    GitError, GitStatus, Repo, StashInfo, render_graph,
 };
 use arandu_index::{IndexEntry, IndexStore, Indexer};
 use arandu_plugin::{PluginContext, PluginManager, default_plugin_dir};
@@ -2407,10 +2407,10 @@ impl AranduApp {
         self.git.log_receiver = Some(receiver);
         std::thread::spawn(move || {
             let result = match Repo::discover(&dir) {
-                None => Err("not a git repository".to_string()),
+                None => Err(git_error_text(&GitError::NotARepository)),
                 Some(repo) => repo
                     .log(DEFAULT_LOG_LIMIT)
-                    .map_err(|error| error.to_string()),
+                    .map_err(|error| git_error_text(&error)),
             };
             let _ = sender.send((dir, result));
         });
@@ -2448,10 +2448,10 @@ impl AranduApp {
         self.git.blame_receiver = Some(receiver);
         std::thread::spawn(move || {
             let result = match Repo::discover(&dir) {
-                None => Err("not a git repository".to_string()),
+                None => Err(git_error_text(&GitError::NotARepository)),
                 Some(repo) => repo
                     .blame_file(&path, DEFAULT_BLAME_LINES)
-                    .map_err(|error| error.to_string()),
+                    .map_err(|error| git_error_text(&error)),
             };
             let _ = sender.send((path, result));
         });
@@ -2480,8 +2480,8 @@ impl AranduApp {
         self.git.branches_receiver = Some(receiver);
         std::thread::spawn(move || {
             let result = match Repo::discover(&dir) {
-                None => Err("not a git repository".to_string()),
-                Some(repo) => repo.branches().map_err(|error| error.to_string()),
+                None => Err(git_error_text(&GitError::NotARepository)),
+                Some(repo) => repo.branches().map_err(|error| git_error_text(&error)),
             };
             let _ = sender.send((dir, result));
         });
@@ -2510,8 +2510,8 @@ impl AranduApp {
         self.git.stashes_receiver = Some(receiver);
         std::thread::spawn(move || {
             let result = match Repo::discover(&dir) {
-                None => Err("not a git repository".to_string()),
-                Some(repo) => repo.stashes().map_err(|error| error.to_string()),
+                None => Err(git_error_text(&GitError::NotARepository)),
+                Some(repo) => repo.stashes().map_err(|error| git_error_text(&error)),
             };
             let _ = sender.send((dir, result));
         });
@@ -2781,7 +2781,7 @@ impl AranduApp {
         } else {
             repo.unstage(&paths)
         };
-        self.git.action_error = outcome.err().map(|error| error.to_string());
+        self.git.action_error = outcome.err().map(|error| git_error_text(&error));
         self.request_git_refresh(true);
     }
 
@@ -2803,7 +2803,7 @@ impl AranduApp {
                 self.git.action_error = None;
                 self.request_git_refresh(true);
             }
-            Err(error) => self.git.action_error = Some(error.to_string()),
+            Err(error) => self.git.action_error = Some(git_error_text(&error)),
         }
     }
 
@@ -2821,7 +2821,7 @@ impl AranduApp {
                 self.reload_dir(&dir);
                 self.request_git_refresh(true);
             }
-            Err(error) => self.git.notice = Some(error.to_string()),
+            Err(error) => self.git.notice = Some(git_error_text(&error)),
         }
     }
 
@@ -2831,10 +2831,10 @@ impl AranduApp {
         let Some(repo) = Repo::discover(&dir) else {
             self.git.not_repo = true;
             self.git.set_status(None);
-            return Err("not a git repository".to_string());
+            return Err(git_error_text(&GitError::NotARepository));
         };
         repo.create_branch(name)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| git_error_text(&error))?;
         self.request_git_refresh(true);
         Ok(())
     }
@@ -2845,10 +2845,10 @@ impl AranduApp {
         let Some(repo) = Repo::discover(&dir) else {
             self.git.not_repo = true;
             self.git.set_status(None);
-            return Err("not a git repository".to_string());
+            return Err(git_error_text(&GitError::NotARepository));
         };
         repo.delete_branch(name)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| git_error_text(&error))?;
         self.request_git_refresh(true);
         Ok(())
     }
@@ -2867,7 +2867,7 @@ impl AranduApp {
                 self.reload_dir(&dir);
                 self.request_git_refresh(true);
             }
-            Err(error) => self.git.notice = Some(error.to_string()),
+            Err(error) => self.git.notice = Some(git_error_text(&error)),
         }
     }
 
@@ -2885,7 +2885,7 @@ impl AranduApp {
                 self.reload_dir(&dir);
                 self.request_git_refresh(true);
             }
-            Err(error) => self.git.notice = Some(error.to_string()),
+            Err(error) => self.git.notice = Some(git_error_text(&error)),
         }
     }
 
@@ -6219,17 +6219,58 @@ fn parse_csv_row(line: &str, delimiter: char) -> Vec<String> {
     fields
 }
 
+/// Converte um erro tipado do backend Git em mensagem localizada para a UI.
+///
+/// O `Display` de [`GitError`] é em português e não passa pelo catálogo de
+/// traduções; aqui cada variante vira uma chave i18n.
+fn git_error_text(error: &GitError) -> String {
+    match error {
+        GitError::NotARepository => rust_i18n::t!("git_not_a_repo").to_string(),
+        GitError::NoWorktree => rust_i18n::t!("git_error_no_worktree").to_string(),
+        GitError::PathOutsideRepository(path) => {
+            rust_i18n::t!("git_error_path_outside", path = path.display().to_string()).to_string()
+        }
+        GitError::InvalidPath(path) => {
+            rust_i18n::t!("git_error_invalid_path", path = path.display().to_string()).to_string()
+        }
+        GitError::EmptyMessage => rust_i18n::t!("git_error_empty_message").to_string(),
+        GitError::NothingStaged => rust_i18n::t!("git_error_nothing_staged").to_string(),
+        GitError::InvalidBranchName(name) => {
+            rust_i18n::t!("git_error_invalid_branch", name = name.as_str()).to_string()
+        }
+        GitError::BranchNotFound(name) => {
+            rust_i18n::t!("git_error_branch_not_found", name = name.as_str()).to_string()
+        }
+        GitError::BranchAlreadyExists(name) => {
+            rust_i18n::t!("git_error_branch_exists", name = name.as_str()).to_string()
+        }
+        GitError::CurrentBranch(name) => {
+            rust_i18n::t!("git_error_current_branch", name = name.as_str()).to_string()
+        }
+        GitError::DirtyWorktree => rust_i18n::t!("git_error_dirty_worktree").to_string(),
+        GitError::NothingToStash => rust_i18n::t!("git_error_nothing_to_stash").to_string(),
+        GitError::StashNotFound(id) => {
+            rust_i18n::t!("git_error_stash_not_found", id = id.as_str()).to_string()
+        }
+        GitError::Gix(message) => {
+            rust_i18n::t!("git_error_generic", error = message.as_str()).to_string()
+        }
+        GitError::Io(error) => rust_i18n::t!("git_error_io", error = error.to_string()).to_string(),
+    }
+}
+
 /// Constrói o `LayoutJob` com syntax highlight (ou monospace puro).
 ///
 /// Limitado a [`MAX_HIGHLIGHT_LINES`] para manter o frame barato.
-fn build_text_job(text: &str, syntax_name: Option<&str>, dark: bool) -> egui::text::LayoutJob {
+fn build_text_job(
+    text: &str,
+    syntax_name: Option<&str>,
+    dark: bool,
+    text_color: Color32,
+) -> egui::text::LayoutJob {
     let base = TextFormat {
         font_id: FontId::monospace(12.0),
-        color: if dark {
-            Color32::from_rgb(0xd4, 0xd4, 0xd4)
-        } else {
-            Color32::from_rgb(0x24, 0x24, 0x24)
-        },
+        color: text_color,
         ..Default::default()
     };
 

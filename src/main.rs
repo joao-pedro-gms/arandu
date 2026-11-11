@@ -15,7 +15,7 @@ async fn main() -> anyhow::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_NAME)
             .with_inner_size([1024.0, 700.0])
-            .with_min_inner_size([640.0, 420.0]),
+            .with_min_inner_size([720.0, 480.0]),
         ..Default::default()
     };
 

@@ -1048,6 +1048,10 @@ impl AranduApp {
             .text_styles
             .insert(TextStyle::Small, FontId::proportional(12.5));
 
+        // Margem interna uniforme dos modais/`Frame::popup` (8-12pt); sem
+        // cores próprias, apenas o espaçamento do tema.
+        style.spacing.window_margin = egui::Margin::same(10);
+
         let mut visuals = if theme.dark {
             egui::Visuals::dark()
         } else {
@@ -2865,11 +2869,16 @@ impl AranduApp {
         ui.scope_builder(
             UiBuilder::new().max_rect(rect.shrink2(vec2(10.0, 0.0))),
             |ui| {
+                // Alvo vertical uniforme e ritmo horizontal: 4pt dentro de um
+                // grupo, 8pt entre grupos.
+                ui.spacing_mut().item_spacing.x = 4.0;
+                const CONTROL_H: f32 = 28.0;
                 ui.horizontal_centered(|ui| {
                     let menu = ui
                         .add(
-                            Label::new(RichText::new(rust_i18n::t!("menu")).size(14.0))
-                                .sense(Sense::CLICK),
+                            egui::Button::new(RichText::new(rust_i18n::t!("menu")).size(14.0))
+                                .frame(false)
+                                .min_size(vec2(0.0, CONTROL_H)),
                         )
                         .on_hover_text(rust_i18n::t!("menu"));
                     egui::Popup::menu(&menu).show(|ui| {
@@ -2879,6 +2888,7 @@ impl AranduApp {
                     ui.separator();
                     ui.label(RichText::new(APP_NAME).strong());
 
+                    ui.add_space(4.0);
                     let git_hint = self
                         .keymap
                         .effective(Action::ToggleGitPanel)
@@ -2890,8 +2900,9 @@ impl AranduApp {
                         .unwrap_or_default();
                     let git_button = ui
                         .add(
-                            Label::new(RichText::new(rust_i18n::t!("git_title")).size(14.0))
-                                .sense(Sense::CLICK),
+                            egui::Button::new(RichText::new(rust_i18n::t!("git_title")).size(14.0))
+                                .frame(false)
+                                .min_size(vec2(0.0, CONTROL_H)),
                         )
                         .on_hover_text(git_hint);
                     if git_button.clicked() {
@@ -2901,12 +2912,13 @@ impl AranduApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let theme_button = ui
                             .add(
-                                Label::new(
+                                egui::Button::new(
                                     RichText::new(self.config.theme.name.clone())
                                         .size(12.5)
                                         .color(ui.visuals().weak_text_color()),
                                 )
-                                .sense(Sense::CLICK),
+                                .frame(false)
+                                .min_size(vec2(0.0, CONTROL_H)),
                             )
                             .on_hover_text(rust_i18n::t!("toggle_theme"));
                         if theme_button.clicked() {
@@ -2925,23 +2937,35 @@ impl AranduApp {
                             .unwrap_or_else(|| action_description(Action::ToggleViewMode));
                         let view_button = ui
                             .add(
-                                Label::new(
+                                egui::Button::new(
                                     RichText::new(view_mode.label())
                                         .size(12.5)
                                         .color(ui.visuals().weak_text_color()),
                                 )
-                                .sense(Sense::CLICK),
+                                .frame(false)
+                                .min_size(vec2(0.0, CONTROL_H)),
                             )
                             .on_hover_text(view_hint);
                         if view_button.clicked() {
                             self.active_panel_mut().toggle_view_mode();
                         }
+
+                        // Segundo grupo de ações (settings/busca).
+                        ui.add_space(4.0);
                         let settings = ui
-                            .add(Label::new(rust_i18n::t!("settings")).sense(Sense::CLICK))
+                            .add(
+                                egui::Button::new(rust_i18n::t!("settings"))
+                                    .frame(false)
+                                    .min_size(vec2(0.0, CONTROL_H)),
+                            )
                             .on_hover_text(rust_i18n::t!("settings"));
                         let _ = settings;
                         let search = ui
-                            .add(Label::new(rust_i18n::t!("search")).sense(Sense::CLICK))
+                            .add(
+                                egui::Button::new(rust_i18n::t!("search"))
+                                    .frame(false)
+                                    .min_size(vec2(0.0, CONTROL_H)),
+                            )
                             .on_hover_text(rust_i18n::t!("search"));
                         let _ = search;
                     });
@@ -3660,7 +3684,7 @@ impl AranduApp {
         visuals: &egui::Visuals,
     ) {
         let Some(entry) = entry else {
-            draw_preview_centered(ui, body, rust_i18n::t!("preview_empty"), visuals);
+            draw_preview_empty(ui, body, visuals);
             return;
         };
 
@@ -4716,7 +4740,7 @@ impl AranduApp {
             UiBuilder::new().max_rect(rect.shrink2(vec2(10.0, 0.0))),
             |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.label(RichText::new(format!("{items}, {selected}")).color(weak));
+                    ui.label(RichText::new(format!("{items} · {selected}")).color(weak));
                     ui.add_space(12.0);
                     ui.add(Label::new(RichText::new(path).color(weak)).truncate());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -4776,25 +4800,32 @@ impl AranduApp {
         let modal = egui::Modal::new(egui::Id::unique("hints-cheatsheet")).show(ctx, |ui| {
             ui.set_min_width(560.0);
             ui.heading(rust_i18n::t!("hints_title"));
+            ui.add_space(4.0);
+            ui.separator();
             ui.add_space(6.0);
             let accent = ui.visuals().selection.stroke.color;
-            egui::Grid::new("hints-grid")
-                .num_columns(4)
-                .spacing([24.0, 6.0])
-                .min_col_width(80.0)
-                .show(ui, |ui| {
-                    for row in 0..rows {
-                        for column in 0..2 {
-                            let Some((binding, description)) = entries.get(column * rows + row)
-                            else {
-                                continue;
-                            };
-                            ui.label(RichText::new(binding).strong().color(accent));
-                            ui.label(description);
-                        }
-                        ui.end_row();
-                    }
-                });
+            // Duas colunas de largura igual; cada uma com o par
+            // atalho/descrição alinhado em grid próprio.
+            ui.columns(2, |columns| {
+                for (column_index, column_ui) in columns.iter_mut().enumerate() {
+                    egui::Grid::new(("hints-grid", column_index))
+                        .num_columns(2)
+                        .spacing([16.0, 6.0])
+                        .min_col_width(80.0)
+                        .show(column_ui, |ui| {
+                            for row in 0..rows {
+                                let Some((binding, description)) =
+                                    entries.get(column_index * rows + row)
+                                else {
+                                    continue;
+                                };
+                                ui.label(RichText::new(binding).strong().color(accent));
+                                ui.label(description);
+                                ui.end_row();
+                            }
+                        });
+                }
+            });
         });
 
         if modal.should_close() {
@@ -4848,7 +4879,14 @@ fn draw_panel(
                     let is_current = *ancestor == panel.cwd;
                     let text = breadcrumb_label(ancestor);
                     if is_current {
-                        ui.label(RichText::new(text).color(visuals.text_color()));
+                        // O diretório atual é o "título" do painel: forte e
+                        // atenuado quando o painel não está ativo.
+                        let color = if active {
+                            visuals.text_color()
+                        } else {
+                            with_alpha(visuals.text_color(), 153)
+                        };
+                        ui.label(RichText::new(text).strong().color(color));
                     } else {
                         let response = ui.add(
                             Label::new(RichText::new(text).color(breadcrumb_color(active, accent)))
@@ -4888,10 +4926,12 @@ fn draw_panel(
                 Stroke::new(2.0, accent),
             );
         } else {
+            // Realce discreto do painel inativo: texto muted com alpha, em vez
+            // de competir com o accent do painel ativo.
             ui.painter().hline(
                 header.response.rect.x_range(),
                 header.response.rect.bottom() - 1.0,
-                Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
+                Stroke::new(1.0, with_alpha(visuals.weak_text_color(), 120)),
             );
         }
 
@@ -5008,7 +5048,7 @@ fn draw_panel(
     let stroke = if active {
         Stroke::new(1.0, accent)
     } else {
-        visuals.widgets.noninteractive.bg_stroke
+        Stroke::new(1.0, with_alpha(visuals.weak_text_color(), 120))
     };
     ui.painter()
         .rect_stroke(rect, 0.0, stroke, StrokeKind::Inside);
@@ -5392,6 +5432,26 @@ fn status_glyph(status: FileStatus) -> &'static str {
     }
 }
 
+/// Empty state do preview: ícone e dica central em texto fraco.
+fn draw_preview_empty(ui: &mut Ui, body: Rect, visuals: &egui::Visuals) {
+    ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
+        ui.vertical_centered(|ui| {
+            ui.add_space((body.height() / 2.0 - 44.0).max(8.0));
+            ui.label(
+                RichText::new("🗋")
+                    .size(36.0)
+                    .color(with_alpha(visuals.weak_text_color(), 140)),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(rust_i18n::t!("preview_empty"))
+                    .size(13.0)
+                    .color(visuals.weak_text_color()),
+            );
+        });
+    });
+}
+
 fn draw_preview_centered(
     ui: &mut Ui,
     body: Rect,
@@ -5520,9 +5580,17 @@ fn draw_empty(ui: &mut Ui, visuals: &egui::Visuals) {
     ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
         ui.vertical_centered(|ui| {
             ui.add_space((body.height() / 2.0 - 48.0).max(8.0));
-            ui.label(RichText::new("🗀").size(48.0));
+            ui.label(
+                RichText::new("🗀")
+                    .size(44.0)
+                    .color(with_alpha(visuals.weak_text_color(), 140)),
+            );
             ui.add_space(4.0);
-            ui.label(RichText::new(rust_i18n::t!("empty_dir")).color(visuals.weak_text_color()));
+            ui.label(
+                RichText::new(rust_i18n::t!("empty_dir"))
+                    .size(13.0)
+                    .color(visuals.weak_text_color()),
+            );
         });
     });
 }

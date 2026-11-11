@@ -21,9 +21,9 @@ O roadmap detalhado com justificativas vive em [SCOPE.md](SCOPE.md). Esta págin
 
 ## Fase 2 — Diferenciais
 
-- [ ] Painel Git completo (gix): status, staging visual, branches, blame, log gráfico, stashes
-- [ ] Indexação global: walker em background (walkdir + notify) + fuzzy (nucleo)
-- [ ] Preview ampliado: markdown, PDF, hex, CSV/JSON
+- [ ] Painel Git completo (gix): ~~status, staging visual~~ ✅ (PR #13); branches, blame, log gráfico, stashes pendentes
+- [x] Indexação global: walker em background (walkdir; notify p/ fase 3) + fuzzy estilo fzf (PR #14)
+- [x] Preview ampliado: markdown, PDF (pdfrum), hex, CSV/JSON (PR #15)
 - [ ] Visualizadores por tipo de arquivo
 
 ## Fase 3 — Extensibilidade
@@ -34,7 +34,7 @@ O roadmap detalhado com justificativas vive em [SCOPE.md](SCOPE.md). Esta págin
 
 ## Decisões em aberto
 
-- [ ] Crate para PDF: mupdf vs pdfium (fase 2)
+- [x] ~~Crate para PDF: mupdf vs pdfium (fase 2)~~ → pdfrum (SCOPE.md)
 - [ ] Plugins: WASM vs Lua (fase 3 — hook de arquitetura já desenhado)
 - [x] ~~Disponibilidade do crate `arandu`~~ livre no crates.io
 - [x] ~~Testes / i18n / telemetria / FS remoto / metadados~~ sessão 2

@@ -3257,24 +3257,29 @@ impl AranduApp {
                             self.active_panel_mut().toggle_view_mode();
                         }
 
-                        // Segundo grupo de ações (settings/busca).
+                        // Busca: mesma ação do quick-open (Ctrl+P).
                         ui.add_space(4.0);
-                        let settings = ui
-                            .add(
-                                egui::Button::new(rust_i18n::t!("settings"))
-                                    .frame(false)
-                                    .min_size(vec2(0.0, CONTROL_H)),
-                            )
-                            .on_hover_text(rust_i18n::t!("settings"));
-                        let _ = settings;
+                        let search_hint = self
+                            .keymap
+                            .effective(Action::ToggleQuickOpen)
+                            .into_iter()
+                            .next()
+                            .map(|binding| {
+                                format!("{binding} {}", action_description(Action::ToggleQuickOpen))
+                            })
+                            .unwrap_or_else(|| {
+                                action_description(Action::ToggleQuickOpen).to_owned()
+                            });
                         let search = ui
                             .add(
                                 egui::Button::new(rust_i18n::t!("search"))
                                     .frame(false)
                                     .min_size(vec2(0.0, CONTROL_H)),
                             )
-                            .on_hover_text(rust_i18n::t!("search"));
-                        let _ = search;
+                            .on_hover_text(search_hint);
+                        if search.clicked() {
+                            self.open_quick_open();
+                        }
                     });
                 });
             },

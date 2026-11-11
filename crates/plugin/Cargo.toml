@@ -13,7 +13,7 @@ thiserror.workspace = true
 directories.workspace = true
 # Luau embutido, sem dependência de Lua do sistema. `vendored` mantém o binário
 # único; sem features extras para reduzir superfície e tempo de build.
-mlua = { version = "0.11", features = ["luau", "vendored"] }
+mlua = { version = "0.11", features = ["luau", "vendored", "send"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

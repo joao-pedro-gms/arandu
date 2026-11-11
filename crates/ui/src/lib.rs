@@ -643,6 +643,23 @@ struct ArchiveJob {
     reload_dir: PathBuf,
 }
 
+/// Resultado de um comando de plugin executado fora da thread de UI.
+struct PluginRun {
+    /// Gerenciador devolvido à UI para as próximas execuções.
+    manager: PluginManager,
+    /// Nome do comando executado.
+    name: String,
+    /// Mensagens de `arandu.notify` produzidas.
+    output: Vec<String>,
+    /// Erro de execução (inclui o limite de instruções), se houver.
+    error: Option<String>,
+}
+
+/// Comando de plugin em andamento em background.
+struct PluginJob {
+    receiver: Receiver<PluginRun>,
+}
+
 /// Resultado de uma atualização de status Git em background.
 enum GitRefresh {
     /// O diretório não pertence a nenhum repositório.
@@ -904,6 +921,12 @@ pub struct AranduApp {
     quick_open: QuickOpenState,
     /// Plugins carregados preguiçosamente no primeiro acesso ao menu.
     plugins: Option<PluginManager>,
+    /// Comandos disponíveis, mantidos mesmo enquanto um comando roda fora da UI.
+    plugin_commands: Vec<String>,
+    /// Comando de plugin em execução (ou `None` quando o gerenciador está na UI).
+    plugin_job: Option<PluginJob>,
+    /// Último comando pedido enquanto outro estava em execução (coalescido).
+    plugin_pending: Option<(String, PluginContext)>,
     /// Diretório de plugins alternativo (testes/headless).
     plugin_dir: Option<PathBuf>,
     /// Congela a drenagem da fila em testes determinísticos de progresso.
@@ -984,6 +1007,9 @@ impl AranduApp {
             show_hints: false,
             quick_open: QuickOpenState::default(),
             plugins: None,
+            plugin_commands: Vec::new(),
+            plugin_job: None,
+            plugin_pending: None,
             plugin_dir: None,
             #[cfg(test)]
             injected_ops: false,
@@ -1013,6 +1039,7 @@ impl AranduApp {
         self.pump_git();
         self.request_git_refresh(false);
         self.pump_index_scan(&ctx);
+        self.pump_plugins();
         // Mensagens temporárias (plugins) somem sozinhas após o TTL.
         if self.ops.notice.as_ref().is_some_and(Notice::expired) {
             self.ops.notice = None;
@@ -1032,6 +1059,7 @@ impl AranduApp {
             || self.git.blame_receiver.is_some()
             || self.git.branches_receiver.is_some()
             || self.git.stashes_receiver.is_some()
+            || self.plugin_job.is_some()
         {
             ctx.request_repaint();
         }
@@ -3036,11 +3064,12 @@ impl AranduApp {
     pub fn set_plugin_dir(&mut self, dir: impl Into<PathBuf>) {
         self.plugin_dir = Some(dir.into());
         self.plugins = None;
+        self.plugin_commands.clear();
     }
 
     /// Carrega os plugins no primeiro acesso ao menu (lazy).
     fn ensure_plugins(&mut self) {
-        if self.plugins.is_some() {
+        if self.plugins.is_some() || self.plugin_job.is_some() {
             return;
         }
         let manager = match self.plugin_dir.clone().or_else(default_plugin_dir) {
@@ -3052,6 +3081,11 @@ impl AranduApp {
 
     /// Recarrega os plugins do disco, refletindo altas/baixas de arquivos.
     fn reload_plugins(&mut self) {
+        // Enquanto um comando roda, o gerenciador está na thread de trabalho;
+        // ignorar o reload evita que o resultado da execução o sobrescreva.
+        if self.plugin_job.is_some() {
+            return;
+        }
         let manager = match self.plugin_dir.clone().or_else(default_plugin_dir) {
             Some(dir) => PluginManager::load_dir(&dir),
             None => PluginManager::empty(),
@@ -3064,7 +3098,8 @@ impl AranduApp {
         for (name, error) in &manager.errors {
             eprintln!("arandu: plugin '{name}' ignorado: {error}");
         }
-        let count = manager.commands().len();
+        self.plugin_commands = manager.commands();
+        let count = self.plugin_commands.len();
         if let Some((name, error)) = manager.errors.first() {
             self.ops.notice = Some(Notice::temporary(
                 rust_i18n::t!(
@@ -3090,11 +3125,7 @@ impl AranduApp {
         let mut reload = false;
         egui::Popup::menu(button).show(|ui| {
             ui.set_min_width(220.0);
-            let commands = self
-                .plugins
-                .as_ref()
-                .map(PluginManager::commands)
-                .unwrap_or_default();
+            let commands = self.plugin_commands.clone();
             if commands.is_empty() {
                 ui.add_enabled(false, egui::Button::new(rust_i18n::t!("plugins_empty")));
             } else {
@@ -3119,30 +3150,84 @@ impl AranduApp {
     }
 
     /// Executa um comando de plugin com o contexto do painel ativo.
+    ///
+    /// O estado Lua roda em uma thread própria: um laço infinito (ou plugin
+    /// lento) não congela a UI — o limite de instruções do Luau aborta a
+    /// execução e o erro vira um aviso. Requisições feitas enquanto outro
+    /// comando roda são coalescidas na última.
     fn run_plugin_command(&mut self, name: &str) {
         let panel = self.active_panel();
         let ctx = PluginContext {
             paths: panel.selected_paths(),
             current_dir: panel.cwd.clone(),
         };
-        let Some(manager) = self.plugins.as_mut() else {
+        if self.plugin_job.is_some() {
+            self.plugin_pending = Some((name.to_owned(), ctx));
+            return;
+        }
+        self.start_plugin_command(name.to_owned(), ctx);
+    }
+
+    /// Move o gerenciador para uma thread e executa `name` lá.
+    fn start_plugin_command(&mut self, name: String, ctx: PluginContext) {
+        let Some(mut manager) = self.plugins.take() else {
             return;
         };
-        let text = match manager.run_command(name, &ctx) {
-            Ok(()) => {
-                let messages = manager.take_output();
-                if messages.is_empty() {
-                    rust_i18n::t!("plugin_ran", name = name).to_string()
-                } else {
-                    messages.join(" · ")
-                }
-            }
-            Err(error) => {
-                manager.take_output();
-                rust_i18n::t!("plugin_failed", name = name, error = error.to_string()).to_string()
+        let (sender, receiver) = mpsc::channel();
+        self.plugin_job = Some(PluginJob { receiver });
+        let job_name = name.clone();
+        let spawned = std::thread::Builder::new()
+            .name("arandu-plugin".into())
+            .spawn(move || {
+                let result = manager.run_command(&job_name, &ctx);
+                let output = manager.take_output();
+                let run = PluginRun {
+                    manager,
+                    name: job_name,
+                    output,
+                    error: result.err().map(|error| error.to_string()),
+                };
+                let _ = sender.send(run);
+            });
+        if spawned.is_err() {
+            // Sem thread não há como executar com segurança; recuperamos o
+            // gerenciador na próxima carga de plugins.
+            self.plugin_job = None;
+            self.plugins = None;
+            self.plugin_commands.clear();
+        }
+    }
+
+    /// Drena o resultado do comando de plugin em background.
+    fn pump_plugins(&mut self) {
+        let Some(job) = self.plugin_job.as_ref() else {
+            return;
+        };
+        let result = match job.receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.plugin_job = None;
+                return;
             }
         };
+        self.plugin_job = None;
+        let PluginRun {
+            manager,
+            name,
+            output,
+            error,
+        } = result;
+        self.plugins = Some(manager);
+        let text = match error {
+            None if output.is_empty() => rust_i18n::t!("plugin_ran", name = name).to_string(),
+            None => output.join(" · "),
+            Some(error) => rust_i18n::t!("plugin_failed", name = name, error = error).to_string(),
+        };
         self.ops.notice = Some(Notice::temporary(text, PLUGIN_NOTICE_TTL));
+        if let Some((name, ctx)) = self.plugin_pending.take() {
+            self.start_plugin_command(name, ctx);
+        }
     }
 
     fn draw_content(&mut self, ui: &mut Ui, content: Rect) {
@@ -7864,9 +7949,16 @@ mod tests {
         harness.run_steps(2);
 
         harness.get_by_label("ola").click();
-        harness.run_steps(2);
-
         let expected = format!("plugin ok: {}", dir.path().display());
+        // O comando roda em thread própria; espera o aviso chegar (o aviso de
+        // "plugins carregados" ainda está visível no primeiro frame).
+        for _ in 0..200 {
+            if harness.state().notice_text().as_deref() == Some(expected.as_str()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run_steps(1);
+        }
         assert_eq!(
             harness.state().notice_text().as_deref(),
             Some(expected.as_str())

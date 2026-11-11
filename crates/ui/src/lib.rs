@@ -29,8 +29,11 @@ use arandu_core::batch::apply_pattern;
 use arandu_core::fs::{CoreError, Entry, format_size, list_dir};
 use arandu_core::hash::{md5_file, sha256_file};
 use arandu_core::ops::{self, Op, OpKind, OpsError, Progress};
-use arandu_core::preview::{PreviewContent, PreviewError, PreviewRequest, UnsupportedReason};
+use arandu_core::preview::{
+    PreviewContent, PreviewError, PreviewRequest, UnsupportedReason, hex_row,
+};
 use arandu_core::queue::{OpQueue, QueueEvent, UndoStack};
+use arandu_git::{FileStatus, GitStatus, Repo};
 use arandu_index::{IndexEntry, IndexStore, Indexer};
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Key, Label, Layout, Modifiers, Rect, RichText,
@@ -74,6 +77,20 @@ const PREVIEW_MIN_W: f32 = 200.0;
 const PREVIEW_MAX_FRACTION: f32 = 0.6;
 /// Entradas mantidas no cache de preview (LRU simples).
 const PREVIEW_CACHE_CAP: usize = 20;
+/// Fração inicial da área útil ocupada pelo painel Git.
+const GIT_FRACTION: f32 = 0.34;
+/// Largura mínima do painel Git.
+const GIT_MIN_W: f32 = 220.0;
+/// Fração máxima da área útil ocupada pelo painel Git.
+const GIT_MAX_FRACTION: f32 = 0.5;
+/// Intervalo do refresh automático do status Git.
+const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+/// Altura reservada ao formulário de commit no painel Git.
+const GIT_COMMIT_H: f32 = 96.0;
+/// Bytes por linha no hex dump.
+const HEX_ROW_BYTES: usize = 16;
+/// Máximo de linhas de dados exibidas na tabela CSV.
+const CSV_MAX_ROWS: usize = 1000;
 /// Teto de linhas renderizadas com syntax highlight.
 ///
 /// Um arquivo de 1 MiB pode ter dezenas de milhares de linhas; construir e
@@ -478,8 +495,10 @@ struct PreviewState {
     receiver: Option<Receiver<(PreviewKey, Result<PreviewContent, PreviewError>)>>,
     /// Job de highlight do preview de texto atual.
     job: Option<(PreviewKey, bool, Arc<egui::text::LayoutJob>)>,
-    /// Textura da imagem atual.
+    /// Textura da imagem/PDF atual.
     texture: Option<(PreviewKey, egui::TextureHandle)>,
+    /// Cache de layout/renderização do Markdown.
+    markdown_cache: egui_commonmark::CommonMarkCache,
 }
 
 /// Conjunto padrão de sintaxes (carregado uma única vez).
@@ -554,6 +573,55 @@ struct ArchiveJob {
     receiver: Receiver<(PathBuf, Result<(), String>)>,
     /// Diretório a recarregar quando o trabalho terminar.
     reload_dir: PathBuf,
+}
+
+/// Resultado de uma atualização de status Git em background.
+enum GitRefresh {
+    /// O diretório não pertence a nenhum repositório.
+    NotRepository,
+    /// Status carregado com sucesso.
+    Status { root: PathBuf, status: GitStatus },
+    /// Falha ao consultar o repositório.
+    Failed(String),
+}
+
+/// Estado do painel Git.
+#[derive(Default)]
+struct GitState {
+    /// Painel visível (Ctrl+G alterna).
+    visible: bool,
+    /// Diretório da última consulta (para detectar troca de painel).
+    requested_dir: Option<PathBuf>,
+    /// Raiz do repositório descoberto.
+    root: Option<PathBuf>,
+    /// Último status válido.
+    status: Option<GitStatus>,
+    /// O diretório atual não é um repositório.
+    not_repo: bool,
+    /// Erro da última consulta.
+    error: Option<String>,
+    /// Erro da última ação (stage/unstage/commit).
+    action_error: Option<String>,
+    /// Consulta em andamento.
+    receiver: Option<Receiver<(PathBuf, GitRefresh)>>,
+    /// Mensagem de commit em edição.
+    commit_message: String,
+    /// Linha focada na lista (staged + modified + untracked).
+    focus: usize,
+    /// O teclado está focado no painel Git.
+    focused: bool,
+    /// O campo de mensagem está com foco (suspende atalhos).
+    commit_focused: bool,
+    /// Início da última consulta, para o refresh periódico.
+    last_loaded: Option<Instant>,
+}
+
+/// Seção de uma linha do painel Git.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitSection {
+    Staged,
+    Modified,
+    Untracked,
 }
 
 /// Evento enviado pela thread de indexação.
@@ -654,6 +722,8 @@ pub struct AranduApp {
     tags: TagsStore,
     /// Painel de pré-visualização (F3).
     preview: PreviewState,
+    /// Painel Git (Ctrl+G).
+    git: GitState,
     /// Tema resolvido (config + arquivo de tema), aplicado no primeiro frame.
     theme: Theme,
     /// Atalhos redefiníveis (preset + overrides).
@@ -732,6 +802,7 @@ impl AranduApp {
             extract_job: None,
             tags,
             preview: PreviewState::default(),
+            git: GitState::default(),
             theme,
             keymap,
             show_hints: false,
@@ -761,8 +832,11 @@ impl AranduApp {
         self.pump_preview();
         self.pump_checksums();
         self.pump_archive_jobs();
+        self.pump_git();
+        self.request_git_refresh(false);
         self.pump_index_scan(&ctx);
-        if self.compress_job.is_some() || self.extract_job.is_some() {
+        if self.compress_job.is_some() || self.extract_job.is_some() || self.git.receiver.is_some()
+        {
             ctx.request_repaint();
         }
         self.handle_keyboard(&ctx);
@@ -1031,6 +1105,11 @@ impl AranduApp {
             return;
         }
 
+        // A digitação da mensagem de commit tem prioridade sobre os atalhos.
+        if self.git.visible && self.git.commit_focused {
+            return;
+        }
+
         let pressed = pressed_keys(ctx);
 
         let toggle_hints = self.action_pressed(Action::ShowHints, &pressed);
@@ -1052,6 +1131,7 @@ impl AranduApp {
         }
 
         let toggle_preview = self.action_pressed(Action::TogglePreview, &pressed);
+        let toggle_git = self.action_pressed(Action::ToggleGitPanel, &pressed);
         let toggle_view_mode = self.action_pressed(Action::ToggleViewMode, &pressed);
         let toggle_panel = self.action_pressed(Action::TogglePanel, &pressed);
         let up = self.action_pressed(Action::NavigateUp, &pressed);
@@ -1073,6 +1153,9 @@ impl AranduApp {
 
         if toggle_preview {
             self.preview.visible = !self.preview.visible;
+        }
+        if toggle_git {
+            self.toggle_git_panel();
         }
         if toggle_view_mode {
             self.active_panel_mut().toggle_view_mode();
@@ -1097,35 +1180,54 @@ impl AranduApp {
                 (false, false)
             };
 
-            let panel = self.active_panel_mut();
-            if up {
-                if view_mode == ViewMode::Icons {
-                    panel.move_focus_row(-1);
-                } else {
-                    panel.move_focus(-1);
+            let mut git_navigated = false;
+            if self.git.visible && self.git.focused {
+                let rows = self.git_rows();
+                if !rows.is_empty() {
+                    if up {
+                        self.git.focus = self.git.focus.saturating_sub(1);
+                    }
+                    if down {
+                        self.git.focus = (self.git.focus + 1).min(rows.len() - 1);
+                    }
+                    if enter {
+                        let (staged, path) = rows[self.git.focus.min(rows.len() - 1)].clone();
+                        self.git_toggle(path, !staged);
+                    }
+                    git_navigated = up || down || enter;
                 }
             }
-            if down {
-                if view_mode == ViewMode::Icons {
-                    panel.move_focus_row(1);
-                } else {
-                    panel.move_focus(1);
+
+            if !git_navigated {
+                let panel = self.active_panel_mut();
+                if up {
+                    if view_mode == ViewMode::Icons {
+                        panel.move_focus_row(-1);
+                    } else {
+                        panel.move_focus(-1);
+                    }
                 }
-            }
-            if grid_left {
-                panel.move_focus_column(-1);
-            }
-            if grid_right {
-                panel.move_focus_column(1);
-            }
-            if enter {
-                panel.open_focused();
-            }
-            if back {
-                panel.go_up();
+                if down {
+                    if view_mode == ViewMode::Icons {
+                        panel.move_focus_row(1);
+                    } else {
+                        panel.move_focus(1);
+                    }
+                }
+                if grid_left {
+                    panel.move_focus_column(-1);
+                }
+                if grid_right {
+                    panel.move_focus_column(1);
+                }
+                if enter {
+                    panel.open_focused();
+                }
+                if back {
+                    panel.go_up();
+                }
             }
         }
-
         if copy {
             self.start_transfer(OpKind::Copy);
         }
@@ -1578,6 +1680,170 @@ impl AranduApp {
         }
     }
 
+    /// Alterna a visibilidade do painel Git.
+    fn toggle_git_panel(&mut self) {
+        self.git.visible = !self.git.visible;
+        self.git.focused = false;
+        if self.git.visible {
+            self.request_git_refresh(true);
+        }
+    }
+
+    /// Diretório usado para descobrir o repositório: o do painel ativo.
+    fn git_target_dir(&self) -> PathBuf {
+        self.active_panel().cwd.clone()
+    }
+
+    /// Dispara (se necessário) uma consulta de status em background.
+    ///
+    /// `force` ignora o intervalo de 10 s e reinicia uma consulta em voo —
+    /// usado após abrir o painel e depois de stage/unstage/commit.
+    fn request_git_refresh(&mut self, force: bool) {
+        if !self.git.visible {
+            return;
+        }
+        let dir = self.git_target_dir();
+        if force {
+            // A thread antiga termina sozinha; o `send` falha no canal órfão.
+            self.git.receiver = None;
+        } else if self.git.receiver.is_some() {
+            return;
+        }
+
+        let dir_changed = self.git.requested_dir.as_deref() != Some(dir.as_path());
+        let due = self
+            .git
+            .last_loaded
+            .is_none_or(|loaded| loaded.elapsed() >= GIT_REFRESH_INTERVAL);
+        if !force && !dir_changed && !due {
+            return;
+        }
+
+        self.git.requested_dir = Some(dir.clone());
+        self.git.last_loaded = Some(Instant::now());
+        let (sender, receiver) = mpsc::channel();
+        self.git.receiver = Some(receiver);
+        std::thread::spawn(move || {
+            let refresh = match Repo::discover(&dir) {
+                None => GitRefresh::NotRepository,
+                Some(repo) => match repo.status() {
+                    Ok(status) => GitRefresh::Status {
+                        root: repo.root().to_path_buf(),
+                        status,
+                    },
+                    Err(error) => GitRefresh::Failed(error.to_string()),
+                },
+            };
+            let _ = sender.send((dir, refresh));
+        });
+    }
+
+    /// Drena o resultado da consulta de status sem bloquear a UI.
+    fn pump_git(&mut self) {
+        let Some(receiver) = self.git.receiver.as_ref() else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.git.receiver = None;
+                return;
+            }
+        };
+        self.git.receiver = None;
+        let (dir, refresh) = result;
+        // Descarta resultados de um diretório que não é mais o alvo.
+        if self.git.requested_dir.as_deref() != Some(dir.as_path()) {
+            return;
+        }
+        match refresh {
+            GitRefresh::NotRepository => {
+                self.git.root = None;
+                self.git.status = None;
+                self.git.not_repo = true;
+                self.git.error = None;
+                self.git.action_error = None;
+            }
+            GitRefresh::Status { root, status } => {
+                let rows = status.staged.len() + status.modified.len() + status.untracked.len();
+                self.git.root = Some(root);
+                self.git.status = Some(status);
+                self.git.not_repo = false;
+                self.git.error = None;
+                self.git.focus = self.git.focus.min(rows.saturating_sub(1));
+            }
+            GitRefresh::Failed(error) => {
+                self.git.error = Some(error);
+                self.git.not_repo = false;
+            }
+        }
+    }
+
+    /// Linhas do painel Git na ordem exibida: `(staged?, caminho absoluto)`.
+    fn git_rows(&self) -> Vec<(bool, PathBuf)> {
+        let (Some(status), Some(root)) = (&self.git.status, &self.git.root) else {
+            return Vec::new();
+        };
+        status
+            .staged
+            .iter()
+            .map(|entry| (true, root.join(&entry.path)))
+            .chain(
+                status
+                    .modified
+                    .iter()
+                    .map(|entry| (false, root.join(&entry.path))),
+            )
+            .chain(
+                status
+                    .untracked
+                    .iter()
+                    .map(|entry| (false, root.join(&entry.path))),
+            )
+            .collect()
+    }
+
+    /// Executa stage (`stage = true`) ou unstage de um caminho e atualiza.
+    fn git_toggle(&mut self, path: PathBuf, stage: bool) {
+        let dir = self.git_target_dir();
+        let Some(repo) = Repo::discover(&dir) else {
+            self.git.not_repo = true;
+            self.git.status = None;
+            return;
+        };
+        let paths = [path];
+        let outcome = if stage {
+            repo.stage(&paths)
+        } else {
+            repo.unstage(&paths)
+        };
+        self.git.action_error = outcome.err().map(|error| error.to_string());
+        self.request_git_refresh(true);
+    }
+
+    /// Cria um commit com a mensagem digitada e o index atual.
+    fn git_commit(&mut self) {
+        let message = self.git.commit_message.trim().to_owned();
+        if message.is_empty() {
+            return;
+        }
+        let dir = self.git_target_dir();
+        let Some(repo) = Repo::discover(&dir) else {
+            self.git.not_repo = true;
+            self.git.status = None;
+            return;
+        };
+        match repo.commit(&message) {
+            Ok(_) => {
+                self.git.commit_message.clear();
+                self.git.action_error = None;
+                self.request_git_refresh(true);
+            }
+            Err(error) => self.git.action_error = Some(error.to_string()),
+        }
+    }
+
     /// Recarrega os painéis que estão exibindo `dir`.
     fn reload_dir(&mut self, dir: &Path) {
         for panel in [&mut self.left, &mut self.right] {
@@ -1873,6 +2139,25 @@ impl AranduApp {
                     ui.separator();
                     ui.label(RichText::new(APP_NAME).strong());
 
+                    let git_hint = self
+                        .keymap
+                        .effective(Action::ToggleGitPanel)
+                        .into_iter()
+                        .next()
+                        .map(|binding| {
+                            format!("{binding} {}", action_description(Action::ToggleGitPanel))
+                        })
+                        .unwrap_or_default();
+                    let git_button = ui
+                        .add(
+                            Label::new(RichText::new(rust_i18n::t!("git_title")).size(14.0))
+                                .sense(Sense::CLICK),
+                        )
+                        .on_hover_text(git_hint);
+                    if git_button.clicked() {
+                        self.toggle_git_panel();
+                    }
+
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let theme_button = ui
                             .add(
@@ -1929,10 +2214,20 @@ impl AranduApp {
         let visuals = ui.visuals().clone();
         let accent = accent_color(&self.theme, &visuals);
 
-        // O preview fica fixo à direita; os dois painéis dividem o restante.
+        // Preview e painel Git ficam fixos à direita; os dois painéis dividem
+        // o restante. O Git ocupa a borda direita e o preview vem antes dele.
+        let git_w = if self.git.visible {
+            let max_w = content.width() * GIT_MAX_FRACTION;
+            (content.width() * GIT_FRACTION)
+                .max(GIT_MIN_W.min(max_w))
+                .min(max_w)
+        } else {
+            0.0
+        };
+        let preview_space = (content.width() - git_w).max(1.0);
         let preview_w = if self.preview.visible {
-            let max_w = content.width() * PREVIEW_MAX_FRACTION;
-            (content.width() * PREVIEW_FRACTION)
+            let max_w = preview_space * PREVIEW_MAX_FRACTION;
+            (preview_space * PREVIEW_FRACTION)
                 .max(PREVIEW_MIN_W.min(max_w))
                 .min(max_w)
         } else {
@@ -1941,7 +2236,7 @@ impl AranduApp {
         let panes_rect = Rect::from_min_max(
             content.min,
             pos2(
-                (content.right() - preview_w).max(content.left() + 1.0),
+                (content.right() - git_w - preview_w).max(content.left() + 1.0),
                 content.bottom(),
             ),
         );
@@ -2006,8 +2301,10 @@ impl AranduApp {
 
         if left_interacted {
             self.active = PanelSide::Left;
+            self.git.focused = false;
         } else if right_interacted {
             self.active = PanelSide::Right;
+            self.git.focused = false;
         }
 
         // Linha do splitter por cima das bordas dos painéis.
@@ -2023,8 +2320,10 @@ impl AranduApp {
         );
 
         if self.preview.visible {
-            let preview_rect =
-                Rect::from_min_max(pos2(panes_rect.right(), content.top()), content.max);
+            let preview_rect = Rect::from_min_max(
+                pos2(panes_rect.right(), content.top()),
+                pos2(content.right() - git_w, content.bottom()),
+            );
             let focused = self
                 .active_panel()
                 .entries
@@ -2032,6 +2331,228 @@ impl AranduApp {
                 .cloned();
             self.ensure_preview(focused.as_ref());
             self.draw_preview(ui, preview_rect, focused.as_ref(), &visuals);
+        }
+
+        if self.git.visible {
+            let git_rect =
+                Rect::from_min_max(pos2(content.right() - git_w, content.top()), content.max);
+            self.draw_git_panel(ui, git_rect, &visuals);
+        }
+    }
+
+    /// Desenha o painel Git completo (cabeçalho, listas e formulário).
+    fn draw_git_panel(&mut self, ui: &mut Ui, rect: Rect, visuals: &egui::Visuals) {
+        ui.painter().rect_filled(rect, 0.0, visuals.faint_bg_color);
+
+        let inner = Rect::from_min_max(
+            pos2(rect.left() + 8.0, rect.top()),
+            pos2(rect.right() - 8.0, rect.bottom()),
+        );
+        let toggle_hint = self
+            .keymap
+            .effective(Action::ToggleGitPanel)
+            .into_iter()
+            .next()
+            .map(|binding| format!("{binding} {}", action_description(Action::ToggleGitPanel)));
+
+        ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let header = ui.allocate_ui_with_layout(
+                vec2(ui.available_width(), HEADER_H),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.label(RichText::new(rust_i18n::t!("git_title")).strong());
+                    if let Some(status) = &self.git.status {
+                        let branch = status
+                            .branch
+                            .clone()
+                            .unwrap_or_else(|| rust_i18n::t!("git_detached").into_owned());
+                        ui.label(
+                            RichText::new(branch)
+                                .size(12.5)
+                                .color(visuals.weak_text_color()),
+                        );
+                        if let Some(upstream) = &status.upstream {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{upstream} ↑{} ↓{}",
+                                    status.ahead, status.behind
+                                ))
+                                .size(11.5)
+                                .color(visuals.weak_text_color()),
+                            );
+                        }
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if let Some(hint) = &toggle_hint {
+                            ui.label(
+                                RichText::new(hint)
+                                    .size(12.5)
+                                    .color(visuals.weak_text_color()),
+                            );
+                        }
+                    });
+                },
+            );
+            ui.painter().hline(
+                header.response.rect.x_range(),
+                header.response.rect.bottom(),
+                visuals.widgets.noninteractive.bg_stroke,
+            );
+
+            let body =
+                Rect::from_min_max(pos2(inner.left(), header.response.rect.bottom()), inner.max);
+            self.draw_git_body(ui, body, visuals);
+        });
+
+        ui.painter().vline(
+            rect.left(),
+            rect.y_range(),
+            visuals.widgets.noninteractive.bg_stroke,
+        );
+    }
+
+    fn draw_git_body(&mut self, ui: &mut Ui, body: Rect, visuals: &egui::Visuals) {
+        let background = ui.interact(body, ui.scope_id().with("git-panel-bg"), Sense::click());
+        if background.clicked() {
+            self.git.focused = true;
+        }
+
+        if self.git.not_repo && self.git.status.is_none() {
+            draw_preview_centered(ui, body, rust_i18n::t!("git_not_repository"), visuals);
+            return;
+        }
+        if let Some(error) = self.git.error.clone() {
+            draw_preview_centered(ui, body, error, visuals);
+            return;
+        }
+        let Some(status) = self.git.status.clone() else {
+            draw_preview_centered(ui, body, rust_i18n::t!("git_loading"), visuals);
+            return;
+        };
+        let root = self.git.root.clone().unwrap_or_default();
+
+        let footer_h = GIT_COMMIT_H.min(body.height() * 0.5);
+        let list_rect = Rect::from_min_max(
+            body.min,
+            pos2(
+                body.right(),
+                (body.bottom() - footer_h).max(body.top() + 1.0),
+            ),
+        );
+        let footer_rect = Rect::from_min_max(pos2(body.left(), list_rect.bottom()), body.max);
+
+        let focus = self.git.focus;
+        let focused_panel = self.git.focused;
+        let mut clicked: Option<(usize, bool, PathBuf)> = None;
+        let mut commit_clicked = false;
+        let mut row_index = 0usize;
+
+        ui.scope_builder(
+            UiBuilder::new().max_rect(list_rect.shrink2(vec2(6.0, 4.0))),
+            |ui| {
+                ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let sections = [
+                            (
+                                GitSection::Staged,
+                                rust_i18n::t!("git_staged").into_owned(),
+                                status.staged.clone(),
+                                false,
+                            ),
+                            (
+                                GitSection::Modified,
+                                rust_i18n::t!("git_modified").into_owned(),
+                                status.modified.clone(),
+                                true,
+                            ),
+                            (
+                                GitSection::Untracked,
+                                rust_i18n::t!("git_untracked").into_owned(),
+                                status.untracked.clone(),
+                                true,
+                            ),
+                        ];
+
+                        for (_section, title, entries, stage) in sections {
+                            if entries.is_empty() {
+                                continue;
+                            }
+                            ui.add_space(2.0);
+                            ui.label(
+                                RichText::new(format!("{title} ({})", entries.len()))
+                                    .small()
+                                    .strong()
+                                    .color(visuals.weak_text_color()),
+                            );
+                            for entry in entries {
+                                let focused = focused_panel && row_index == focus;
+                                let text = format!(
+                                    "{}  {}",
+                                    status_glyph(entry.status),
+                                    entry.path.display()
+                                );
+                                let mut rich = RichText::new(text).size(13.0);
+                                if focused {
+                                    rich = rich.strong().color(visuals.strong_text_color());
+                                }
+                                let response = ui
+                                    .add(Label::new(rich).sense(Sense::click()))
+                                    .on_hover_text(entry.path.display().to_string());
+                                if response.clicked() {
+                                    clicked = Some((row_index, stage, root.join(&entry.path)));
+                                }
+                                row_index += 1;
+                            }
+                        }
+
+                        if row_index == 0 {
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(rust_i18n::t!("git_clean"))
+                                    .color(visuals.weak_text_color()),
+                            );
+                        }
+                    });
+            },
+        );
+
+        ui.scope_builder(
+            UiBuilder::new().max_rect(footer_rect.shrink2(vec2(6.0, 2.0))),
+            |ui| {
+                ui.separator();
+                let editor = egui::TextEdit::multiline(&mut self.git.commit_message)
+                    .hint_text(rust_i18n::t!("git_commit_placeholder"))
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY);
+                let response = ui.add(editor);
+                self.git.commit_focused = response.has_focus();
+
+                let enabled =
+                    !status.staged.is_empty() && !self.git.commit_message.trim().is_empty();
+                let button =
+                    ui.add_enabled(enabled, egui::Button::new(rust_i18n::t!("git_commit")));
+                if button.clicked() {
+                    commit_clicked = true;
+                }
+                if let Some(error) = &self.git.action_error {
+                    ui.label(
+                        RichText::new(error)
+                            .small()
+                            .color(ui.visuals().error_fg_color),
+                    );
+                }
+            },
+        );
+
+        if let Some((index, stage, path)) = clicked {
+            self.git.focus = index;
+            self.git.focused = true;
+            self.git_toggle(path, stage);
+        }
+        if commit_clicked {
+            self.git_commit();
         }
     }
 
@@ -2056,6 +2577,7 @@ impl AranduApp {
             .into_iter()
             .next()
             .map(|binding| format!("{binding} {}", action_description(Action::TogglePreview)));
+        let kind_label = entry.and_then(|entry| self.preview_kind_label(entry));
         ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             let header = ui.allocate_ui_with_layout(
@@ -2063,6 +2585,18 @@ impl AranduApp {
                 Layout::left_to_right(Align::Center),
                 |ui| {
                     ui.label(RichText::new(rust_i18n::t!("preview_title")).strong());
+                    if let Some(kind) = &kind_label {
+                        ui.label(
+                            RichText::new("·")
+                                .size(12.5)
+                                .color(visuals.weak_text_color()),
+                        );
+                        ui.label(
+                            RichText::new(kind)
+                                .size(12.5)
+                                .color(visuals.weak_text_color()),
+                        );
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if let Some(hint) = &toggle_hint {
                             ui.label(
@@ -2129,8 +2663,25 @@ impl AranduApp {
                         syntax_name.as_deref(),
                     );
                 }
+                PreviewContent::Markdown { text, truncated } => {
+                    self.draw_preview_markdown(ui, body, text, *truncated);
+                }
+                PreviewContent::Hex {
+                    bytes, truncated, ..
+                } => {
+                    self.draw_preview_hex(ui, body, bytes, *truncated);
+                }
+                PreviewContent::Csv { text, truncated } => {
+                    self.draw_preview_csv(ui, body, text, *truncated);
+                }
+                PreviewContent::Json { text, truncated } => {
+                    self.draw_preview_text(ui, body, &key, text, *truncated, Some("json"));
+                }
                 PreviewContent::Image { image, .. } => {
                     self.draw_preview_image(ui, body, &key, image, visuals);
+                }
+                PreviewContent::Pdf { page, .. } => {
+                    self.draw_preview_rgba(ui, body, &key, page, visuals);
                 }
                 PreviewContent::Unsupported { reason } => {
                     ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
@@ -2213,12 +2764,171 @@ impl AranduApp {
         });
     }
 
+    /// Rótulo do tipo detectado exibido no header do painel.
+    fn preview_kind_label(&self, entry: &Entry) -> Option<String> {
+        if entry.is_dir {
+            return Some(rust_i18n::t!("preview_kind_directory").to_string());
+        }
+        let key = PreviewKey::for_entry(entry);
+        let PreviewEntry::Ready(content) = self.preview.cache.get(&key)? else {
+            return None;
+        };
+        Some(match &*content {
+            PreviewContent::Text { .. } => rust_i18n::t!("preview_kind_text").to_string(),
+            PreviewContent::Markdown { .. } => rust_i18n::t!("preview_kind_markdown").to_string(),
+            PreviewContent::Hex { .. } => rust_i18n::t!("preview_kind_hex").to_string(),
+            PreviewContent::Csv { .. } => rust_i18n::t!("preview_kind_csv").to_string(),
+            PreviewContent::Json { .. } => rust_i18n::t!("preview_kind_json").to_string(),
+            PreviewContent::Image { .. } => rust_i18n::t!("preview_kind_image").to_string(),
+            PreviewContent::Pdf { page_count, .. } => format!(
+                "{} — {}",
+                rust_i18n::t!("preview_kind_pdf"),
+                rust_i18n::t!("preview_pdf_pages", count => *page_count)
+            ),
+            PreviewContent::Unsupported { .. } => return None,
+        })
+    }
+
+    fn draw_preview_markdown(&mut self, ui: &mut Ui, body: Rect, text: &str, truncated: bool) {
+        let cache = &mut self.preview.markdown_cache;
+        ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
+            if truncated {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(rust_i18n::t!("preview_truncated"))
+                        .size(12.5)
+                        .color(ui.visuals().warn_fg_color),
+                );
+            }
+            ScrollArea::vertical()
+                .id_salt("preview-markdown")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add_space(4.0);
+                    egui_commonmark::CommonMarkViewer::new().show(ui, cache, text);
+                    ui.add_space(8.0);
+                });
+        });
+    }
+
+    fn draw_preview_hex(&mut self, ui: &mut Ui, body: Rect, bytes: &[u8], truncated: bool) {
+        ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
+            if truncated {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(rust_i18n::t!("preview_truncated"))
+                        .size(12.5)
+                        .color(ui.visuals().warn_fg_color),
+                );
+            }
+            let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+            let rows = bytes.len().div_ceil(HEX_ROW_BYTES);
+            let visuals = ui.visuals().clone();
+            ScrollArea::vertical()
+                .id_salt("preview-hex")
+                .auto_shrink([false, false])
+                .show_rows(ui, row_height, rows, |ui, row_range| {
+                    for row in row_range {
+                        let offset = row * HEX_ROW_BYTES;
+                        let end = (offset + HEX_ROW_BYTES).min(bytes.len());
+                        let (offset_text, hex_text, ascii_text) =
+                            hex_row(offset, &bytes[offset..end]);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 12.0;
+                            ui.label(
+                                RichText::new(offset_text)
+                                    .monospace()
+                                    .color(visuals.weak_text_color()),
+                            );
+                            ui.label(RichText::new(hex_text).monospace());
+                            ui.label(
+                                RichText::new(ascii_text)
+                                    .monospace()
+                                    .color(visuals.weak_text_color()),
+                            );
+                        });
+                    }
+                });
+        });
+    }
+
+    fn draw_preview_csv(&mut self, ui: &mut Ui, body: Rect, text: &str, truncated: bool) {
+        ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
+            if truncated {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(rust_i18n::t!("preview_truncated"))
+                        .size(12.5)
+                        .color(ui.visuals().warn_fg_color),
+                );
+            }
+            let mut lines = text.lines();
+            let Some(header) = lines.next() else {
+                return;
+            };
+            let delimiter = if header.contains('\t') && !header.contains(',') {
+                '\t'
+            } else {
+                ','
+            };
+            let headers = parse_csv_row(header, delimiter);
+            let rows: Vec<Vec<String>> = lines
+                .take(CSV_MAX_ROWS + 1)
+                .map(|line| parse_csv_row(line, delimiter))
+                .collect();
+            let capped = rows.len() > CSV_MAX_ROWS;
+            ScrollArea::both()
+                .id_salt("preview-csv")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    egui::Grid::new("preview-csv-grid")
+                        .striped(true)
+                        .min_col_width(32.0)
+                        .show(ui, |ui| {
+                            for field in &headers {
+                                ui.label(RichText::new(field.as_str()).strong());
+                            }
+                            ui.end_row();
+                            for row in rows.iter().take(CSV_MAX_ROWS) {
+                                for field in row {
+                                    ui.label(if field.is_empty() { " " } else { field });
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    if capped {
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(rust_i18n::t!(
+                                "preview_csv_limit",
+                                count => CSV_MAX_ROWS
+                            ))
+                            .size(12.5)
+                            .color(ui.visuals().warn_fg_color),
+                        );
+                    }
+                });
+        });
+    }
+
     fn draw_preview_image(
         &mut self,
         ui: &mut Ui,
         body: Rect,
         key: &PreviewKey,
         image: &image::DynamicImage,
+        visuals: &egui::Visuals,
+    ) {
+        let rgba = image.to_rgba8();
+        self.draw_preview_rgba(ui, body, key, &rgba, visuals);
+    }
+
+    fn draw_preview_rgba(
+        &mut self,
+        ui: &mut Ui,
+        body: Rect,
+        key: &PreviewKey,
+        rgba: &image::RgbaImage,
         _visuals: &egui::Visuals,
     ) {
         let stale = self
@@ -2228,7 +2938,6 @@ impl AranduApp {
             .map(|(cached_key, _)| cached_key != key)
             .unwrap_or(true);
         if stale {
-            let rgba = image.to_rgba8();
             let color = egui::ColorImage::from_rgba_unmultiplied(
                 [rgba.width() as usize, rgba.height() as usize],
                 rgba.as_raw(),
@@ -2247,8 +2956,8 @@ impl AranduApp {
         let texture = texture.clone();
 
         let available = body.size() - vec2(0.0, 8.0);
-        let width = image.width() as f32;
-        let height = image.height() as f32;
+        let width = rgba.width() as f32;
+        let height = rgba.height() as f32;
         let scale = (available.x / width)
             .min(available.y / height)
             .clamp(0.01, 1.0);
@@ -3382,6 +4091,16 @@ fn draw_preview_metadata(ui: &mut Ui, entry: &Entry) {
 }
 
 /// Mensagem centralizada (carregando / nenhum item focado).
+/// Símbolo curto do estado de um arquivo no painel Git.
+fn status_glyph(status: FileStatus) -> &'static str {
+    match status {
+        FileStatus::Added => "A",
+        FileStatus::Modified => "M",
+        FileStatus::Deleted => "D",
+        FileStatus::Renamed => "R",
+    }
+}
+
 fn draw_preview_centered(
     ui: &mut Ui,
     body: Rect,
@@ -3403,8 +4122,39 @@ fn preview_reason(reason: UnsupportedReason) -> String {
         UnsupportedReason::Directory => "preview_reason_directory",
         UnsupportedReason::Binary => "preview_reason_binary",
         UnsupportedReason::TooLarge => "preview_reason_too_large",
+        UnsupportedReason::Pdf => "preview_reason_pdf",
     };
     rust_i18n::t!(key).to_string()
+}
+
+/// Divide uma linha CSV/TSV em campos, tratando aspas duplas básicas.
+fn parse_csv_row(line: &str, delimiter: char) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if quoted {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    quoted = false;
+                }
+            } else {
+                field.push(ch);
+            }
+        } else if ch == '"' && field.is_empty() {
+            quoted = true;
+        } else if ch == delimiter {
+            fields.push(std::mem::take(&mut field));
+        } else {
+            field.push(ch);
+        }
+    }
+    fields.push(field);
+    fields
 }
 
 /// Constrói o `LayoutJob` com syntax highlight (ou monospace puro).
@@ -3629,6 +4379,7 @@ fn home_directory() -> PathBuf {
 fn action_description(action: Action) -> String {
     let key = match action {
         Action::TogglePreview => "action_toggle_preview",
+        Action::ToggleGitPanel => "action_toggle_git_panel",
         Action::TogglePanel => "action_toggle_panel",
         Action::NavigateUp => "action_navigate_up",
         Action::NavigateDown => "action_navigate_down",
@@ -3879,6 +4630,19 @@ impl AranduApp {
         }
     }
 
+    /// Markdown bruto do preview focado — usado em testes.
+    #[cfg(test)]
+    fn preview_markdown(&self) -> Option<String> {
+        let key = self.focused_preview_key()?;
+        match self.preview.cache.get(&key)? {
+            PreviewEntry::Ready(content) => match &*content {
+                PreviewContent::Markdown { text, .. } => Some(text.clone()),
+                _ => None,
+            },
+            PreviewEntry::Failed(_) => None,
+        }
+    }
+
     /// Se o cálculo de checksums terminou — usado em testes.
     #[cfg(test)]
     fn checksums_done(&self) -> bool {
@@ -3981,6 +4745,130 @@ mod tests {
 
         assert_eq!(harness.state().active_selected_count(), 1);
         assert!(harness.state().left.selected.is_some());
+    }
+
+    #[test]
+    fn ctrl_g_toggles_git_panel_and_detects_non_repository() {
+        let (_dir, app) = fixture_app();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        assert!(!harness.state().git.visible);
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::G);
+        harness.run_steps(1);
+        assert!(harness.state().git.visible);
+
+        // O refresh em background mantém repaint contínuo, então `run()` (que
+        // espera a UI assentar) estouraria max_steps. Avança passos com teto
+        // até a descoberta terminar.
+        for _ in 0..200 {
+            if harness.state().git.not_repo {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run_steps(1);
+        }
+        assert!(
+            harness.state().git.not_repo,
+            "esperava estado de não-repositório"
+        );
+
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::G);
+        harness.run_steps(1);
+        assert!(!harness.state().git.visible);
+    }
+
+    #[test]
+    fn git_panel_enter_stages_and_unstages_focused_row() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        let run_git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("executa git");
+            assert!(
+                output.status.success(),
+                "git {:?} falhou: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_git(&["init", "-b", "main"]);
+        run_git(&["config", "user.name", "Teste"]);
+        run_git(&["config", "user.email", "teste@example.com"]);
+        fs::write(dir.path().join("novo.txt"), b"conteudo").expect("cria arquivo");
+
+        let app = AranduApp::new_at(Config::default(), dir.path());
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::G);
+        harness.run_steps(1);
+
+        // O refresh em background mantém repaint contínuo, então `run()` (que
+        // espera a UI assentar) estouraria max_steps. Avança passos com teto
+        // até o status esperado aparecer.
+        for _ in 0..200 {
+            if harness.state().git.status.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run_steps(1);
+        }
+        assert!(harness.state().git.status.is_some(), "status não carregou");
+
+        harness.state_mut().git.focused = true;
+        harness.run_steps(1);
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(1);
+
+        for _ in 0..200 {
+            let staged = harness
+                .state()
+                .git
+                .status
+                .as_ref()
+                .is_some_and(|status| status.staged.len() == 1 && status.untracked.is_empty());
+            if staged {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run_steps(1);
+        }
+        let status = harness.state().git.status.clone().expect("status");
+        assert_eq!(status.staged.len(), 1, "Enter deveria preparar o arquivo");
+        assert!(status.untracked.is_empty());
+
+        harness.state_mut().git.focused = true;
+        harness.run_steps(1);
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(1);
+
+        for _ in 0..200 {
+            let unstaged = harness
+                .state()
+                .git
+                .status
+                .as_ref()
+                .is_some_and(|status| status.staged.is_empty() && status.untracked.len() == 1);
+            if unstaged {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run_steps(1);
+        }
+        let status = harness.state().git.status.clone().expect("status");
+        assert!(
+            status.staged.is_empty(),
+            "Enter de novo deveria despreparar o arquivo"
+        );
+        assert_eq!(status.untracked.len(), 1);
     }
 
     #[test]
@@ -4252,6 +5140,101 @@ mod tests {
             0,
             "o painel de preview deveria sumir ao pressionar F3 novamente"
         );
+    }
+
+    #[test]
+    fn parse_csv_row_handles_quotes_and_delimiter() {
+        assert_eq!(
+            super::parse_csv_row("a,\"b,c\",\"d\"\"e\"", ','),
+            vec!["a", "b,c", "d\"e"]
+        );
+        assert_eq!(super::parse_csv_row("a\tb", '\t'), vec!["a", "b"]);
+    }
+
+    fn preview_app_for(name: &str, bytes: &[u8]) -> (tempfile::TempDir, AranduApp) {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        fs::write(dir.path().join(name), bytes).expect("cria arquivo de fixture");
+        let mut app = AranduApp::new_at(Config::default(), dir.path());
+        let index = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.name == name)
+            .expect("fixture contém o arquivo");
+        app.left.select(index, false);
+        (dir, app)
+    }
+
+    fn wait_for_preview(harness: &mut Harness<'_, AranduApp>) {
+        for _ in 0..200 {
+            if harness.state().preview_ready() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run();
+        }
+    }
+
+    #[test]
+    fn preview_markdown_shows_raw_text_and_kind() {
+        let (_dir, app) = preview_app_for("README.md", b"# Titulo\n\n- item\n");
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        harness.key_press(egui::Key::F3);
+        harness.run();
+        wait_for_preview(&mut harness);
+
+        assert_eq!(
+            harness.state().preview_markdown().as_deref(),
+            Some("# Titulo\n\n- item\n")
+        );
+        let kind = rust_i18n::t!("preview_kind_markdown").to_string();
+        assert!(
+            harness.query_all_by_label(&kind).count() >= 1,
+            "esperava o tipo '{kind}' no header do preview"
+        );
+    }
+
+    #[test]
+    fn preview_csv_draws_table_and_kind() {
+        let (_dir, app) = preview_app_for("dados.csv", b"nome,idade\nAna,30\n");
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        harness.key_press(egui::Key::F3);
+        harness.run();
+        wait_for_preview(&mut harness);
+
+        for label in ["nome", "idade", "Ana", "30"] {
+            assert!(
+                harness.query_all_by_label(label).count() >= 1,
+                "esperava a célula '{label}' na tabela CSV"
+            );
+        }
+        let kind = rust_i18n::t!("preview_kind_csv").to_string();
+        assert!(harness.query_all_by_label(&kind).count() >= 1);
+    }
+
+    #[test]
+    fn preview_hex_shows_offsets() {
+        let (_dir, app) = preview_app_for("dados.bin", &[0u8; 20]);
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        harness.key_press(egui::Key::F3);
+        harness.run();
+        wait_for_preview(&mut harness);
+
+        for offset in ["00000000", "00000010"] {
+            assert!(
+                harness.query_all_by_label(offset).count() >= 1,
+                "esperava o offset '{offset}' no hex dump"
+            );
+        }
     }
 
     #[test]

@@ -45,6 +45,7 @@ toml = "1"
 directories = "6"
 eframe = "0.37"
 rust-i18n = "4.2"
+gix = "0.90"
 trash = "5"
 # `deflate` (flate2/zlib-rs e zopfli) é puro Rust; bzip2/zstd/aes exigiriam C.
 zip = { version = "9", default-features = false, features = ["deflate"] }
@@ -60,6 +61,19 @@ image = { version = "0.25", default-features = false, features = [
 syntect = { version = "5", default-features = false, features = [
     "default-fancy",
     "plist-load",
+] }
+serde_json = "1"
+# Renderização de PDF puramente em Rust. `edit`/`forms` ficam de fora: o
+# preview só rasteriza, não edita nem preenche formulários.
+pdfrum = { version = "0.5", default-features = false, features = [
+    "vello-cpu",
+    "codecs-all",
+    "system-fonts",
+] }
+# Markdown do painel de preview (feito para egui 0.37).
+egui_commonmark = { version = "0.26", default-features = false, features = [
+    "pulldown_cmark",
+    "regex",
 ] }
 
 arandu-core = { path = "crates/core" }

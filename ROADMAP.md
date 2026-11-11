@@ -21,7 +21,7 @@ O roadmap detalhado com justificativas vive em [SCOPE.md](SCOPE.md). Esta págin
 
 ## Fase 2 — Diferenciais
 
-- [ ] Painel Git completo (gix): ~~status, staging visual~~ ✅ (PR #13); branches, blame, log gráfico, stashes pendentes
+- [ ] Painel Git (gix): ~~status, staging visual~~ ✅ (PR #13); ~~log gráfico, blame~~ ✅; branches e stashes pendentes
 - [x] Indexação global: walker em background (walkdir; notify p/ fase 3) + fuzzy estilo fzf (PR #14)
 - [x] Preview ampliado: markdown, PDF (pdfrum), hex, CSV/JSON (PR #15)
 - [ ] Visualizadores por tipo de arquivo

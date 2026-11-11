@@ -1,0 +1,19 @@
+[package]
+name = "arandu-plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "API de plugins do Arandu em Lua (Luau) sandbox"
+
+[dependencies]
+thiserror.workspace = true
+directories.workspace = true
+# Luau embutido, sem dependência de Lua do sistema. `vendored` mantém o binário
+# único; sem features extras para reduzir superfície e tempo de build.
+mlua = { version = "0.11", features = ["luau", "vendored"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

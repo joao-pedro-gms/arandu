@@ -30,7 +30,7 @@ O roadmap detalhado com justificativas vive em [SCOPE.md](SCOPE.md). Esta págin
 
 - [ ] API de plugins (WASM ou Lua — decisão em aberto, ver SCOPE.md)
 - [ ] Sync de config entre máquinas
-- [ ] macOS
+- [x] macOS <!-- CI macOS (build + testes + clippy em `macos-latest`); port funcional depende de teste em hardware Apple -->
 
 ## Decisões em aberto
 

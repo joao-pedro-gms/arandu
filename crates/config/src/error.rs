@@ -35,6 +35,14 @@ pub enum ConfigError {
     #[error("tecla inválida em `{action}`: {key:?} (nomes egui: F1..F12, Tab, ArrowUp, J, ...)")]
     InvalidKey { action: String, key: String },
 
+    /// Diretório de configuração ausente ao exportar o pacote.
+    #[error("diretório de configuração não encontrado: {path}")]
+    MissingConfigDir { path: String },
+
+    /// Entrada do pacote com caminho absoluto, `..` ou tipo não suportado.
+    #[error("entrada insegura no pacote de configuração: {entry}")]
+    UnsafeArchiveEntry { entry: String },
+
     /// Tag vazia, com vírgula/quebra de linha ou longa demais.
     #[error(
         "tag inválida: {tag:?} (não pode ser vazia, conter vírgula ou quebra de linha, nem passar de 32 caracteres)"

@@ -6,10 +6,12 @@
 
 mod error;
 pub mod keymap;
+pub mod sync;
 pub mod tags;
 
 pub use error::ConfigError;
 pub use keymap::{Action, KeyBinding, Keymap, Modifiers};
+pub use sync::{export_config, import_config};
 pub use tags::TagsStore;
 
 use serde::{Deserialize, Serialize};

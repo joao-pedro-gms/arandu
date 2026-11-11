@@ -28,13 +28,13 @@ O roadmap detalhado com justificativas vive em [SCOPE.md](SCOPE.md). Esta págin
 
 ## Fase 3 — Extensibilidade
 
-- [ ] API de plugins (WASM ou Lua — decisão em aberto, ver SCOPE.md)
-- [ ] Sync de config entre máquinas
+- [x] API de plugins (Lua/Luau sandboxed — mlua; decisão registrada no SCOPE.md) <!-- PR #20 -->
+- [x] Sync de config entre máquinas <!-- export/import tar.gz via CLI (`--export-config`/`--import-config`) -->
 - [x] macOS <!-- CI macOS (build + testes + clippy em `macos-latest`); port funcional depende de teste em hardware Apple -->
 
 ## Decisões em aberto
 
 - [x] ~~Crate para PDF: mupdf vs pdfium (fase 2)~~ → pdfrum (SCOPE.md)
-- [ ] Plugins: WASM vs Lua (fase 3 — hook de arquitetura já desenhado)
+- [x] ~~Plugins: WASM vs Lua~~ → Lua/Luau (SCOPE.md)
 - [x] ~~Disponibilidade do crate `arandu`~~ livre no crates.io
 - [x] ~~Testes / i18n / telemetria / FS remoto / metadados~~ sessão 2

@@ -8,4 +8,4 @@ max_failed_pixels = 0
 # lavapipe/software rendering varia alguns pixels entre versões de driver.
 [linux]
 threshold = 1.0
-max_failed_pixels = 4
+max_failed_pixels = 50

@@ -5,29 +5,32 @@
 ![CI](https://github.com/joao-pedro-gms/arandu/actions/workflows/ci.yml/badge.svg)
 ![Licença](https://img.shields.io/badge/licença-MIT%20%2B%20Apache--2.0-blue)
 
-**Arandu** (arquivo, em tupi) é um gerenciador de arquivos desktop para Linux e
-Windows, escrito em Rust com [egui](https://github.com/emilk/egui), pensado para
+**Arandu** (arquivo, em tupi) é um gerenciador de arquivos desktop para Linux,
+Windows e macOS, escrito em Rust com [egui](https://github.com/emilk/egui), pensado para
 ser customizável de ponta a ponta e servir tanto a desenvolvedores quanto a
 usuários avançados.
 
 ## Status
 
-🧠 **Fase de definição de escopo** — veja [SCOPE.md](SCOPE.md) para as decisões
-fechadas de arquitetura e o roadmap em três fases. Scaffold do workspace Cargo
-em andamento (`core`, `config`, `ui`, `git` e `index`).
+🚀 **v0.1.0 lançada** — todas as fases do roadmap entregues (navegação dual
+pane, operações com undo, previews multi-formato incluindo PDF, painel Git
+completo, quick-open fuzzy, tags, plugins Lua, temas/keymap). Veja
+[CHANGELOG.md](CHANGELOG.md).
 
-## Diferenciais planejados
+**📖 [Guia de como rodar](docs/GUIA.md)** — binários prontos para Linux,
+Windows e macOS, ou compile do código-fonte.
 
+## Funcionalidades
+
+- 🗂️ **Dual pane** com modos ícones/lista, virtualização para diretórios enormes
 - 🎨 **Temas e configuração declarativa em TOML** — keymap 100% redefinível,
   preset Vim opcional
-- 🌿 **Painel Git completo** — branches, staging visual, blame, log gráfico
-  (via [gitoxide](https://github.com/GitoxideLabs/gitoxide))
-- ⚡ **Indexação global de disco** com busca fuzzy (motor [nucleo](https://github.com/voitd/nucleo),
-  o mesmo do fzf)
+- 🌿 **Painel Git completo** — status, staging, commit, branches, stashes,
+  blame e log gráfico (via [gitoxide](https://github.com/GitoxideLabs/gitoxide))
+- ⚡ **Busca global** (Ctrl+P) com indexação em background e fuzzy estilo fzf
 - 👀 **Preview pane multi-formato** — texto com syntax highlight, imagens,
-  markdown, hex, CSV/JSON
-- 🗂️ **Dual pane** com modos ícones/lista/colunas e virtualização para
-  diretórios com centenas de milhares de arquivos
+  markdown, PDF, hex, CSV/JSON
+- 🔌 **API de plugins** Lua/Luau sandboxed
 
 ## Stack
 
@@ -36,17 +39,16 @@ em andamento (`core`, `config`, `ui`, `git` e `index`).
 | GUI | egui/eframe 0.37 |
 | Git | gix (gitoxide) |
 | Async | Tokio |
-| Indexação/busca | walkdir + notify + nucleo |
+| Indexação/busca | walkdir + fuzzy matcher próprio |
 | Config/temas | TOML + directories |
+| Plugins | mlua (Lua/Luau sandboxed) |
+| PDF | pdfrum |
 
 ## Roadmap
 
-1. **Fase 1 (MVP):** navegação dual pane, operações com fila/undo/lixeira,
-   previews de texto/imagem, temas e keymap
-2. **Fase 2:** painel Git completo, indexação global, visualizadores por tipo
-3. **Fase 3:** API de plugins, sync de config, macOS
-
-Detalhes em [SCOPE.md](SCOPE.md) e [ROADMAP.md](ROADMAP.md).
+✅ Fases 1–3 completas na v0.1.0. O histórico planejado está em
+[SCOPE.md](SCOPE.md) e [ROADMAP.md](ROADMAP.md); próximos passos são discutidos
+nas issues.
 
 ## Sincronizar configuração entre máquinas
 
@@ -69,8 +71,8 @@ extrair, e pacotes com caminhos absolutos ou `..` são rejeitados. Veja também
 
 ## Contribuindo
 
-Veja [CONTRIBUTING.md](CONTRIBUTING.md). O projeto está em fase de definição —
-issues de discussão sobre o escopo são muito bem-vindas.
+Veja [CONTRIBUTING.md](CONTRIBUTING.md). Issues e PRs são bem-vindos — o
+[guia](docs/GUIA.md) mostra como compilar e rodar.
 
 ## Licença
 

@@ -43,6 +43,7 @@ pub enum Action {
     Extract,
     ToggleViewMode,
     ToggleQuickOpen,
+    ToggleGitLog,
 }
 
 impl Action {
@@ -71,11 +72,12 @@ impl Action {
             Self::Extract => "extract",
             Self::ToggleViewMode => "toggle_view_mode",
             Self::ToggleQuickOpen => "toggle_quick_open",
+            Self::ToggleGitLog => "toggle_git_log",
         }
     }
 
     /// Todas as ações, na ordem canônica do arquivo.
-    pub const ALL: [Action; 22] = [
+    pub const ALL: [Action; 23] = [
         Self::TogglePreview,
         Self::ToggleGitPanel,
         Self::TogglePanel,
@@ -98,6 +100,7 @@ impl Action {
         Self::Extract,
         Self::ToggleViewMode,
         Self::ToggleQuickOpen,
+        Self::ToggleGitLog,
     ];
 
     /// Converte um nome `snake_case` em ação.
@@ -376,6 +379,14 @@ fn default_bindings(action: Action) -> Vec<KeyBinding> {
         // Um único atalho cicla lista -> ícones -> lista.
         Action::ToggleViewMode => vec![ctrl("1")],
         Action::ToggleQuickOpen => vec![ctrl("P")],
+        Action::ToggleGitLog => vec![KeyBinding::with_mods(
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Modifiers::NONE
+            },
+            "G",
+        )],
     }
 }
 
@@ -405,6 +416,14 @@ fn vim_bindings(action: Action) -> Vec<KeyBinding> {
         Action::Extract => vec![kb("F10")],
         Action::ToggleViewMode => vec![ctrl("1")],
         Action::ToggleQuickOpen => vec![ctrl("P")],
+        Action::ToggleGitLog => vec![KeyBinding::with_mods(
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Modifiers::NONE
+            },
+            "G",
+        )],
     }
 }
 

@@ -34,8 +34,8 @@ use arandu_core::preview::{
 };
 use arandu_core::queue::{OpQueue, QueueEvent, UndoStack};
 use arandu_git::{
-    BlameLine, CommitInfo, DEFAULT_BLAME_LINES, DEFAULT_LOG_LIMIT, FileStatus, GitStatus, Repo,
-    render_graph,
+    BlameLine, BranchInfo, CommitInfo, DEFAULT_BLAME_LINES, DEFAULT_LOG_LIMIT, FileStatus,
+    GitStatus, Repo, StashInfo, render_graph,
 };
 use arandu_index::{IndexEntry, IndexStore, Indexer};
 use eframe::egui::{
@@ -592,6 +592,29 @@ enum GitRefresh {
 type LogRefresh = (PathBuf, Result<Vec<CommitInfo>, String>);
 /// Resultado de uma consulta de blame: arquivo consultado + linhas.
 type BlameRefresh = (PathBuf, Result<Vec<BlameLine>, String>);
+/// Resultado de uma consulta de branches: diretório consultado + branches.
+type BranchesRefresh = (PathBuf, Result<Vec<BranchInfo>, String>);
+/// Resultado de uma consulta de stashes: diretório consultado + entradas.
+type StashesRefresh = (PathBuf, Result<Vec<StashInfo>, String>);
+
+/// Diálogo de criação de branch (N na aba Branches).
+struct BranchDialog {
+    name: String,
+    error: Option<String>,
+}
+
+/// Diálogo de stash push (S na aba Stashes).
+struct StashDialog {
+    message: String,
+    error: Option<String>,
+}
+
+/// Confirmação de uma ação destrutiva no painel Git.
+#[derive(Clone)]
+enum GitConfirm {
+    DeleteBranch(String),
+    PopStash(String),
+}
 
 /// Aba visível no painel Git.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -600,6 +623,8 @@ enum GitTab {
     Status,
     Log,
     Blame,
+    Branches,
+    Stashes,
 }
 
 impl GitTab {
@@ -608,7 +633,9 @@ impl GitTab {
         match self {
             Self::Status => Self::Log,
             Self::Log => Self::Blame,
-            Self::Blame => Self::Status,
+            Self::Blame => Self::Branches,
+            Self::Branches => Self::Stashes,
+            Self::Stashes => Self::Status,
         }
     }
 }
@@ -654,6 +681,30 @@ struct GitState {
     blame_receiver: Option<Receiver<BlameRefresh>>,
     /// O blame atingiu o limite de linhas.
     blame_truncated: bool,
+    /// Branches carregadas para a aba Branches.
+    branches: Vec<BranchInfo>,
+    /// Diretório dos dados de branches atuais (ou da requisição em voo).
+    branches_dir: Option<PathBuf>,
+    /// Erro ao carregar as branches.
+    branches_error: Option<String>,
+    /// Requisição de branches em andamento.
+    branches_receiver: Option<Receiver<BranchesRefresh>>,
+    /// Stashes carregados para a aba Stashes.
+    stashes: Vec<StashInfo>,
+    /// Diretório dos dados de stashes atuais (ou da requisição em voo).
+    stashes_dir: Option<PathBuf>,
+    /// Erro ao carregar os stashes.
+    stashes_error: Option<String>,
+    /// Requisição de stashes em andamento.
+    stashes_receiver: Option<Receiver<StashesRefresh>>,
+    /// Diálogo de criação de branch.
+    branch_dialog: Option<BranchDialog>,
+    /// Diálogo de stash push.
+    stash_dialog: Option<StashDialog>,
+    /// Confirmação pendente (excluir branch / aplicar stash).
+    confirm: Option<GitConfirm>,
+    /// Aviso modal de uma ação do painel Git.
+    notice: Option<String>,
     /// Mensagem de commit em edição.
     commit_message: String,
     /// Linha focada na lista (staged + modified + untracked, ou log).
@@ -890,6 +941,8 @@ impl AranduApp {
             || self.git.receiver.is_some()
             || self.git.log_receiver.is_some()
             || self.git.blame_receiver.is_some()
+            || self.git.branches_receiver.is_some()
+            || self.git.stashes_receiver.is_some()
         {
             ctx.request_repaint();
         }
@@ -1163,6 +1216,15 @@ impl AranduApp {
         if self.git.visible && self.git.commit_focused {
             return;
         }
+        // Diálogos do painel Git tratam Esc/Enter por conta própria.
+        if self.git.visible
+            && (self.git.branch_dialog.is_some()
+                || self.git.stash_dialog.is_some()
+                || self.git.confirm.is_some()
+                || self.git.notice.is_some())
+        {
+            return;
+        }
 
         let pressed = pressed_keys(ctx);
 
@@ -1231,6 +1293,7 @@ impl AranduApp {
             self.active = self.active.other();
         }
 
+        let mut git_consumed_delete = false;
         {
             let view_mode = self.active_panel().view_mode;
             // No modo ícones, as setas horizontais percorrem a grade. Como não
@@ -1285,6 +1348,74 @@ impl AranduApp {
                         }
                     }
                     GitTab::Blame => {}
+                    GitTab::Branches => {
+                        // Delete é do painel Git nesta aba, nunca dos arquivos.
+                        git_consumed_delete |= delete;
+                        if !self.git.branches.is_empty() {
+                            if up {
+                                self.git.focus = self.git.focus.saturating_sub(1);
+                            }
+                            if down {
+                                self.git.focus =
+                                    (self.git.focus + 1).min(self.git.branches.len() - 1);
+                            }
+                            let selected = self
+                                .git
+                                .branches
+                                .get(self.git.focus.min(self.git.branches.len() - 1))
+                                .cloned();
+                            if enter && let Some(branch) = &selected {
+                                self.git_checkout(&branch.name);
+                            }
+                            if let Some(branch) = &selected {
+                                if delete && !branch.current {
+                                    self.git.confirm =
+                                        Some(GitConfirm::DeleteBranch(branch.name.clone()));
+                                    git_consumed_delete = true;
+                                }
+                                let new_branch = ctx
+                                    .input_mut(|input| input.consume_key(Modifiers::NONE, Key::N));
+                                if new_branch {
+                                    self.git.branch_dialog = Some(BranchDialog {
+                                        name: String::new(),
+                                        error: None,
+                                    });
+                                }
+                                git_navigated = up || down || enter || delete || new_branch;
+                            }
+                        }
+                    }
+                    GitTab::Stashes => {
+                        // Delete não exclui arquivos quando a aba Stashes está ativa.
+                        git_consumed_delete = delete;
+                        git_navigated = delete;
+                        if !self.git.stashes.is_empty() {
+                            if up {
+                                self.git.focus = self.git.focus.saturating_sub(1);
+                            }
+                            if down {
+                                self.git.focus =
+                                    (self.git.focus + 1).min(self.git.stashes.len() - 1);
+                            }
+                            let selected = self
+                                .git
+                                .stashes
+                                .get(self.git.focus.min(self.git.stashes.len() - 1))
+                                .cloned();
+                            if enter && let Some(stash) = &selected {
+                                self.git.confirm = Some(GitConfirm::PopStash(stash.id.clone()));
+                            }
+                            let stash_push =
+                                ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::S));
+                            if stash_push {
+                                self.git.stash_dialog = Some(StashDialog {
+                                    message: String::new(),
+                                    error: None,
+                                });
+                            }
+                            git_navigated = up || down || enter || stash_push || delete;
+                        }
+                    }
                 }
             }
 
@@ -1342,7 +1473,7 @@ impl AranduApp {
         if extract {
             self.start_extract();
         }
-        if delete {
+        if delete && !git_consumed_delete {
             self.request_delete();
         }
         if undo {
@@ -1874,6 +2005,66 @@ impl AranduApp {
         });
     }
 
+    /// Dispara a consulta de branches se a aba Branches estiver ativa.
+    fn request_git_branches(&mut self, force: bool) {
+        if self.git.tab != GitTab::Branches {
+            return;
+        }
+        let dir = self.git_target_dir();
+        if force {
+            self.git.branches_receiver = None;
+            self.git.branches_dir = None;
+            self.git.branches_error = None;
+        }
+        if self.git.branches_receiver.is_some() {
+            return;
+        }
+        if !force && self.git.branches_dir.as_deref() == Some(dir.as_path()) {
+            return;
+        }
+
+        self.git.branches_dir = Some(dir.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.git.branches_receiver = Some(receiver);
+        std::thread::spawn(move || {
+            let result = match Repo::discover(&dir) {
+                None => Err("not a git repository".to_string()),
+                Some(repo) => repo.branches().map_err(|error| error.to_string()),
+            };
+            let _ = sender.send((dir, result));
+        });
+    }
+
+    /// Dispara a consulta de stashes se a aba Stashes estiver ativa.
+    fn request_git_stashes(&mut self, force: bool) {
+        if self.git.tab != GitTab::Stashes {
+            return;
+        }
+        let dir = self.git_target_dir();
+        if force {
+            self.git.stashes_receiver = None;
+            self.git.stashes_dir = None;
+            self.git.stashes_error = None;
+        }
+        if self.git.stashes_receiver.is_some() {
+            return;
+        }
+        if !force && self.git.stashes_dir.as_deref() == Some(dir.as_path()) {
+            return;
+        }
+
+        self.git.stashes_dir = Some(dir.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.git.stashes_receiver = Some(receiver);
+        std::thread::spawn(move || {
+            let result = match Repo::discover(&dir) {
+                None => Err("not a git repository".to_string()),
+                Some(repo) => repo.stashes().map_err(|error| error.to_string()),
+            };
+            let _ = sender.send((dir, result));
+        });
+    }
+
     /// Dispara (se necessário) uma consulta de status em background.
     ///
     /// `force` ignora o intervalo de 10 s e reinicia uma consulta em voo —
@@ -1884,6 +2075,8 @@ impl AranduApp {
         }
         self.request_git_log(force);
         self.request_git_blame(force);
+        self.request_git_branches(force);
+        self.request_git_stashes(force);
         let dir = self.git_target_dir();
         if force {
             // A thread antiga termina sozinha; o `send` falha no canal órfão.
@@ -1924,6 +2117,8 @@ impl AranduApp {
     fn pump_git(&mut self) {
         self.pump_git_log();
         self.pump_git_blame();
+        self.pump_git_branches();
+        self.pump_git_stashes();
         let Some(receiver) = self.git.receiver.as_ref() else {
             return;
         };
@@ -2032,6 +2227,70 @@ impl AranduApp {
         }
     }
 
+    /// Drena o resultado da consulta de branches em background.
+    fn pump_git_branches(&mut self) {
+        let Some(receiver) = self.git.branches_receiver.as_ref() else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.git.branches_receiver = None;
+                return;
+            }
+        };
+        self.git.branches_receiver = None;
+        let (dir, result) = result;
+        if self.git_target_dir() != dir {
+            return;
+        }
+        self.git.branches_dir = Some(dir);
+        match result {
+            Ok(branches) => {
+                self.git.focus = self.git.focus.min(branches.len().saturating_sub(1));
+                self.git.branches = branches;
+                self.git.branches_error = None;
+            }
+            Err(error) => {
+                self.git.branches.clear();
+                self.git.branches_error = Some(error);
+            }
+        }
+    }
+
+    /// Drena o resultado da consulta de stashes em background.
+    fn pump_git_stashes(&mut self) {
+        let Some(receiver) = self.git.stashes_receiver.as_ref() else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.git.stashes_receiver = None;
+                return;
+            }
+        };
+        self.git.stashes_receiver = None;
+        let (dir, result) = result;
+        if self.git_target_dir() != dir {
+            return;
+        }
+        self.git.stashes_dir = Some(dir);
+        match result {
+            Ok(stashes) => {
+                self.git.focus = self.git.focus.min(stashes.len().saturating_sub(1));
+                self.git.stashes = stashes;
+                self.git.stashes_error = None;
+            }
+            Err(error) => {
+                self.git.stashes.clear();
+                self.git.stashes_error = Some(error);
+            }
+        }
+    }
+
     /// Linhas do painel Git na ordem exibida: `(staged?, caminho absoluto)`.
     fn git_rows(&self) -> Vec<(bool, PathBuf)> {
         let (Some(status), Some(root)) = (&self.git.status, &self.git.root) else {
@@ -2093,6 +2352,88 @@ impl AranduApp {
                 self.request_git_refresh(true);
             }
             Err(error) => self.git.action_error = Some(error.to_string()),
+        }
+    }
+
+    /// Faz checkout da branch selecionada e recarrega o painel.
+    fn git_checkout(&mut self, name: &str) {
+        let dir = self.git_target_dir();
+        let Some(repo) = Repo::discover(&dir) else {
+            self.git.not_repo = true;
+            self.git.status = None;
+            return;
+        };
+        match repo.checkout(name) {
+            Ok(()) => {
+                self.git.notice = None;
+                self.reload_dir(&dir);
+                self.request_git_refresh(true);
+            }
+            Err(error) => self.git.notice = Some(error.to_string()),
+        }
+    }
+
+    /// Cria uma branch no HEAD atual. Retorna o erro para o diálogo exibir.
+    fn git_create_branch(&mut self, name: &str) -> Result<(), String> {
+        let dir = self.git_target_dir();
+        let Some(repo) = Repo::discover(&dir) else {
+            self.git.not_repo = true;
+            self.git.status = None;
+            return Err("not a git repository".to_string());
+        };
+        repo.create_branch(name)
+            .map_err(|error| error.to_string())?;
+        self.request_git_refresh(true);
+        Ok(())
+    }
+
+    /// Exclui uma branch e recarrega a lista.
+    fn git_delete_branch(&mut self, name: &str) -> Result<(), String> {
+        let dir = self.git_target_dir();
+        let Some(repo) = Repo::discover(&dir) else {
+            self.git.not_repo = true;
+            self.git.status = None;
+            return Err("not a git repository".to_string());
+        };
+        repo.delete_branch(name)
+            .map_err(|error| error.to_string())?;
+        self.request_git_refresh(true);
+        Ok(())
+    }
+
+    /// Guarda as mudanças atuais num stash.
+    fn git_stash_push(&mut self, message: &str) {
+        let dir = self.git_target_dir();
+        let Some(repo) = Repo::discover(&dir) else {
+            self.git.not_repo = true;
+            self.git.status = None;
+            return;
+        };
+        match repo.stash_push(message) {
+            Ok(()) => {
+                self.git.notice = None;
+                self.reload_dir(&dir);
+                self.request_git_refresh(true);
+            }
+            Err(error) => self.git.notice = Some(error.to_string()),
+        }
+    }
+
+    /// Reaplica o stash indicado e o remove da pilha.
+    fn git_stash_pop(&mut self, id: &str) {
+        let dir = self.git_target_dir();
+        let Some(repo) = Repo::discover(&dir) else {
+            self.git.not_repo = true;
+            self.git.status = None;
+            return;
+        };
+        match repo.stash_pop(id) {
+            Ok(()) => {
+                self.git.notice = None;
+                self.reload_dir(&dir);
+                self.request_git_refresh(true);
+            }
+            Err(error) => self.git.notice = Some(error.to_string()),
         }
     }
 
@@ -2630,6 +2971,14 @@ impl AranduApp {
                         (GitTab::Status, rust_i18n::t!("git_tab_status").into_owned()),
                         (GitTab::Log, rust_i18n::t!("git_tab_log").into_owned()),
                         (GitTab::Blame, rust_i18n::t!("git_tab_blame").into_owned()),
+                        (
+                            GitTab::Branches,
+                            rust_i18n::t!("git_tab_branches").into_owned(),
+                        ),
+                        (
+                            GitTab::Stashes,
+                            rust_i18n::t!("git_tab_stashes").into_owned(),
+                        ),
                     ];
                     for (tab, label) in tabs {
                         let response = ui
@@ -2705,6 +3054,8 @@ impl AranduApp {
             GitTab::Status => self.draw_git_status_body(ui, body, visuals),
             GitTab::Log => self.draw_git_log_body(ui, body, visuals),
             GitTab::Blame => self.draw_git_blame_body(ui, body, visuals),
+            GitTab::Branches => self.draw_git_branches_body(ui, body, visuals),
+            GitTab::Stashes => self.draw_git_stashes_body(ui, body, visuals),
         }
     }
 
@@ -2881,6 +3232,121 @@ impl AranduApp {
                                 "{graph:<6} {} {:<44} {:<12} {}",
                                 commit.id, commit.message, commit.author, commit.time
                             );
+                            let mut rich = RichText::new(text).monospace().size(11.5);
+                            if focused_panel && index == focus {
+                                rich = rich.strong().color(visuals.strong_text_color());
+                            }
+                            let response =
+                                ui.add(Label::new(rich).truncate().sense(Sense::click()));
+                            if response.clicked() {
+                                clicked = Some(index);
+                            }
+                        }
+                    });
+            },
+        );
+
+        if let Some(index) = clicked {
+            self.git.focus = index;
+            self.git.focused = true;
+        }
+    }
+
+    /// Aba Branches: branches locais, com a atual marcada.
+    fn draw_git_branches_body(&mut self, ui: &mut Ui, body: Rect, visuals: &egui::Visuals) {
+        if let Some(error) = self.git.branches_error.clone() {
+            draw_preview_centered(ui, body, error, visuals);
+            return;
+        }
+        if self.git.branches.is_empty() {
+            let message = if self.git.branches_receiver.is_some() {
+                rust_i18n::t!("git_loading")
+            } else {
+                rust_i18n::t!("git_branches_empty")
+            };
+            draw_preview_centered(ui, body, message, visuals);
+            return;
+        }
+
+        const BRANCH_ROW_H: f32 = 20.0;
+        let rows = self.git.branches.len();
+        let focus = self.git.focus;
+        let focused_panel = self.git.focused;
+        let mut clicked = None;
+
+        ui.scope_builder(
+            UiBuilder::new().max_rect(body.shrink2(vec2(6.0, 4.0))),
+            |ui| {
+                ui.label(
+                    RichText::new(rust_i18n::t!("git_branches_hint"))
+                        .small()
+                        .color(visuals.weak_text_color()),
+                );
+                ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show_rows(ui, BRANCH_ROW_H, rows, |ui, range| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for index in range {
+                            let branch = &self.git.branches[index];
+                            let marker = if branch.current { "●" } else { " " };
+                            let text = format!("{marker} {:<28} {}", branch.name, branch.commit);
+                            let mut rich = RichText::new(text).monospace().size(11.5);
+                            if focused_panel && index == focus {
+                                rich = rich.strong().color(visuals.strong_text_color());
+                            }
+                            let response =
+                                ui.add(Label::new(rich).truncate().sense(Sense::click()));
+                            if response.clicked() {
+                                clicked = Some(index);
+                            }
+                        }
+                    });
+            },
+        );
+
+        if let Some(index) = clicked {
+            self.git.focus = index;
+            self.git.focused = true;
+        }
+    }
+
+    /// Aba Stashes: pilha de stashes, do mais recente para o mais antigo.
+    fn draw_git_stashes_body(&mut self, ui: &mut Ui, body: Rect, visuals: &egui::Visuals) {
+        if let Some(error) = self.git.stashes_error.clone() {
+            draw_preview_centered(ui, body, error, visuals);
+            return;
+        }
+        if self.git.stashes.is_empty() {
+            let message = if self.git.stashes_receiver.is_some() {
+                rust_i18n::t!("git_loading")
+            } else {
+                rust_i18n::t!("git_stashes_empty")
+            };
+            draw_preview_centered(ui, body, message, visuals);
+            return;
+        }
+
+        const STASH_ROW_H: f32 = 20.0;
+        let rows = self.git.stashes.len();
+        let focus = self.git.focus;
+        let focused_panel = self.git.focused;
+        let mut clicked = None;
+
+        ui.scope_builder(
+            UiBuilder::new().max_rect(body.shrink2(vec2(6.0, 4.0))),
+            |ui| {
+                ui.label(
+                    RichText::new(rust_i18n::t!("git_stashes_hint"))
+                        .small()
+                        .color(visuals.weak_text_color()),
+                );
+                ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show_rows(ui, STASH_ROW_H, rows, |ui, range| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for index in range {
+                            let stash = &self.git.stashes[index];
+                            let text = format!("{} {:<40} {}", stash.id, stash.message, stash.time);
                             let mut rich = RichText::new(text).monospace().size(11.5);
                             if focused_panel && index == focus {
                                 rich = rich.strong().color(visuals.strong_text_color());
@@ -3806,6 +4272,173 @@ impl AranduApp {
                 self.apply_batch_rename(pairs);
             } else if !cancel {
                 self.batch_rename = Some(dialog);
+            }
+        }
+
+        if let Some(mut dialog) = self.git.branch_dialog.take() {
+            let mut submit = false;
+            let mut cancel = false;
+            egui::Modal::new(egui::Id::unique("git-branch-dialog")).show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                ui.heading(rust_i18n::t!("git_branch_new_title"));
+                ui.add_space(6.0);
+                ui.label(rust_i18n::t!("git_branch_new_label"));
+                let response = ui
+                    .add(egui::TextEdit::singleline(&mut dialog.name).desired_width(f32::INFINITY));
+                if !response.has_focus() {
+                    response.request_focus();
+                }
+                if let Some(error) = &dialog.error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+                if ui.input(|input| input.key_pressed(Key::Enter)) {
+                    submit = true;
+                }
+                if ui.input(|input| input.key_pressed(Key::Escape)) {
+                    cancel = true;
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button(rust_i18n::t!("git_branch_create")).clicked() {
+                        submit = true;
+                    }
+                    if ui.button(rust_i18n::t!("cancel")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+            if submit {
+                let name = dialog.name.trim().to_owned();
+                if name.is_empty() {
+                    dialog.error = Some(rust_i18n::t!("git_branch_name_empty").to_string());
+                    self.git.branch_dialog = Some(dialog);
+                } else if let Err(error) = self.git_create_branch(&name) {
+                    dialog.error = Some(error);
+                    self.git.branch_dialog = Some(dialog);
+                }
+            } else if !cancel {
+                self.git.branch_dialog = Some(dialog);
+            }
+        }
+
+        if let Some(mut dialog) = self.git.stash_dialog.take() {
+            let mut submit = false;
+            let mut cancel = false;
+            egui::Modal::new(egui::Id::unique("git-stash-dialog")).show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                ui.heading(rust_i18n::t!("git_stash_push_title"));
+                ui.add_space(6.0);
+                ui.label(rust_i18n::t!("git_stash_push_label"));
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut dialog.message)
+                        .hint_text(rust_i18n::t!("git_stash_push_placeholder"))
+                        .desired_width(f32::INFINITY),
+                );
+                if !response.has_focus() {
+                    response.request_focus();
+                }
+                if let Some(error) = &dialog.error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+                if ui.input(|input| input.key_pressed(Key::Enter)) {
+                    submit = true;
+                }
+                if ui.input(|input| input.key_pressed(Key::Escape)) {
+                    cancel = true;
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button(rust_i18n::t!("git_stash_push_ok")).clicked() {
+                        submit = true;
+                    }
+                    if ui.button(rust_i18n::t!("cancel")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+            if submit {
+                let message = dialog.message.trim().to_owned();
+                if message.is_empty() {
+                    dialog.error = Some(rust_i18n::t!("git_stash_message_empty").to_string());
+                    self.git.stash_dialog = Some(dialog);
+                } else {
+                    self.git_stash_push(&message);
+                }
+            } else if !cancel {
+                self.git.stash_dialog = Some(dialog);
+            }
+        }
+
+        if let Some(pending) = self.git.confirm.clone() {
+            let mut confirm = false;
+            let mut cancel = false;
+            egui::Modal::new(egui::Id::unique("git-action-confirm")).show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                match &pending {
+                    GitConfirm::DeleteBranch(name) => {
+                        ui.heading(rust_i18n::t!("git_branch_delete_title"));
+                        ui.add_space(6.0);
+                        ui.label(rust_i18n::t!(
+                            "git_branch_delete_body",
+                            name = name.as_str()
+                        ));
+                    }
+                    GitConfirm::PopStash(id) => {
+                        ui.heading(rust_i18n::t!("git_stash_pop_title"));
+                        ui.add_space(6.0);
+                        ui.label(rust_i18n::t!("git_stash_pop_body", id = id.as_str()));
+                    }
+                }
+                if ui.input(|input| input.key_pressed(Key::Escape)) {
+                    cancel = true;
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button(rust_i18n::t!("delete_confirm_ok")).clicked() {
+                        confirm = true;
+                    }
+                    if ui.button(rust_i18n::t!("cancel")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+            if confirm {
+                self.git.confirm = None;
+                match pending {
+                    GitConfirm::DeleteBranch(name) => {
+                        if let Err(error) = self.git_delete_branch(&name) {
+                            self.git.notice = Some(error);
+                        }
+                    }
+                    GitConfirm::PopStash(id) => self.git_stash_pop(&id),
+                }
+            } else if cancel {
+                self.git.confirm = None;
+            }
+        }
+
+        if let Some(notice) = self.git.notice.clone() {
+            let mut close = false;
+            egui::Modal::new(egui::Id::unique("git-notice")).show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                ui.heading(rust_i18n::t!("git_action_failed"));
+                ui.add_space(6.0);
+                ui.label(notice);
+                if ui.input(|input| input.key_pressed(Key::Escape)) {
+                    close = true;
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button(rust_i18n::t!("git_action_ok")).clicked() {
+                        close = true;
+                    }
+                });
+            });
+            if close {
+                self.git.notice = None;
             }
         }
     }
@@ -5322,7 +5955,13 @@ mod tests {
         harness.state_mut().git.focused = true;
         assert_eq!(harness.state().git.tab, GitTab::Status);
 
-        for expected in [GitTab::Log, GitTab::Blame, GitTab::Status] {
+        for expected in [
+            GitTab::Log,
+            GitTab::Blame,
+            GitTab::Branches,
+            GitTab::Stashes,
+            GitTab::Status,
+        ] {
             harness.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Tab);
             harness.run_steps(1);
             assert_eq!(harness.state().git.tab, expected);
@@ -5377,6 +6016,168 @@ mod tests {
         assert!(
             harness.query_all_by_label(&expected).count() >= 1,
             "linha do log não apareceu na árvore de acessibilidade: {expected:?}"
+        );
+    }
+
+    /// Abre o painel Git e espera o primeiro status assíncrono.
+    fn open_git_panel(harness: &mut Harness<'_, AranduApp>) {
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::G);
+        harness.run_steps(1);
+        for _ in 0..200 {
+            if harness.state().git.status.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run_steps(1);
+        }
+        assert!(harness.state().git.status.is_some(), "status não carregou");
+    }
+
+    #[test]
+    fn git_branches_tab_lists_current_branch() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        init_git_repo(dir.path());
+        fs::write(dir.path().join("a.txt"), b"a").expect("escreve arquivo");
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "inicial"]);
+        run_git(dir.path(), &["branch", "feature"]);
+
+        let app = AranduApp::new_at(Config::default(), dir.path());
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        open_git_panel(&mut harness);
+
+        harness.state_mut().git.tab = GitTab::Branches;
+        harness.state_mut().git.focus = 0;
+        for _ in 0..200 {
+            if harness.state().git.branches.len() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run_steps(1);
+        }
+
+        let git = &harness.state().git;
+        assert_eq!(git.tab, GitTab::Branches);
+        assert_eq!(git.branches.len(), 2, "deveria listar main e feature");
+        let main = git
+            .branches
+            .iter()
+            .find(|branch| branch.name == "main")
+            .expect("branch main");
+        assert!(main.current);
+        let text = format!("● {:<28} {}", main.name, main.commit);
+        assert!(
+            harness.query_all_by_label(&text).count() >= 1,
+            "linha da branch não apareceu: {text:?}"
+        );
+    }
+
+    #[test]
+    fn git_create_branch_via_modal() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        init_git_repo(dir.path());
+        fs::write(dir.path().join("a.txt"), b"a").expect("escreve arquivo");
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "inicial"]);
+
+        let app = AranduApp::new_at(Config::default(), dir.path());
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        open_git_panel(&mut harness);
+
+        harness.state_mut().git.tab = GitTab::Branches;
+        harness.state_mut().git.focused = true;
+        for _ in 0..200 {
+            if !harness.state().git.branches.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run_steps(1);
+        }
+        assert!(!harness.state().git.branches.is_empty());
+
+        harness.key_press(egui::Key::N);
+        harness.run_steps(1);
+        assert!(
+            harness.state().git.branch_dialog.is_some(),
+            "N deveria abrir o diálogo de nova branch"
+        );
+
+        harness
+            .state_mut()
+            .git
+            .branch_dialog
+            .as_mut()
+            .expect("diálogo aberto")
+            .name = "nova".to_string();
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(1);
+
+        for _ in 0..200 {
+            if harness
+                .state()
+                .git
+                .branches
+                .iter()
+                .any(|branch| branch.name == "nova")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run_steps(1);
+        }
+        assert!(harness.state().git.branch_dialog.is_none());
+        assert!(
+            harness
+                .state()
+                .git
+                .branches
+                .iter()
+                .any(|branch| branch.name == "nova"),
+            "a branch nova deveria aparecer na lista"
+        );
+    }
+
+    #[test]
+    fn git_stashes_tab_lists_entries() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        init_git_repo(dir.path());
+        fs::write(dir.path().join("a.txt"), b"a").expect("escreve arquivo");
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "inicial"]);
+        fs::write(dir.path().join("a.txt"), b"alterado").expect("altera arquivo");
+        run_git(dir.path(), &["stash", "push", "-m", "teste de stash"]);
+
+        let app = AranduApp::new_at(Config::default(), dir.path());
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        open_git_panel(&mut harness);
+
+        harness.state_mut().git.tab = GitTab::Stashes;
+        harness.state_mut().git.focus = 0;
+        for _ in 0..200 {
+            if harness.state().git.stashes.len() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run_steps(1);
+        }
+
+        let git = &harness.state().git;
+        assert_eq!(git.tab, GitTab::Stashes);
+        assert_eq!(git.stashes.len(), 1, "deveria listar um stash");
+        let stash = &git.stashes[0];
+        let text = format!("{} {:<40} {}", stash.id, stash.message, stash.time);
+        assert!(
+            harness.query_all_by_label(&text).count() >= 1,
+            "linha do stash não apareceu: {text:?}"
         );
     }
 

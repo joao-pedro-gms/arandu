@@ -2,8 +2,8 @@
 //!
 //! Este crate expõe a primeira fatia da integração Git: descoberta de
 //! repositório, leitura de status, staging/unstaging e criação de commits.
-//! Tudo é implementado com [`gix`] (gitoxide), sem depender do binário `git`
-//! em tempo de execução.
+//! Quase tudo é implementado com [`gix`] (gitoxide); a exceção é o stash, que
+//! usa o binário `git` em tempo de execução (ver abaixo).
 //!
 //! # Decisões e trade-offs
 //!
@@ -34,11 +34,22 @@
 //!   alteradas apenas no worktree não aparecem: o blame reflete o conteúdo
 //!   commitado, não o arquivo em disco. Isso mantém a operação barata e
 //!   determinística.
+//! - Branches são listadas e manipuladas com o ref store do gix. A listagem
+//!   cobre apenas branches locais (`refs/heads/`): incluir refs remote-tracking
+//!   exigiria decidir se o checkout cria ou não uma branch local de
+//!   acompanhamento, e essa ambiguidade não cabe na interface atual.
+//! - Stash é a única operação que recorre ao binário `git`. O gix 0.90 não
+//!   expõe API de stash, e o formato envolve commits de worktree/index e um
+//!   reflog próprio cuja reaplicação é um merge — reimplementar isso seria
+//!   arriscado e incompatível com `git stash`. Usar o binário mantém os stashes
+//!   interoperáveis com o Git; o restante do crate continua 100% gix.
 //! - Datas são formatadas em `YYYY-MM-DD HH:MM` no fuso gravado no commit
 //!   (o mesmo que `git log --date=local` mostraria para o autor).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gix::bstr::{BStr, BString, ByteSlice};
@@ -79,6 +90,27 @@ pub enum GitError {
     /// Não há mudanças staged para commitar.
     #[error("nada staged para commitar")]
     NothingStaged,
+    /// O nome de branch informado é inválido.
+    #[error("nome de branch inválido: {0}")]
+    InvalidBranchName(String),
+    /// A branch informada não existe.
+    #[error("branch não encontrada: {0}")]
+    BranchNotFound(String),
+    /// Já existe uma branch com o nome informado.
+    #[error("branch já existe: {0}")]
+    BranchAlreadyExists(String),
+    /// A operação não é permitida na branch atual.
+    #[error("não é possível excluir a branch atual: {0}")]
+    CurrentBranch(String),
+    /// Há mudanças staged ou modificadas que seriam sobrescritas.
+    #[error("há mudanças não commitadas; faça commit ou guarde um stash antes de trocar de branch")]
+    DirtyWorktree,
+    /// Não há mudanças para guardar no stash.
+    #[error("nada para guardar no stash")]
+    NothingToStash,
+    /// O stash informado não existe.
+    #[error("stash não encontrado: {0}")]
+    StashNotFound(String),
     /// Alguma operação do gix falhou.
     #[error("erro git: {0}")]
     Gix(String),
@@ -168,6 +200,28 @@ pub struct BlameLine {
     pub time: String,
     /// Conteúdo da linha, sem o terminador.
     pub content: String,
+}
+
+/// Uma branch local do repositório.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchInfo {
+    /// Nome curto da branch (ex.: `main`).
+    pub name: String,
+    /// `true` quando é a branch apontada por `HEAD`.
+    pub current: bool,
+    /// Id curto (8 caracteres hexadecimais) do commit apontado.
+    pub commit: String,
+}
+
+/// Uma entrada da pilha de stash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StashInfo {
+    /// Id curto (8 caracteres hexadecimais) do commit de stash.
+    pub id: String,
+    /// Mensagem descritiva (`git stash list`).
+    pub message: String,
+    /// Data em `YYYY-MM-DD HH:MM`.
+    pub time: String,
 }
 
 /// Um repositório Git aberto.
@@ -522,6 +576,299 @@ impl Repo {
         Ok(lines)
     }
 
+    /// Lista as branches locais, com a atual marcada.
+    ///
+    /// Refs remote-tracking não são incluídas; veja a documentação do módulo.
+    pub fn branches(&self) -> Result<Vec<BranchInfo>, GitError> {
+        let current = self
+            .inner
+            .head()
+            .ok()
+            .and_then(|head| head.referent_name().map(|name| name.shorten().to_string()));
+
+        let mut branches = Vec::new();
+        let references = self.inner.references().map_err(gix_err)?;
+        let iter = references
+            .local_branches()
+            .map_err(gix_err)?
+            .peeled()
+            .map_err(gix_err)?;
+        for reference in iter {
+            let reference = reference.map_err(gix_err)?;
+            let Some(id) = reference.try_id() else {
+                continue;
+            };
+            let name = reference.name().shorten().to_string();
+            branches.push(BranchInfo {
+                current: current.as_deref() == Some(name.as_str()),
+                name,
+                commit: short_id(id.detach()),
+            });
+        }
+        branches.sort_by(|a, b| b.current.cmp(&a.current).then_with(|| a.name.cmp(&b.name)));
+        Ok(branches)
+    }
+
+    /// Troca `HEAD` para a branch local `name` e atualiza o worktree.
+    ///
+    /// Retorna [`GitError::DirtyWorktree`] se houver mudanças staged ou
+    /// modificadas; arquivos não rastreados não bloqueiam a troca (como no
+    /// `git checkout`, eles permanecem no worktree).
+    pub fn checkout(&self, name: &str) -> Result<(), GitError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(GitError::BranchNotFound(name.to_string()));
+        }
+        if self
+            .inner
+            .head()
+            .ok()
+            .and_then(|head| head.referent_name().map(|name| name.shorten().to_string()))
+            .as_deref()
+            == Some(name)
+        {
+            return Ok(());
+        }
+
+        let status = self.status()?;
+        if !status.staged.is_empty() || !status.modified.is_empty() {
+            return Err(GitError::DirtyWorktree);
+        }
+
+        let full_name = format!("refs/heads/{name}");
+        let reference = self
+            .inner
+            .find_reference(full_name.as_str())
+            .map_err(|_| GitError::BranchNotFound(name.to_string()))?;
+        let commit_id = reference
+            .try_id()
+            .ok_or_else(|| GitError::BranchNotFound(name.to_string()))?
+            .detach();
+        let commit = self.inner.find_commit(commit_id).map_err(gix_err)?;
+        let tree_id = commit.tree_id().map_err(gix_err)?.detach();
+
+        let old_index = self.load_index()?;
+        let old_paths: Vec<PathBuf> = old_index
+            .entries_with_paths_by_filter_map(|path, _| Some(to_path(path)))
+            .map(|(_, path)| path)
+            .collect();
+        let mut index = self.inner.index_from_tree(&tree_id).map_err(gix_err)?;
+        let new_paths: HashSet<PathBuf> = index
+            .entries_with_paths_by_filter_map(|path, _| Some(to_path(path)))
+            .map(|(_, path)| path)
+            .collect();
+
+        // Arquivos rastreados que não existem na árvore de destino precisam
+        // sair do disco: o checkout de baixo nível só escreve o que está no
+        // index.
+        for path in old_paths {
+            if new_paths.contains(&path) {
+                continue;
+            }
+            match std::fs::remove_file(self.root.join(&path)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(GitError::Io(error)),
+            }
+        }
+
+        let mut options = self
+            .inner
+            .checkout_options(gix::worktree::stack::state::attributes::Source::IdMapping)
+            .map_err(gix_err)?;
+        options.overwrite_existing = true;
+        let should_interrupt = AtomicBool::new(false);
+        gix::worktree::state::checkout(
+            &mut index,
+            self.root.clone(),
+            self.inner.objects.clone(),
+            &gix::progress::Discard,
+            &gix::progress::Discard,
+            &should_interrupt,
+            options,
+        )
+        .map_err(gix_err)?;
+
+        self.write_index(&mut index)?;
+
+        use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+        let head_name = gix::refs::FullName::try_from("HEAD")
+            .map_err(|error| GitError::Gix(error.to_string()))?;
+        let target = gix::refs::FullName::try_from(full_name)
+            .map_err(|error| GitError::InvalidBranchName(error.to_string()))?;
+        self.inner
+            .edit_reference(RefEdit {
+                change: Change::Update {
+                    log: LogChange {
+                        mode: RefLog::AndReference,
+                        force_create_reflog: false,
+                        message: format!("checkout: moving to {name}").into(),
+                    },
+                    expected: PreviousValue::Any,
+                    new: gix::refs::Target::Symbolic(target),
+                },
+                name: head_name,
+                deref: false,
+            })
+            .map_err(gix_err)?;
+        Ok(())
+    }
+
+    /// Cria uma branch local apontando para o commit atual de `HEAD`.
+    ///
+    /// A branch criada não é ativada; use [`Repo::checkout`] em seguida.
+    pub fn create_branch(&self, name: &str) -> Result<(), GitError> {
+        let name = validate_branch_name(name)?;
+        let full_name = format!("refs/heads/{name}");
+        if self.inner.find_reference(full_name.as_str()).is_ok() {
+            return Err(GitError::BranchAlreadyExists(name.to_string()));
+        }
+        let mut head = self.inner.head().map_err(gix_err)?;
+        if head.is_unborn() {
+            return Err(GitError::Gix(
+                "não há commit em HEAD para apontar a nova branch".into(),
+            ));
+        }
+        let commit = head.peel_to_commit().map_err(gix_err)?.id().detach();
+
+        use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
+        let ref_name = gix::refs::FullName::try_from(full_name)
+            .map_err(|error| GitError::InvalidBranchName(error.to_string()))?;
+        self.inner
+            .edit_reference(RefEdit {
+                change: Change::Update {
+                    log: LogChange {
+                        mode: RefLog::AndReference,
+                        force_create_reflog: false,
+                        message: format!("branch: created from HEAD ({name})").into(),
+                    },
+                    expected: PreviousValue::MustNotExist,
+                    new: gix::refs::Target::Object(commit),
+                },
+                name: ref_name,
+                deref: false,
+            })
+            .map_err(gix_err)?;
+        Ok(())
+    }
+
+    /// Exclui a branch local `name`.
+    ///
+    /// Retorna [`GitError::CurrentBranch`] se for a branch apontada por
+    /// `HEAD`; a exclusão de branches com commits não mesclados é permitida
+    /// (equivalente a `git branch -D`), pois a interface pede confirmação.
+    pub fn delete_branch(&self, name: &str) -> Result<(), GitError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(GitError::BranchNotFound(name.to_string()));
+        }
+        let current = self
+            .inner
+            .head()
+            .ok()
+            .and_then(|head| head.referent_name().map(|name| name.shorten().to_string()));
+        if current.as_deref() == Some(name) {
+            return Err(GitError::CurrentBranch(name.to_string()));
+        }
+        let full_name = format!("refs/heads/{name}");
+        if self.inner.find_reference(full_name.as_str()).is_err() {
+            return Err(GitError::BranchNotFound(name.to_string()));
+        }
+
+        use gix::refs::transaction::{Change, PreviousValue, RefEdit, RefLog};
+        let ref_name = gix::refs::FullName::try_from(full_name)
+            .map_err(|error| GitError::InvalidBranchName(error.to_string()))?;
+        self.inner
+            .edit_reference(RefEdit {
+                change: Change::Delete {
+                    expected: PreviousValue::MustExist,
+                    log: RefLog::AndReference,
+                },
+                name: ref_name,
+                deref: false,
+            })
+            .map_err(gix_err)?;
+        Ok(())
+    }
+
+    /// Lista a pilha de stash, da entrada mais recente para a mais antiga.
+    ///
+    /// Lê o reflog de `refs/stash` através do binário `git`; veja a
+    /// documentação do módulo para a justificativa.
+    pub fn stashes(&self) -> Result<Vec<StashInfo>, GitError> {
+        let output = self.run_git(&["stash", "list", "--format=%H%x00%gs%x00%ci"])?;
+        let mut stashes = Vec::new();
+        for line in output.lines().filter(|line| !line.trim().is_empty()) {
+            let mut fields = line.split('\0');
+            let hash = fields.next().unwrap_or_default().trim();
+            let message = fields.next().unwrap_or_default().trim();
+            let date = fields.next().unwrap_or_default().trim();
+            if hash.is_empty() {
+                continue;
+            }
+            stashes.push(StashInfo {
+                id: hash.chars().take(8).collect(),
+                message: message.to_string(),
+                time: date.chars().take(16).collect(),
+            });
+        }
+        Ok(stashes)
+    }
+
+    /// Guarda as mudanças atuais (incluindo arquivos não rastreados) em um
+    /// stash e limpa o worktree.
+    pub fn stash_push(&self, message: &str) -> Result<(), GitError> {
+        if self.status()?.is_clean() {
+            return Err(GitError::NothingToStash);
+        }
+        let message = message.trim();
+        let argument = if message.is_empty() {
+            "--message=WIP (Arandu)".to_string()
+        } else {
+            format!("--message={message}")
+        };
+        self.run_git(&["stash", "push", "--include-untracked", &argument])?;
+        Ok(())
+    }
+
+    /// Reaplica o stash identificado por `id` e o remove da pilha.
+    ///
+    /// `id` pode ser o id curto exibido por [`Repo::stashes`] ou um prefixo
+    /// sem ambiguidade. Conflitos deixam o stash na pilha e retornam erro.
+    pub fn stash_pop(&self, id: &str) -> Result<(), GitError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(GitError::StashNotFound(id.to_string()));
+        }
+        let stashes = self.stashes()?;
+        let index = stashes
+            .iter()
+            .position(|stash| stash.id == id || stash.id.starts_with(id))
+            .ok_or_else(|| GitError::StashNotFound(id.to_string()))?;
+        let reference = format!("stash@{{{index}}}");
+        self.run_git(&["stash", "pop", &reference])?;
+        Ok(())
+    }
+
+    /// Executa o binário `git` no worktree e devolve o stdout.
+    fn run_git(&self, args: &[&str]) -> Result<String, GitError> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&self.root)
+            .args(args)
+            .output()
+            .map_err(|error| GitError::Gix(format!("não foi possível executar git: {error}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(GitError::Gix(format!(
+                "git {}: {}",
+                args.join(" "),
+                stderr.trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     /// Autor e data formatada de um commit, com fallback vazio em falha.
     fn commit_meta(&self, id: gix::ObjectId) -> (String, String) {
         match self.inner.find_commit(id) {
@@ -848,6 +1195,33 @@ fn index_mode(mode: EntryMode) -> IndexMode {
 
 fn to_path(path: &BStr) -> PathBuf {
     PathBuf::from(path.to_str_lossy().into_owned())
+}
+
+/// Valida um nome de branch segundo as regras básicas do `git check-ref-format`.
+///
+/// A validação é deliberadamente conservadora: cobre os casos que produzem
+/// refs inválidas ou confundem a interface, sem tentar reproduzir todas as
+/// regras de `git check-ref-format`.
+fn validate_branch_name(name: &str) -> Result<&str, GitError> {
+    let name = name.trim();
+    let invalid = name.is_empty()
+        || name == "HEAD"
+        || name.starts_with('-')
+        || name.ends_with('/')
+        || name.ends_with('.')
+        || name.ends_with(".lock")
+        || name.contains("..")
+        || name.contains("//")
+        || name.chars().any(|character| {
+            matches!(
+                character,
+                ' ' | '\t' | '\n' | '~' | '^' | ':' | '?' | '*' | '[' | '\\' | '\x7f'
+            )
+        });
+    if invalid {
+        return Err(GitError::InvalidBranchName(name.to_string()));
+    }
+    Ok(name)
 }
 
 fn sort_dedup(entries: &mut Vec<FileEntry>) {
@@ -1233,6 +1607,173 @@ mod tests {
         assert_eq!(blame.len(), 4);
         assert_eq!(blame[0].content, "linha 1");
         assert_eq!(blame[3].content, "linha 4");
+    }
+
+    fn repo_com_commit(repo: &TestRepo) -> Repo {
+        repo.write("arquivo.txt", "inicial");
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "inicial"]);
+        Repo::discover(&repo.path).expect("repositório")
+    }
+
+    #[test]
+    fn branches_lista_atual_marcada() {
+        let repo = TestRepo::new();
+        let repo = repo_com_commit(&repo);
+        repo.create_branch("feature").unwrap();
+
+        let branches = repo.branches().unwrap();
+        assert_eq!(branches.len(), 2);
+        let main = branches.iter().find(|b| b.name == "main").unwrap();
+        let feature = branches.iter().find(|b| b.name == "feature").unwrap();
+        assert!(main.current, "main deveria estar marcada como atual");
+        assert!(!feature.current);
+        assert_eq!(main.commit.len(), 8);
+        assert_eq!(feature.commit, main.commit);
+        assert_eq!(branches[0].name, "main", "a atual vem primeiro");
+    }
+
+    #[test]
+    fn create_branch_aponta_para_head_e_rejeita_nome_invalido() {
+        let repo = TestRepo::new();
+        let repo = repo_com_commit(&repo);
+        repo.create_branch("nova").unwrap();
+
+        let head = repo
+            .inner
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .id()
+            .detach();
+        let created = repo
+            .inner
+            .find_reference("refs/heads/nova")
+            .unwrap()
+            .try_id()
+            .unwrap()
+            .detach();
+        assert_eq!(created, head);
+        assert!(matches!(
+            repo.create_branch("nome com espaço"),
+            Err(GitError::InvalidBranchName(_))
+        ));
+        assert!(matches!(
+            repo.create_branch("  "),
+            Err(GitError::InvalidBranchName(_))
+        ));
+    }
+
+    #[test]
+    fn checkout_troca_branch_e_atualiza_worktree() {
+        let fixture = TestRepo::new();
+        let repo = repo_com_commit(&fixture);
+        repo.create_branch("feature").unwrap();
+        repo.checkout("feature").unwrap();
+
+        let status = repo.status().unwrap();
+        assert_eq!(status.branch.as_deref(), Some("feature"));
+
+        fixture.write("arquivo.txt", "da feature");
+        fixture.write("exclusivo.txt", "só na feature");
+        fixture.git(&["add", "."]);
+        fixture.git(&["commit", "-m", "altera na feature"]);
+        repo.checkout("main").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.root().join("arquivo.txt")).unwrap(),
+            "inicial"
+        );
+        assert!(
+            !repo.root().join("exclusivo.txt").exists(),
+            "checkout deveria remover arquivos ausentes na branch de destino"
+        );
+        repo.checkout("feature").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.root().join("arquivo.txt")).unwrap(),
+            "da feature"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.root().join("exclusivo.txt")).unwrap(),
+            "só na feature"
+        );
+    }
+
+    #[test]
+    fn checkout_bloqueia_worktree_sujo() {
+        let fixture = TestRepo::new();
+        let repo = repo_com_commit(&fixture);
+        repo.create_branch("feature").unwrap();
+        fixture.write("arquivo.txt", "modificado");
+        assert!(matches!(
+            repo.checkout("feature"),
+            Err(GitError::DirtyWorktree)
+        ));
+        assert_eq!(repo.status().unwrap().branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn delete_branch_remove_ref_e_rejeita_atual() {
+        let repo = TestRepo::new();
+        let repo = repo_com_commit(&repo);
+        repo.create_branch("descartavel").unwrap();
+        repo.delete_branch("descartavel").unwrap();
+        assert!(
+            repo.branches()
+                .unwrap()
+                .iter()
+                .all(|branch| branch.name != "descartavel")
+        );
+        assert!(matches!(
+            repo.delete_branch("main"),
+            Err(GitError::CurrentBranch(_))
+        ));
+        assert!(matches!(
+            repo.delete_branch("nao-existe"),
+            Err(GitError::BranchNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn stash_guarda_lista_e_reaplica_mudancas() {
+        let fixture = TestRepo::new();
+        let repo = repo_com_commit(&fixture);
+        fixture.write("arquivo.txt", "alterado");
+        fixture.write("novo.txt", "não rastreado");
+        repo.stash_push("trabalho em andamento").unwrap();
+
+        assert!(repo.status().unwrap().is_clean());
+        let stashes = repo.stashes().unwrap();
+        assert_eq!(stashes.len(), 1);
+        assert!(stashes[0].message.contains("trabalho em andamento"));
+        assert_eq!(stashes[0].id.len(), 8);
+        assert_eq!(stashes[0].time.len(), 16);
+
+        let id = stashes[0].id.clone();
+        repo.stash_pop(&id).unwrap();
+        assert!(repo.stashes().unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(repo.root().join("arquivo.txt")).unwrap(),
+            "alterado"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.root().join("novo.txt")).unwrap(),
+            "não rastreado"
+        );
+    }
+
+    #[test]
+    fn stash_push_sem_mudancas_retorna_erro() {
+        let repo = TestRepo::new();
+        let repo = repo_com_commit(&repo);
+        assert!(matches!(
+            repo.stash_push("vazio"),
+            Err(GitError::NothingToStash)
+        ));
+        assert!(matches!(
+            repo.stash_pop("deadbeef"),
+            Err(GitError::StashNotFound(_))
+        ));
     }
 
     #[test]

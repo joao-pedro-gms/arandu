@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    name: Binário (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: arandu-linux-x86_64.tar.gz
+            bin: arandu
+            cmd: tar -czf arandu-linux-x86_64.tar.gz arandu
+          - os: windows-latest
+            artifact: arandu-windows-x86_64.zip
+            bin: arandu.exe
+            cmd: 7z a arandu-windows-x86_64.zip arandu.exe
+          - os: macos-latest
+            artifact: arandu-macos-universal.tar.gz
+            bin: arandu
+            cmd: tar -czf arandu-macos-universal.tar.gz arandu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Preparar binário
+        shell: bash
+        run: |
+          cp target/release/${{ matrix.bin }} ${{ matrix.bin }}
+          chmod +x ${{ matrix.bin }}
+          ${{ matrix.cmd }}
+
+      - name: Enviar artefato
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    name: Publicar GitHub Release
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Criar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "Arandu ${{ github.ref_name }}" \
+            --generate-notes \
+            dist/*

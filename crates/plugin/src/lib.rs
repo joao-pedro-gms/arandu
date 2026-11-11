@@ -20,8 +20,16 @@ pub use error::PluginError;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use mlua::{Function, Lua, LuaOptions, StdLib, Table};
+use mlua::{Function, Lua, LuaOptions, StdLib, Table, VmState};
+
+/// Máximo de pontos de interrupção (chamadas de função/iterações de laço) que
+/// um plugin pode executar antes de ser abortado.
+const MAX_INTERRUPTS: u64 = 5_000_000;
+/// Limite de memória por estado Lua (64 MiB).
+const MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 
 /// Contexto entregue a um comando de plugin no momento da execução.
 #[derive(Debug, Clone, Default)]
@@ -43,6 +51,8 @@ pub fn default_plugin_dir() -> Option<PathBuf> {
 struct Plugin {
     lua: Lua,
     commands: HashMap<String, Function>,
+    /// Contador de interrupções do estado atual; zerado antes de cada execução.
+    interrupts: Arc<AtomicU64>,
 }
 
 /// Gerenciador de plugins carregados.
@@ -175,6 +185,23 @@ impl Plugin {
         // `ALL_SAFE`).
         let libs = StdLib::ALL_SAFE ^ (StdLib::OS | StdLib::DEBUG);
         let lua = Lua::new_with(libs, LuaOptions::default())?;
+        lua.set_memory_limit(MEMORY_LIMIT)?;
+
+        // Aborta o plugin se ele ultrapassar o orçamento de execução. O
+        // `set_interrupt` do Luau é chamado em cada chamada de função e
+        // iteração de laço, o que cobre tanto scripts infinitos no topo
+        // (`ensure_plugins`) quanto dentro de comandos.
+        let interrupts = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&interrupts);
+        lua.set_interrupt(move |_| {
+            if counter.fetch_add(1, Ordering::Relaxed) + 1 > MAX_INTERRUPTS {
+                Err(mlua::Error::runtime(
+                    "plugin excedeu limite de execução (possível laço infinito)",
+                ))
+            } else {
+                Ok(VmState::Continue)
+            }
+        });
 
         lua.set_named_registry_value("arandu.commands", lua.create_table()?)?;
         lua.set_named_registry_value("arandu.output", lua.create_table()?)?;
@@ -220,6 +247,7 @@ impl Plugin {
         )?;
         lua.globals().set("arandu", arandu)?;
 
+        interrupts.store(0, Ordering::Relaxed);
         lua.load(&source).set_name(name).exec()?;
 
         let registered: Table = lua.named_registry_value("arandu.commands")?;
@@ -229,7 +257,11 @@ impl Plugin {
             commands.insert(command, callback);
         }
 
-        Ok(Self { lua, commands })
+        Ok(Self {
+            lua,
+            commands,
+            interrupts,
+        })
     }
 
     /// Injeta o contexto da execução e zera o buffer de saída.
@@ -253,6 +285,7 @@ impl Plugin {
     fn run(&self, callback: &Function, ctx: &PluginContext) -> Result<(), PluginError> {
         self.set_context(ctx)?;
         let context: Table = self.lua.named_registry_value("arandu.ctx")?;
+        self.interrupts.store(0, Ordering::Relaxed);
         callback.call::<()>(context)?;
         Ok(())
     }
@@ -371,6 +404,50 @@ mod tests {
         assert_eq!(
             manager.commands(),
             vec!["alfa".to_owned(), "beta".to_owned()]
+        );
+    }
+
+    #[test]
+    fn infinite_loop_is_aborted_by_execution_limit() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        write_plugin(
+            dir.path(),
+            "loop.lua",
+            r#"arandu.register_command("trava", function()
+                   while true do end
+               end)"#,
+        );
+
+        let mut manager = PluginManager::load_dir(dir.path());
+        assert!(manager.errors.is_empty(), "erros: {:?}", manager.errors);
+
+        let started = std::time::Instant::now();
+        let error = manager
+            .run_command("trava", &PluginContext::default())
+            .expect_err("laço infinito deveria ser abortado");
+        let message = error.to_string();
+        assert!(
+            message.contains("excedeu limite"),
+            "mensagem inesperada: {message}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "limite demorou demais para disparar: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn infinite_loop_at_top_level_is_aborted_on_load() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        write_plugin(dir.path(), "topo.lua", "while true do end");
+
+        let manager = PluginManager::load_dir(dir.path());
+        assert_eq!(manager.errors.len(), 1, "erros: {:?}", manager.errors);
+        assert!(
+            manager.errors[0].1.to_string().contains("excedeu limite"),
+            "erro inesperado: {:?}",
+            manager.errors[0].1
         );
     }
 

@@ -93,10 +93,16 @@ const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const PLUGIN_NOTICE_TTL: Duration = Duration::from_secs(5);
 /// Altura reservada ao formulário de commit no painel Git.
 const GIT_COMMIT_H: f32 = 96.0;
+/// Altura de uma linha (cabeçalho ou entrada) da aba Status do Git.
+const GIT_STATUS_ROW_H: f32 = 20.0;
 /// Bytes por linha no hex dump.
 const HEX_ROW_BYTES: usize = 16;
 /// Máximo de linhas de dados exibidas na tabela CSV.
 const CSV_MAX_ROWS: usize = 1000;
+/// Altura fixa de uma linha do preview CSV (virtualização).
+const CSV_ROW_H: f32 = 20.0;
+/// Largura fixa de uma célula do preview CSV.
+const CSV_CELL_W: f32 = 120.0;
 /// Teto de linhas renderizadas com syntax highlight.
 ///
 /// Um arquivo de 1 MiB pode ter dezenas de milhares de linhas; construir e
@@ -182,6 +188,16 @@ impl ViewMode {
     }
 }
 
+/// Cache do mapa `caminho -> tags` de um painel.
+///
+/// Evita `canonicalize` por entrada a cada frame: o mapa só é recalculado
+/// quando as entradas do painel ou o `TagsStore` mudam.
+struct TagCache {
+    entries_generation: u64,
+    tags_generation: u64,
+    map: HashMap<String, Vec<String>>,
+}
+
 /// Estado de um painel.
 pub struct PanelState {
     /// Diretório atual do painel.
@@ -209,6 +225,8 @@ pub struct PanelState {
     viewport_h: f32,
     /// Offset solicitado para o próximo frame (auto-scroll do foco).
     pending_scroll: Option<f32>,
+    /// Incrementada a cada recarga; invalida caches derivados das entradas.
+    entries_generation: u64,
 }
 
 impl PanelState {
@@ -226,6 +244,7 @@ impl PanelState {
             scroll_offset: 0.0,
             viewport_h: 0.0,
             pending_scroll: None,
+            entries_generation: 0,
         };
         panel.reload();
         panel
@@ -233,6 +252,7 @@ impl PanelState {
 
     /// Recarrega a listagem do diretório atual.
     fn reload(&mut self) {
+        self.entries_generation = self.entries_generation.wrapping_add(1);
         match list_dir(&self.cwd) {
             Ok(entries) => {
                 self.entries = entries;
@@ -513,6 +533,17 @@ impl PreviewCache {
     }
 }
 
+/// CSV parseado para renderização virtualizada.
+struct CsvPreview {
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    /// Havia mais linhas além de [`CSV_MAX_ROWS`].
+    capped: bool,
+}
+
+/// Mensagem enviada pela thread de leitura de preview.
+type PreviewJobMessage = (u64, PreviewKey, Result<PreviewContent, PreviewError>);
+
 /// Estado do painel de preview (F3).
 #[derive(Default)]
 struct PreviewState {
@@ -522,11 +553,19 @@ struct PreviewState {
     /// Chave cuja leitura está em andamento.
     pending: Option<PreviewKey>,
     /// Canal da leitura em background (uma por vez).
-    receiver: Option<Receiver<(PreviewKey, Result<PreviewContent, PreviewError>)>>,
+    receiver: Option<Receiver<PreviewJobMessage>>,
+    /// Sinaliza à thread anterior que a requisição foi substituída.
+    cancel: Arc<AtomicBool>,
+    /// Geração da requisição atual (incrementa a cada nova leitura).
+    generation: u64,
     /// Job de highlight do preview de texto atual.
     job: Option<(PreviewKey, bool, Arc<egui::text::LayoutJob>)>,
     /// Textura da imagem/PDF atual.
     texture: Option<(PreviewKey, egui::TextureHandle)>,
+    /// RGBA decodificado da imagem atual (evita `to_rgba8()` por frame).
+    image: Option<(PreviewKey, Arc<image::RgbaImage>)>,
+    /// CSV já parseado da prévia atual (evita reparse por frame).
+    csv: Option<(PreviewKey, CsvPreview)>,
     /// Cache de layout/renderização do Markdown.
     markdown_cache: egui_commonmark::CommonMarkCache,
 }
@@ -583,6 +622,21 @@ struct ChecksumsDialog {
 struct BatchRenameDialog {
     paths: Vec<PathBuf>,
     pattern: String,
+    /// Renomeações em andamento em background.
+    running: bool,
+    /// Resultado da última execução (mostrado no próprio modal).
+    result: Option<BatchRenameOutcome>,
+}
+
+/// Resultado de uma renomeação em lote.
+struct BatchRenameOutcome {
+    succeeded: usize,
+    failures: Vec<(PathBuf, String)>,
+}
+
+/// Renomeação em lote em andamento.
+struct BatchRenameJob {
+    receiver: Receiver<(BatchRenameOutcome, Vec<PathBuf>)>,
 }
 
 /// Diálogo de compressão (F8).
@@ -641,6 +695,23 @@ struct ArchiveJob {
     receiver: Receiver<(PathBuf, Result<(), String>)>,
     /// Diretório a recarregar quando o trabalho terminar.
     reload_dir: PathBuf,
+}
+
+/// Resultado de um comando de plugin executado fora da thread de UI.
+struct PluginRun {
+    /// Gerenciador devolvido à UI para as próximas execuções.
+    manager: PluginManager,
+    /// Nome do comando executado.
+    name: String,
+    /// Mensagens de `arandu.notify` produzidas.
+    output: Vec<String>,
+    /// Erro de execução (inclui o limite de instruções), se houver.
+    error: Option<String>,
+}
+
+/// Comando de plugin em andamento em background.
+struct PluginJob {
+    receiver: Receiver<PluginRun>,
 }
 
 /// Resultado de uma atualização de status Git em background.
@@ -780,6 +851,46 @@ struct GitState {
     commit_focused: bool,
     /// Início da última consulta, para o refresh periódico.
     last_loaded: Option<Instant>,
+    /// Linhas achatadas do status (recomputadas só quando o status muda).
+    status_rows: Vec<GitStatusRow>,
+}
+
+impl GitState {
+    /// Substitui o status e reconstrói a lista achatada uma única vez.
+    fn set_status(&mut self, status: Option<GitStatus>) {
+        self.status = status;
+        self.rebuild_status_rows();
+    }
+
+    fn rebuild_status_rows(&mut self) {
+        let mut rows = Vec::new();
+        if let Some(status) = self.status.as_ref() {
+            let mut entry_index = 0usize;
+            for (section, entries, stage) in [
+                (GitSection::Staged, &status.staged, false),
+                (GitSection::Modified, &status.modified, true),
+                (GitSection::Untracked, &status.untracked, true),
+            ] {
+                if entries.is_empty() {
+                    continue;
+                }
+                rows.push(GitStatusRow::Header {
+                    section,
+                    count: entries.len(),
+                });
+                for entry in entries {
+                    rows.push(GitStatusRow::Entry {
+                        index: entry_index,
+                        stage,
+                        path: entry.path.clone(),
+                        status: entry.status,
+                    });
+                    entry_index += 1;
+                }
+            }
+        }
+        self.status_rows = rows;
+    }
 }
 
 /// Seção de uma linha do painel Git.
@@ -788,6 +899,21 @@ enum GitSection {
     Staged,
     Modified,
     Untracked,
+}
+
+/// Linha achatada da aba Status: cabeçalho de seção ou entrada de arquivo.
+enum GitStatusRow {
+    Header {
+        section: GitSection,
+        count: usize,
+    },
+    Entry {
+        /// Índice na ordem staged + modified + untracked (navegação por teclado).
+        index: usize,
+        stage: bool,
+        path: PathBuf,
+        status: FileStatus,
+    },
 }
 
 /// Evento enviado pela thread de indexação.
@@ -878,6 +1004,8 @@ pub struct AranduApp {
     checksums: Option<ChecksumsDialog>,
     /// Diálogo de renomeação em lote aberto (F7).
     batch_rename: Option<BatchRenameDialog>,
+    /// Renomeação em lote em andamento (background).
+    batch_rename_job: Option<BatchRenameJob>,
     /// Diálogo de compressão aberto (F8).
     compress: Option<CompressDialog>,
     /// Compressão em andamento (background).
@@ -890,6 +1018,11 @@ pub struct AranduApp {
     open_executor: Arc<dyn OpenExecutor>,
     /// Tags dos arquivos, persistidas em `tags.toml`.
     tags: TagsStore,
+    /// Incrementada a cada edição de tags; invalida [`TagCache`].
+    tags_generation: u64,
+    /// Mapa de tags em cache por painel.
+    tag_cache_left: Option<TagCache>,
+    tag_cache_right: Option<TagCache>,
     /// Painel de pré-visualização (F3).
     preview: PreviewState,
     /// Painel Git (Ctrl+G).
@@ -904,11 +1037,20 @@ pub struct AranduApp {
     quick_open: QuickOpenState,
     /// Plugins carregados preguiçosamente no primeiro acesso ao menu.
     plugins: Option<PluginManager>,
+    /// Comandos disponíveis, mantidos mesmo enquanto um comando roda fora da UI.
+    plugin_commands: Vec<String>,
+    /// Comando de plugin em execução (ou `None` quando o gerenciador está na UI).
+    plugin_job: Option<PluginJob>,
+    /// Último comando pedido enquanto outro estava em execução (coalescido).
+    plugin_pending: Option<(String, PluginContext)>,
     /// Diretório de plugins alternativo (testes/headless).
     plugin_dir: Option<PathBuf>,
     /// Congela a drenagem da fila em testes determinísticos de progresso.
     #[cfg(test)]
     injected_ops: bool,
+    /// Quantas vezes o mapa de tags foi recalculado (testes de cache).
+    #[cfg(test)]
+    tag_cache_computations: usize,
 }
 
 impl AranduApp {
@@ -971,12 +1113,16 @@ impl AranduApp {
             tag_editor: None,
             checksums: None,
             batch_rename: None,
+            batch_rename_job: None,
             compress: None,
             compress_job: None,
             extract_job: None,
             open_with_dialog: None,
             open_executor: Arc::new(SystemOpenExecutor),
             tags,
+            tags_generation: 0,
+            tag_cache_left: None,
+            tag_cache_right: None,
             preview: PreviewState::default(),
             git: GitState::default(),
             theme,
@@ -984,9 +1130,14 @@ impl AranduApp {
             show_hints: false,
             quick_open: QuickOpenState::default(),
             plugins: None,
+            plugin_commands: Vec::new(),
+            plugin_job: None,
+            plugin_pending: None,
             plugin_dir: None,
             #[cfg(test)]
             injected_ops: false,
+            #[cfg(test)]
+            tag_cache_computations: 0,
         }
     }
 
@@ -1009,10 +1160,12 @@ impl AranduApp {
         self.pump_queue();
         self.pump_preview();
         self.pump_checksums();
+        self.pump_batch_rename();
         self.pump_archive_jobs();
         self.pump_git();
         self.request_git_refresh(false);
         self.pump_index_scan(&ctx);
+        self.pump_plugins();
         // Mensagens temporárias (plugins) somem sozinhas após o TTL.
         if self.ops.notice.as_ref().is_some_and(Notice::expired) {
             self.ops.notice = None;
@@ -1027,11 +1180,13 @@ impl AranduApp {
         }
         if self.compress_job.is_some()
             || self.extract_job.is_some()
+            || self.batch_rename_job.is_some()
             || self.git.receiver.is_some()
             || self.git.log_receiver.is_some()
             || self.git.blame_receiver.is_some()
             || self.git.branches_receiver.is_some()
             || self.git.stashes_receiver.is_some()
+            || self.plugin_job.is_some()
         {
             ctx.request_repaint();
         }
@@ -1204,8 +1359,22 @@ impl AranduApp {
         }
     }
 
-    /// Tags das entradas de um painel, resolvidas uma vez por frame.
-    fn tag_map_for(&self, panel: &PanelState) -> HashMap<String, Vec<String>> {
+    /// Tags das entradas de um painel, recalculadas só quando as entradas ou
+    /// o armazenamento de tags mudam (sem `canonicalize` por frame).
+    fn tag_map_for(&mut self, side: PanelSide) -> HashMap<String, Vec<String>> {
+        let (panel, cache) = match side {
+            PanelSide::Left => (&self.left, &mut self.tag_cache_left),
+            PanelSide::Right => (&self.right, &mut self.tag_cache_right),
+        };
+        let entries_generation = panel.entries_generation;
+        let tags_generation = self.tags_generation;
+        if let Some(cache) = cache.as_ref()
+            && cache.entries_generation == entries_generation
+            && cache.tags_generation == tags_generation
+        {
+            return cache.map.clone();
+        }
+
         let mut map = HashMap::new();
         for entry in &panel.entries {
             let tags = self.tags.tags_of(&entry.path);
@@ -1213,7 +1382,21 @@ impl AranduApp {
                 map.insert(entry.path.to_string_lossy().into_owned(), tags);
             }
         }
+        *cache = Some(TagCache {
+            entries_generation,
+            tags_generation,
+            map: map.clone(),
+        });
+        #[cfg(test)]
+        {
+            self.tag_cache_computations += 1;
+        }
         map
+    }
+
+    /// Invalida os caches de tags após uma edição.
+    fn tags_changed(&mut self) {
+        self.tags_generation = self.tags_generation.wrapping_add(1);
     }
 
     /// Trata atalhos globais antes de desenhar os widgets, casando as teclas
@@ -1646,9 +1829,14 @@ impl AranduApp {
             .receiver
             .as_ref()
             .and_then(|receiver| receiver.try_recv().ok());
-        let Some((key, result)) = received else {
+        let Some((generation, key, result)) = received else {
             return;
         };
+        // Resposta de uma requisição já substituída: descarta.
+        if generation != self.preview.generation {
+            self.preview.receiver = None;
+            return;
+        }
         self.preview.receiver = None;
         if self.preview.pending.as_ref() == Some(&key) {
             self.preview.pending = None;
@@ -1680,6 +1868,14 @@ impl AranduApp {
             return;
         }
 
+        // Cancela a leitura anterior: navegar rápido não deve empilhar threads
+        // nem deixar resultados obsoletos chegarem ao cache.
+        self.preview.cancel.store(true, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.preview.cancel = Arc::clone(&cancel);
+        self.preview.generation = self.preview.generation.wrapping_add(1);
+        let generation = self.preview.generation;
+
         let (sender, receiver) = mpsc::channel();
         self.preview.receiver = Some(receiver);
         self.preview.pending = Some(key.clone());
@@ -1690,8 +1886,14 @@ impl AranduApp {
         };
         // Preview é leitura pura: não passa pela fila de operações.
         std::thread::spawn(move || {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
             let result = request.load();
-            let _ = sender.send((key, result));
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let _ = sender.send((generation, key, result));
         });
     }
 
@@ -1843,47 +2045,85 @@ impl AranduApp {
         self.batch_rename = Some(BatchRenameDialog {
             paths,
             pattern: "{name}{ext}".to_owned(),
+            running: false,
+            result: None,
         });
         self.ops.notice = None;
     }
 
-    /// Executa as renomeações confirmadas, agregando sucessos e falhas.
+    /// Executa as renomeações confirmadas em background, agregando resultados.
     fn apply_batch_rename(&mut self, renames: Vec<(PathBuf, String)>) {
-        let mut succeeded = 0_usize;
-        let mut failed = 0_usize;
-        let mut touched: Vec<PathBuf> = Vec::new();
-
-        for (path, new_name) in renames {
-            let Some(parent) = path.parent() else {
-                failed += 1;
-                continue;
-            };
-            let target = parent.join(new_name.trim());
-            if target == path {
-                succeeded += 1;
-                continue;
-            }
-            match std::fs::rename(&path, &target) {
-                Ok(()) => {
-                    succeeded += 1;
-                    if !touched.iter().any(|dir| dir == parent) {
-                        touched.push(parent.to_path_buf());
-                    }
-                }
-                Err(_) => failed += 1,
-            }
+        if self.batch_rename_job.is_some() {
+            return;
         }
+        let (sender, receiver) = mpsc::channel();
+        self.batch_rename_job = Some(BatchRenameJob { receiver });
+        std::thread::spawn(move || {
+            let mut succeeded = 0_usize;
+            let mut failures: Vec<(PathBuf, String)> = Vec::new();
+            let mut touched: Vec<PathBuf> = Vec::new();
 
+            for (path, new_name) in renames {
+                let Some(parent) = path.parent() else {
+                    failures.push((path, "caminho sem diretório pai".to_owned()));
+                    continue;
+                };
+                let target = parent.join(new_name.trim());
+                if target == path {
+                    succeeded += 1;
+                    continue;
+                }
+                match std::fs::rename(&path, &target) {
+                    Ok(()) => {
+                        succeeded += 1;
+                        if !touched.iter().any(|dir| dir == parent) {
+                            touched.push(parent.to_path_buf());
+                        }
+                    }
+                    Err(error) => failures.push((path, error.to_string())),
+                }
+            }
+
+            let _ = sender.send((
+                BatchRenameOutcome {
+                    succeeded,
+                    failures,
+                },
+                touched,
+            ));
+        });
+        if let Some(dialog) = self.batch_rename.as_mut() {
+            dialog.running = true;
+            dialog.result = None;
+        }
+    }
+
+    /// Drena o resultado da renomeação em lote em background.
+    fn pump_batch_rename(&mut self) {
+        let received = self
+            .batch_rename_job
+            .as_ref()
+            .and_then(|job| job.receiver.try_recv().ok());
+        let Some((outcome, touched)) = received else {
+            return;
+        };
+        self.batch_rename_job = None;
         for dir in touched {
             self.reload_dir(&dir);
         }
-        let text = rust_i18n::t!("batch_rename_done", ok = succeeded, errors = failed).to_string();
-        self.ops.notice = Some(if failed == 0 {
-            Notice::info(text)
+        let failed = outcome.failures.len();
+        let text =
+            rust_i18n::t!("batch_rename_done", ok = outcome.succeeded, errors = failed).to_string();
+        if let Some(dialog) = self.batch_rename.as_mut() {
+            dialog.running = false;
+            dialog.result = Some(outcome);
         } else {
-            Notice::error(text)
-        });
-        self.batch_rename = None;
+            self.ops.notice = Some(if failed == 0 {
+                Notice::info(text)
+            } else {
+                Notice::error(text)
+            });
+        }
     }
 
     /// Abre o diálogo de compressão para a seleção do painel ativo.
@@ -2335,7 +2575,7 @@ impl AranduApp {
         match refresh {
             GitRefresh::NotRepository => {
                 self.git.root = None;
-                self.git.status = None;
+                self.git.set_status(None);
                 self.git.not_repo = true;
                 self.git.error = None;
                 self.git.action_error = None;
@@ -2343,7 +2583,7 @@ impl AranduApp {
             GitRefresh::Status { root, status } => {
                 let rows = status.staged.len() + status.modified.len() + status.untracked.len();
                 self.git.root = Some(root);
-                self.git.status = Some(status);
+                self.git.set_status(Some(status));
                 self.git.not_repo = false;
                 self.git.error = None;
                 self.git.focus = self.git.focus.min(rows.saturating_sub(1));
@@ -2516,7 +2756,7 @@ impl AranduApp {
         let dir = self.git_target_dir();
         let Some(repo) = Repo::discover(&dir) else {
             self.git.not_repo = true;
-            self.git.status = None;
+            self.git.set_status(None);
             return;
         };
         let paths = [path];
@@ -2538,7 +2778,7 @@ impl AranduApp {
         let dir = self.git_target_dir();
         let Some(repo) = Repo::discover(&dir) else {
             self.git.not_repo = true;
-            self.git.status = None;
+            self.git.set_status(None);
             return;
         };
         match repo.commit(&message) {
@@ -2556,7 +2796,7 @@ impl AranduApp {
         let dir = self.git_target_dir();
         let Some(repo) = Repo::discover(&dir) else {
             self.git.not_repo = true;
-            self.git.status = None;
+            self.git.set_status(None);
             return;
         };
         match repo.checkout(name) {
@@ -2574,7 +2814,7 @@ impl AranduApp {
         let dir = self.git_target_dir();
         let Some(repo) = Repo::discover(&dir) else {
             self.git.not_repo = true;
-            self.git.status = None;
+            self.git.set_status(None);
             return Err("not a git repository".to_string());
         };
         repo.create_branch(name)
@@ -2588,7 +2828,7 @@ impl AranduApp {
         let dir = self.git_target_dir();
         let Some(repo) = Repo::discover(&dir) else {
             self.git.not_repo = true;
-            self.git.status = None;
+            self.git.set_status(None);
             return Err("not a git repository".to_string());
         };
         repo.delete_branch(name)
@@ -2602,7 +2842,7 @@ impl AranduApp {
         let dir = self.git_target_dir();
         let Some(repo) = Repo::discover(&dir) else {
             self.git.not_repo = true;
-            self.git.status = None;
+            self.git.set_status(None);
             return;
         };
         match repo.stash_push(message) {
@@ -2620,7 +2860,7 @@ impl AranduApp {
         let dir = self.git_target_dir();
         let Some(repo) = Repo::discover(&dir) else {
             self.git.not_repo = true;
-            self.git.status = None;
+            self.git.set_status(None);
             return;
         };
         match repo.stash_pop(id) {
@@ -3036,11 +3276,12 @@ impl AranduApp {
     pub fn set_plugin_dir(&mut self, dir: impl Into<PathBuf>) {
         self.plugin_dir = Some(dir.into());
         self.plugins = None;
+        self.plugin_commands.clear();
     }
 
     /// Carrega os plugins no primeiro acesso ao menu (lazy).
     fn ensure_plugins(&mut self) {
-        if self.plugins.is_some() {
+        if self.plugins.is_some() || self.plugin_job.is_some() {
             return;
         }
         let manager = match self.plugin_dir.clone().or_else(default_plugin_dir) {
@@ -3052,6 +3293,11 @@ impl AranduApp {
 
     /// Recarrega os plugins do disco, refletindo altas/baixas de arquivos.
     fn reload_plugins(&mut self) {
+        // Enquanto um comando roda, o gerenciador está na thread de trabalho;
+        // ignorar o reload evita que o resultado da execução o sobrescreva.
+        if self.plugin_job.is_some() {
+            return;
+        }
         let manager = match self.plugin_dir.clone().or_else(default_plugin_dir) {
             Some(dir) => PluginManager::load_dir(&dir),
             None => PluginManager::empty(),
@@ -3064,7 +3310,8 @@ impl AranduApp {
         for (name, error) in &manager.errors {
             eprintln!("arandu: plugin '{name}' ignorado: {error}");
         }
-        let count = manager.commands().len();
+        self.plugin_commands = manager.commands();
+        let count = self.plugin_commands.len();
         if let Some((name, error)) = manager.errors.first() {
             self.ops.notice = Some(Notice::temporary(
                 rust_i18n::t!(
@@ -3090,11 +3337,7 @@ impl AranduApp {
         let mut reload = false;
         egui::Popup::menu(button).show(|ui| {
             ui.set_min_width(220.0);
-            let commands = self
-                .plugins
-                .as_ref()
-                .map(PluginManager::commands)
-                .unwrap_or_default();
+            let commands = self.plugin_commands.clone();
             if commands.is_empty() {
                 ui.add_enabled(false, egui::Button::new(rust_i18n::t!("plugins_empty")));
             } else {
@@ -3119,30 +3362,84 @@ impl AranduApp {
     }
 
     /// Executa um comando de plugin com o contexto do painel ativo.
+    ///
+    /// O estado Lua roda em uma thread própria: um laço infinito (ou plugin
+    /// lento) não congela a UI — o limite de instruções do Luau aborta a
+    /// execução e o erro vira um aviso. Requisições feitas enquanto outro
+    /// comando roda são coalescidas na última.
     fn run_plugin_command(&mut self, name: &str) {
         let panel = self.active_panel();
         let ctx = PluginContext {
             paths: panel.selected_paths(),
             current_dir: panel.cwd.clone(),
         };
-        let Some(manager) = self.plugins.as_mut() else {
+        if self.plugin_job.is_some() {
+            self.plugin_pending = Some((name.to_owned(), ctx));
+            return;
+        }
+        self.start_plugin_command(name.to_owned(), ctx);
+    }
+
+    /// Move o gerenciador para uma thread e executa `name` lá.
+    fn start_plugin_command(&mut self, name: String, ctx: PluginContext) {
+        let Some(mut manager) = self.plugins.take() else {
             return;
         };
-        let text = match manager.run_command(name, &ctx) {
-            Ok(()) => {
-                let messages = manager.take_output();
-                if messages.is_empty() {
-                    rust_i18n::t!("plugin_ran", name = name).to_string()
-                } else {
-                    messages.join(" · ")
-                }
-            }
-            Err(error) => {
-                manager.take_output();
-                rust_i18n::t!("plugin_failed", name = name, error = error.to_string()).to_string()
+        let (sender, receiver) = mpsc::channel();
+        self.plugin_job = Some(PluginJob { receiver });
+        let job_name = name.clone();
+        let spawned = std::thread::Builder::new()
+            .name("arandu-plugin".into())
+            .spawn(move || {
+                let result = manager.run_command(&job_name, &ctx);
+                let output = manager.take_output();
+                let run = PluginRun {
+                    manager,
+                    name: job_name,
+                    output,
+                    error: result.err().map(|error| error.to_string()),
+                };
+                let _ = sender.send(run);
+            });
+        if spawned.is_err() {
+            // Sem thread não há como executar com segurança; recuperamos o
+            // gerenciador na próxima carga de plugins.
+            self.plugin_job = None;
+            self.plugins = None;
+            self.plugin_commands.clear();
+        }
+    }
+
+    /// Drena o resultado do comando de plugin em background.
+    fn pump_plugins(&mut self) {
+        let Some(job) = self.plugin_job.as_ref() else {
+            return;
+        };
+        let result = match job.receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.plugin_job = None;
+                return;
             }
         };
+        self.plugin_job = None;
+        let PluginRun {
+            manager,
+            name,
+            output,
+            error,
+        } = result;
+        self.plugins = Some(manager);
+        let text = match error {
+            None if output.is_empty() => rust_i18n::t!("plugin_ran", name = name).to_string(),
+            None => output.join(" · "),
+            Some(error) => rust_i18n::t!("plugin_failed", name = name, error = error).to_string(),
+        };
         self.ops.notice = Some(Notice::temporary(text, PLUGIN_NOTICE_TTL));
+        if let Some((name, ctx)) = self.plugin_pending.take() {
+            self.start_plugin_command(name, ctx);
+        }
     }
 
     fn draw_content(&mut self, ui: &mut Ui, content: Rect) {
@@ -3212,8 +3509,8 @@ impl AranduApp {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         }
 
-        let left_tags = self.tag_map_for(&self.left);
-        let right_tags = self.tag_map_for(&self.right);
+        let left_tags = self.tag_map_for(PanelSide::Left);
+        let right_tags = self.tag_map_for(PanelSide::Right);
 
         let left_interacted = draw_panel(
             ui,
@@ -3402,12 +3699,23 @@ impl AranduApp {
     }
 
     /// Aba Status: seções Staged/Modified/Untracked e formulário de commit.
+    ///
+    /// As linhas são achatadas uma única vez (quando o status muda) e
+    /// renderizadas com `show_rows`, então só as visíveis viram widgets.
     fn draw_git_status_body(&mut self, ui: &mut Ui, body: Rect, visuals: &egui::Visuals) {
-        let Some(status) = self.git.status.clone() else {
+        let has_staged = self
+            .git
+            .status
+            .as_ref()
+            .is_some_and(|status| !status.staged.is_empty());
+        let Some(root) = self.git.root.clone() else {
             draw_preview_centered(ui, body, rust_i18n::t!("git_loading"), visuals);
             return;
         };
-        let root = self.git.root.clone().unwrap_or_default();
+        if self.git.status.is_none() {
+            draw_preview_centered(ui, body, rust_i18n::t!("git_loading"), visuals);
+            return;
+        }
 
         let footer_h = GIT_COMMIT_H.min(body.height() * 0.5);
         let list_rect = Rect::from_min_max(
@@ -3423,77 +3731,63 @@ impl AranduApp {
         let focused_panel = self.git.focused;
         let mut clicked: Option<(usize, bool, PathBuf)> = None;
         let mut commit_clicked = false;
-        let mut row_index = 0usize;
 
+        let rows = std::mem::take(&mut self.git.status_rows);
         ui.scope_builder(
             UiBuilder::new().max_rect(list_rect.shrink2(vec2(6.0, 4.0))),
             |ui| {
+                if rows.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(rust_i18n::t!("git_clean")).color(visuals.weak_text_color()),
+                    );
+                    return;
+                }
                 ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        let sections = [
-                            (
-                                GitSection::Staged,
-                                rust_i18n::t!("git_staged").into_owned(),
-                                status.staged.clone(),
-                                false,
-                            ),
-                            (
-                                GitSection::Modified,
-                                rust_i18n::t!("git_modified").into_owned(),
-                                status.modified.clone(),
-                                true,
-                            ),
-                            (
-                                GitSection::Untracked,
-                                rust_i18n::t!("git_untracked").into_owned(),
-                                status.untracked.clone(),
-                                true,
-                            ),
-                        ];
-
-                        for (_section, title, entries, stage) in sections {
-                            if entries.is_empty() {
-                                continue;
-                            }
-                            ui.add_space(2.0);
-                            ui.label(
-                                RichText::new(format!("{title} ({})", entries.len()))
-                                    .small()
-                                    .strong()
-                                    .color(visuals.weak_text_color()),
-                            );
-                            for entry in entries {
-                                let focused = focused_panel && row_index == focus;
-                                let text = format!(
-                                    "{}  {}",
-                                    status_glyph(entry.status),
-                                    entry.path.display()
-                                );
-                                let mut rich = RichText::new(text).size(13.0);
-                                if focused {
-                                    rich = rich.strong().color(visuals.strong_text_color());
+                    .show_rows(ui, GIT_STATUS_ROW_H, rows.len(), |ui, range| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for row in &rows[range] {
+                            match row {
+                                GitStatusRow::Header { section, count } => {
+                                    let title = match section {
+                                        GitSection::Staged => rust_i18n::t!("git_staged"),
+                                        GitSection::Modified => rust_i18n::t!("git_modified"),
+                                        GitSection::Untracked => rust_i18n::t!("git_untracked"),
+                                    };
+                                    ui.label(
+                                        RichText::new(format!("{title} ({count})"))
+                                            .small()
+                                            .strong()
+                                            .color(visuals.weak_text_color()),
+                                    );
                                 }
-                                let response = ui
-                                    .add(Label::new(rich).sense(Sense::click()))
-                                    .on_hover_text(entry.path.display().to_string());
-                                if response.clicked() {
-                                    clicked = Some((row_index, stage, root.join(&entry.path)));
+                                GitStatusRow::Entry {
+                                    index,
+                                    stage,
+                                    path,
+                                    status,
+                                } => {
+                                    let focused = focused_panel && *index == focus;
+                                    let text =
+                                        format!("{}  {}", status_glyph(*status), path.display());
+                                    let mut rich = RichText::new(text).size(13.0);
+                                    if focused {
+                                        rich = rich.strong().color(visuals.strong_text_color());
+                                    }
+                                    let response = ui
+                                        .add(Label::new(rich).sense(Sense::click()))
+                                        .on_hover_text(path.display().to_string());
+                                    if response.clicked() {
+                                        clicked = Some((*index, *stage, root.join(path)));
+                                    }
                                 }
-                                row_index += 1;
                             }
-                        }
-
-                        if row_index == 0 {
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new(rust_i18n::t!("git_clean"))
-                                    .color(visuals.weak_text_color()),
-                            );
                         }
                     });
             },
         );
+        self.git.status_rows = rows;
 
         ui.scope_builder(
             UiBuilder::new().max_rect(footer_rect.shrink2(vec2(6.0, 2.0))),
@@ -3506,8 +3800,7 @@ impl AranduApp {
                 let response = ui.add(editor);
                 self.git.commit_focused = response.has_focus();
 
-                let enabled =
-                    !status.staged.is_empty() && !self.git.commit_message.trim().is_empty();
+                let enabled = has_staged && !self.git.commit_message.trim().is_empty();
                 let button =
                     ui.add_enabled(enabled, egui::Button::new(rust_i18n::t!("git_commit")));
                 if button.clicked() {
@@ -3893,7 +4186,7 @@ impl AranduApp {
                     self.draw_preview_hex(ui, body, bytes, *truncated);
                 }
                 PreviewContent::Csv { text, truncated } => {
-                    self.draw_preview_csv(ui, body, text, *truncated);
+                    self.draw_preview_csv(ui, body, &key, text, *truncated);
                 }
                 PreviewContent::Json { text, truncated } => {
                     self.draw_preview_text(ui, body, &key, text, *truncated, Some("json"));
@@ -4073,7 +4366,53 @@ impl AranduApp {
         });
     }
 
-    fn draw_preview_csv(&mut self, ui: &mut Ui, body: Rect, text: &str, truncated: bool) {
+    fn draw_preview_csv(
+        &mut self,
+        ui: &mut Ui,
+        body: Rect,
+        key: &PreviewKey,
+        text: &str,
+        truncated: bool,
+    ) {
+        // Parseia só quando a chave do preview muda; o desenho abaixo é
+        // virtualizado e não depende do número total de linhas.
+        if self
+            .preview
+            .csv
+            .as_ref()
+            .is_none_or(|(cached_key, _)| cached_key != key)
+        {
+            let mut lines = text.lines();
+            let (headers, rows, capped) = match lines.next() {
+                Some(header) => {
+                    let delimiter = if header.contains('\t') && !header.contains(',') {
+                        '\t'
+                    } else {
+                        ','
+                    };
+                    let mut rows: Vec<Vec<String>> = lines
+                        .take(CSV_MAX_ROWS + 1)
+                        .map(|line| parse_csv_row(line, delimiter))
+                        .collect();
+                    let capped = rows.len() > CSV_MAX_ROWS;
+                    rows.truncate(CSV_MAX_ROWS);
+                    (parse_csv_row(header, delimiter), rows, capped)
+                }
+                None => (Vec::new(), Vec::new(), false),
+            };
+            self.preview.csv = Some((
+                key.clone(),
+                CsvPreview {
+                    headers,
+                    rows,
+                    capped,
+                },
+            ));
+        }
+        let Some((_, parsed)) = self.preview.csv.as_ref() else {
+            return;
+        };
+
         ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
             if truncated {
                 ui.add_space(4.0);
@@ -4083,52 +4422,35 @@ impl AranduApp {
                         .color(ui.visuals().warn_fg_color),
                 );
             }
-            let mut lines = text.lines();
-            let Some(header) = lines.next() else {
-                return;
-            };
-            let delimiter = if header.contains('\t') && !header.contains(',') {
-                '\t'
-            } else {
-                ','
-            };
-            let headers = parse_csv_row(header, delimiter);
-            let rows: Vec<Vec<String>> = lines
-                .take(CSV_MAX_ROWS + 1)
-                .map(|line| parse_csv_row(line, delimiter))
-                .collect();
-            let capped = rows.len() > CSV_MAX_ROWS;
+            // Linha 0 = cabeçalho; demais = registros.
+            let total = parsed.rows.len() + 1;
             ScrollArea::both()
                 .id_salt("preview-csv")
                 .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    egui::Grid::new("preview-csv-grid")
-                        .striped(true)
-                        .min_col_width(32.0)
-                        .show(ui, |ui| {
-                            for field in &headers {
-                                ui.label(RichText::new(field.as_str()).strong());
-                            }
-                            ui.end_row();
-                            for row in rows.iter().take(CSV_MAX_ROWS) {
-                                for field in row {
-                                    ui.label(if field.is_empty() { " " } else { field });
+                .show_rows(ui, CSV_ROW_H, total, |ui, range| {
+                    ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                    for row_index in range {
+                        ui.horizontal(|ui| {
+                            if row_index == 0 {
+                                for field in &parsed.headers {
+                                    csv_cell(ui, field, true, ui.visuals().strong_text_color());
                                 }
-                                ui.end_row();
+                            } else if let Some(row) = parsed.rows.get(row_index - 1) {
+                                for field in row {
+                                    csv_cell(ui, field, false, ui.visuals().text_color());
+                                }
                             }
                         });
-                    if capped {
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(rust_i18n::t!(
-                                "preview_csv_limit",
-                                count => CSV_MAX_ROWS
-                            ))
-                            .size(12.5)
-                            .color(ui.visuals().warn_fg_color),
-                        );
                     }
                 });
+            if parsed.capped {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(rust_i18n::t!("preview_csv_limit", count => CSV_MAX_ROWS))
+                        .size(12.5)
+                        .color(ui.visuals().warn_fg_color),
+                );
+            }
         });
     }
 
@@ -4140,7 +4462,22 @@ impl AranduApp {
         image: &image::DynamicImage,
         visuals: &egui::Visuals,
     ) {
-        let rgba = image.to_rgba8();
+        // A conversão é cara (decodifica todos os pixels); reaproveita o RGBA
+        // enquanto a chave do preview não mudar.
+        let cached = self
+            .preview
+            .image
+            .as_ref()
+            .filter(|(cached_key, _)| cached_key == key)
+            .map(|(_, rgba)| Arc::clone(rgba));
+        let rgba = match cached {
+            Some(rgba) => rgba,
+            None => {
+                let rgba = Arc::new(image.to_rgba8());
+                self.preview.image = Some((key.clone(), Arc::clone(&rgba)));
+                rgba
+            }
+        };
         self.draw_preview_rgba(ui, body, key, &rgba, visuals);
     }
 
@@ -4408,6 +4745,7 @@ impl AranduApp {
                 for path in &dialog.paths {
                     self.tags.remove(path, &tag);
                 }
+                self.tags_changed();
                 self.persist_tags();
             }
 
@@ -4422,6 +4760,7 @@ impl AranduApp {
                         .iter()
                         .try_for_each(|path| self.tags.add(path, &tag));
                     if added.is_ok() {
+                        self.tags_changed();
                         self.persist_tags();
                         dialog.input.clear();
                         dialog.error = None;
@@ -4681,6 +5020,36 @@ impl AranduApp {
                 if let Some(error) = &validation {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 }
+                if dialog.running {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(rust_i18n::t!("batch_rename_running"));
+                    });
+                } else if let Some(result) = &dialog.result {
+                    let text = rust_i18n::t!(
+                        "batch_rename_done",
+                        ok => result.succeeded,
+                        errors => result.failures.len()
+                    );
+                    if result.failures.is_empty() {
+                        ui.label(text.to_string());
+                    } else {
+                        ui.colored_label(ui.visuals().error_fg_color, text.to_string());
+                        // Mostra até 5 falhas com o arquivo e o erro do sistema.
+                        for (path, error) in result.failures.iter().take(5) {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}: {error}",
+                                    truncate_for_display(&path.to_string_lossy(), 60)
+                                ))
+                                .text_style(TextStyle::Monospace),
+                            );
+                        }
+                        if result.failures.len() > 5 {
+                            ui.label("…");
+                        }
+                    }
+                }
                 if ui.input(|input| input.key_pressed(Key::Enter)) {
                     submit = true;
                 }
@@ -4689,26 +5058,33 @@ impl AranduApp {
                 }
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(
-                            validation.is_none(),
-                            egui::Button::new(rust_i18n::t!("batch_rename_ok")),
-                        )
-                        .clicked()
-                    {
-                        submit = true;
-                    }
-                    if ui.button(rust_i18n::t!("cancel")).clicked() {
-                        cancel = true;
+                    if dialog.running || dialog.result.is_some() {
+                        if ui.button(rust_i18n::t!("batch_rename_close")).clicked() {
+                            cancel = true;
+                        }
+                    } else {
+                        if ui
+                            .add_enabled(
+                                validation.is_none(),
+                                egui::Button::new(rust_i18n::t!("batch_rename_ok")),
+                            )
+                            .clicked()
+                        {
+                            submit = true;
+                        }
+                        if ui.button(rust_i18n::t!("cancel")).clicked() {
+                            cancel = true;
+                        }
                     }
                 });
             });
 
-            if submit && validation.is_none() {
+            if submit && validation.is_none() && !dialog.running && dialog.result.is_none() {
                 let pairs = renames
                     .into_iter()
                     .map(|(path, _, new_name)| (path, new_name))
                     .collect();
+                self.batch_rename = Some(dialog);
                 self.apply_batch_rename(pairs);
             } else if !cancel {
                 self.batch_rename = Some(dialog);
@@ -5654,6 +6030,21 @@ fn preview_reason(reason: UnsupportedReason) -> String {
     rust_i18n::t!(key).to_string()
 }
 
+/// Célula de largura fixa do preview CSV (mantém colunas alinhadas).
+fn csv_cell(ui: &mut Ui, field: &str, strong: bool, color: Color32) {
+    let mut rich = RichText::new(if field.is_empty() { " " } else { field })
+        .size(12.5)
+        .color(color);
+    if strong {
+        rich = rich.strong();
+    }
+    let response = ui.add_sized(
+        vec2(CSV_CELL_W, CSV_ROW_H),
+        Label::new(rich).truncate().sense(Sense::hover()),
+    );
+    response.on_hover_text(field);
+}
+
 /// Divide uma linha CSV/TSV em campos, tratando aspas duplas básicas.
 fn parse_csv_row(line: &str, delimiter: char) -> Vec<String> {
     let mut fields = Vec::new();
@@ -6290,10 +6681,13 @@ mod tests {
     use egui_kittest::kittest::Queryable;
 
     use super::{
-        AranduApp, GitTab, IndexScanStatus, OpenExecutor, PanelSide, ViewMode,
-        build_open_invocations, format_modified, parse_hex_color, visible_breadcrumb,
+        AranduApp, BatchRenameDialog, GitTab, IndexScanStatus, OpenExecutor, PanelSide,
+        PreviewContent, PreviewKey, ViewMode, build_open_invocations, format_modified,
+        parse_hex_color, visible_breadcrumb,
     };
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -7197,6 +7591,117 @@ mod tests {
     }
 
     #[test]
+    fn preview_switch_cancels_previous_request() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        fs::write(dir.path().join("a.txt"), b"AAAA").expect("cria a");
+        fs::write(dir.path().join("b.txt"), b"BBBB").expect("cria b");
+        let mut app = AranduApp::new_at(Config::default(), dir.path());
+        let a = app
+            .left
+            .entries
+            .iter()
+            .find(|entry| entry.name == "a.txt")
+            .cloned()
+            .expect("a.txt listado");
+        let b = app
+            .left
+            .entries
+            .iter()
+            .find(|entry| entry.name == "b.txt")
+            .cloned()
+            .expect("b.txt listado");
+
+        app.ensure_preview(Some(&a));
+        let first_generation = app.preview.generation;
+        let first_cancel = Arc::clone(&app.preview.cancel);
+        let key_a = PreviewKey::for_entry(&a);
+
+        // Troca rápida: a requisição anterior é cancelada e substituída.
+        app.ensure_preview(Some(&b));
+        assert_eq!(app.preview.generation, first_generation + 1);
+        assert_eq!(
+            app.preview.pending.as_ref(),
+            Some(&PreviewKey::for_entry(&b))
+        );
+        assert!(
+            first_cancel.load(Ordering::Relaxed),
+            "a requisição anterior deveria ter sido sinalizada para cancelar"
+        );
+
+        // Uma resposta de geração antiga é descartada em vez de ir ao cache.
+        let (sender, receiver) = mpsc::channel();
+        app.preview.receiver = Some(receiver);
+        sender
+            .send((
+                first_generation,
+                key_a.clone(),
+                Ok(PreviewContent::Text {
+                    text: "obsoleto".to_owned(),
+                    truncated: false,
+                    syntax_name: None,
+                }),
+            ))
+            .expect("envia resposta obsoleta");
+        app.pump_preview();
+        assert!(
+            app.preview.cache.get(&key_a).is_none(),
+            "resultado de requisição cancelada não deveria entrar no cache"
+        );
+    }
+
+    #[test]
+    fn batch_rename_runs_in_background_and_reports_failures() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        fs::write(dir.path().join("antigo.txt"), b"x").expect("cria arquivo");
+        let mut app = AranduApp::new_at(Config::default(), dir.path());
+        let old = dir.path().join("antigo.txt");
+        let missing = dir.path().join("sumiu.txt");
+        app.batch_rename = Some(BatchRenameDialog {
+            paths: vec![old.clone(), missing.clone()],
+            pattern: String::new(),
+            running: false,
+            result: None,
+        });
+
+        app.apply_batch_rename(vec![
+            (old.clone(), "novo.txt".to_owned()),
+            (missing.clone(), "destino.txt".to_owned()),
+        ]);
+        assert!(
+            app.batch_rename
+                .as_ref()
+                .is_some_and(|dialog| dialog.running),
+            "o modal deveria indicar execução em andamento"
+        );
+        for _ in 0..200 {
+            if app.batch_rename_job.is_none() {
+                break;
+            }
+            app.pump_batch_rename();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.batch_rename_job.is_none(), "job deveria terminar");
+
+        let dialog = app.batch_rename.as_ref().expect("modal permanece aberto");
+        assert!(!dialog.running);
+        let outcome = dialog.result.as_ref().expect("resultado exibido no modal");
+        assert_eq!(outcome.succeeded, 1);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].0, missing);
+        assert!(
+            !outcome.failures[0].1.is_empty(),
+            "erro do sistema preservado"
+        );
+        assert!(dir.path().join("novo.txt").exists());
+        assert!(
+            app.left
+                .entries
+                .iter()
+                .any(|entry| entry.name == "novo.txt")
+        );
+    }
+
+    #[test]
     fn preview_hex_shows_offsets() {
         let (_dir, app) = preview_app_for("dados.bin", &[0u8; 20]);
         let mut harness = Harness::builder()
@@ -7477,9 +7982,39 @@ mod tests {
         let path = dir.path().join("fixture-file.txt");
         app.tags.add(&path, "chip").expect("adiciona tag");
 
-        let map = app.tag_map_for(&app.left);
+        let map = app.tag_map_for(PanelSide::Left);
         let key = path.to_string_lossy().into_owned();
         assert_eq!(map.get(&key), Some(&vec!["chip".to_owned()]));
+    }
+
+    #[test]
+    fn tag_map_reuses_cache_until_tags_or_entries_change() {
+        let (dir, mut app) = fixture_app();
+        let path = dir.path().join("fixture-file.txt");
+        app.tags.add(&path, "chip").expect("adiciona tag");
+
+        let key = path.to_string_lossy().into_owned();
+        let first = app.tag_map_for(PanelSide::Left);
+        assert_eq!(first.get(&key), Some(&vec!["chip".to_owned()]));
+        assert_eq!(app.tag_cache_computations, 1);
+
+        // Frame seguinte sem mudanças: cache reutilizado (sem canonicalize).
+        let again = app.tag_map_for(PanelSide::Left);
+        assert_eq!(again.get(&key), Some(&vec!["chip".to_owned()]));
+        assert_eq!(
+            app.tag_cache_computations, 1,
+            "o mapa não deve ser recalculado por frame"
+        );
+
+        // Edição de tags invalida o cache e reflete o novo valor.
+        app.tags.add(&path, "nova").expect("adiciona tag");
+        app.tags_changed();
+        let updated = app.tag_map_for(PanelSide::Left);
+        assert_eq!(
+            updated.get(&key),
+            Some(&vec!["chip".to_owned(), "nova".to_owned()])
+        );
+        assert_eq!(app.tag_cache_computations, 2);
     }
 
     #[test]
@@ -7864,9 +8399,16 @@ mod tests {
         harness.run_steps(2);
 
         harness.get_by_label("ola").click();
-        harness.run_steps(2);
-
         let expected = format!("plugin ok: {}", dir.path().display());
+        // O comando roda em thread própria; espera o aviso chegar (o aviso de
+        // "plugins carregados" ainda está visível no primeiro frame).
+        for _ in 0..200 {
+            if harness.state().notice_text().as_deref() == Some(expected.as_str()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run_steps(1);
+        }
         assert_eq!(
             harness.state().notice_text().as_deref(),
             Some(expected.as_str())

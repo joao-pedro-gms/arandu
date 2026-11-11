@@ -25,6 +25,17 @@
 //!   struct [`GitStatus`].
 //! - A identidade do commit vem de `user.name`/`user.email` (via gix). Se
 //!   ausente, usamos `Arandu <arandu@localhost>`, como combinado.
+//! - O log é um walk first-DFS a partir de `HEAD` (primeiro pai primeiro),
+//!   limitado por [`DEFAULT_LOG_LIMIT`]. O grafo ASCII é uma aproximação
+//!   determinística de `git log --graph --oneline`: uma linha por commit,
+//!   com colunas de lanes e um marcador `|\` nos merges.
+//! - O blame usa o algoritmo nativo do `gix-blame` (já habilitado pela feature
+//!   `extras` padrão do gix 0.90), partindo do commit de `HEAD`. Linhas
+//!   alteradas apenas no worktree não aparecem: o blame reflete o conteúdo
+//!   commitado, não o arquivo em disco. Isso mantém a operação barata e
+//!   determinística.
+//! - Datas são formatadas em `YYYY-MM-DD HH:MM` no fuso gravado no commit
+//!   (o mesmo que `git log --date=local` mostraria para o autor).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -36,6 +47,12 @@ use gix::objs::tree::{EntryKind, EntryMode};
 
 /// Máximo de commits visitados ao calcular `ahead`/`behind` de cada lado.
 const MAX_GRAPH_WALK: usize = 10_000;
+
+/// Limite padrão de commits retornados por [`Repo::log`].
+pub const DEFAULT_LOG_LIMIT: usize = 500;
+
+/// Limite padrão de linhas anotadas por [`Repo::blame_file`].
+pub const DEFAULT_BLAME_LINES: usize = 2_000;
 
 /// Identidade usada quando o repositório não tem `user.name`/`user.email`.
 const FALLBACK_NAME: &str = "Arandu";
@@ -123,6 +140,34 @@ impl GitStatus {
     pub fn is_clean(&self) -> bool {
         self.staged.is_empty() && self.modified.is_empty() && self.untracked.is_empty()
     }
+}
+
+/// Um commit resumido para o log gráfico.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitInfo {
+    /// Id curto (8 caracteres hexadecimais).
+    pub id: String,
+    /// Primeira linha da mensagem de commit.
+    pub message: String,
+    /// Nome do autor.
+    pub author: String,
+    /// Data do commit em `YYYY-MM-DD HH:MM` (fuso do commit).
+    pub time: String,
+    /// Ids curtos dos pais (2 ou mais indicam merge).
+    pub parents: Vec<String>,
+}
+
+/// Uma linha de arquivo anotada com o commit que a introduziu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlameLine {
+    /// Id curto (8 caracteres hexadecimais) do commit.
+    pub commit: String,
+    /// Nome do autor do commit.
+    pub author: String,
+    /// Data do commit em `YYYY-MM-DD HH:MM` (fuso do commit).
+    pub time: String,
+    /// Conteúdo da linha, sem o terminador.
+    pub content: String,
 }
 
 /// Um repositório Git aberto.
@@ -359,6 +404,142 @@ impl Repo {
             .commit_as(signature, signature, "HEAD", message, tree, parents)
             .map_err(gix_err)
             .map(|id| id.detach())
+    }
+
+    /// Caminha os commits de `HEAD` em profundidade, primeiro pai primeiro.
+    ///
+    /// `max == 0` usa [`DEFAULT_LOG_LIMIT`]. Um repositório sem commits
+    /// (HEAD unborn) retorna uma lista vazia.
+    pub fn log(&self, max: usize) -> Result<Vec<CommitInfo>, GitError> {
+        let max = if max == 0 { DEFAULT_LOG_LIMIT } else { max };
+        let mut head = self.inner.head().map_err(gix_err)?;
+        if head.is_unborn() {
+            return Ok(Vec::new());
+        }
+        let head_id = head.peel_to_commit().map_err(gix_err)?.id().detach();
+
+        let mut commits = Vec::new();
+        let mut seen = HashSet::new();
+        let mut stack = vec![head_id];
+        while let Some(id) = stack.pop() {
+            if commits.len() >= max {
+                break;
+            }
+            if !seen.insert(id) {
+                continue;
+            }
+            let Ok(commit) = self.inner.find_commit(id) else {
+                continue;
+            };
+            let author = commit
+                .author()
+                .ok()
+                .map(|author| author.name.to_str_lossy().trim().to_string())
+                .unwrap_or_default();
+            let time = commit
+                .time()
+                .ok()
+                .map(format_git_time)
+                .unwrap_or_else(|| "-".to_string());
+            let message = commit
+                .message()
+                .ok()
+                .map(|message| message.title.to_str_lossy().trim().to_string())
+                .unwrap_or_default();
+            let parents: Vec<gix::ObjectId> =
+                commit.parent_ids().map(|parent| parent.detach()).collect();
+            // Empilha os pais ao contrário para visitar o primeiro pai primeiro.
+            for parent in parents.iter().rev() {
+                if !seen.contains(parent) {
+                    stack.push(*parent);
+                }
+            }
+            commits.push(CommitInfo {
+                id: short_id(id),
+                message,
+                author,
+                time,
+                parents: parents.into_iter().map(short_id).collect(),
+            });
+        }
+        Ok(commits)
+    }
+
+    /// Anota cada linha de `path` (na versão de `HEAD`) com o commit que a
+    /// introduziu.
+    ///
+    /// `max_lines == 0` usa [`DEFAULT_BLAME_LINES`]. A anotação usa o algoritmo
+    /// nativo do `gix-blame`; arquivos sem versão commitada retornam erro.
+    pub fn blame_file(&self, path: &Path, max_lines: usize) -> Result<Vec<BlameLine>, GitError> {
+        let max_lines = if max_lines == 0 {
+            DEFAULT_BLAME_LINES
+        } else {
+            max_lines
+        };
+        let rela = self.rela_path(path)?;
+        let mut head = self.inner.head().map_err(gix_err)?;
+        if head.is_unborn() {
+            return Ok(Vec::new());
+        }
+        let head_id = head.peel_to_commit().map_err(gix_err)?.id().detach();
+
+        let limit = u32::try_from(max_lines).unwrap_or(u32::MAX);
+        let range = 0..limit;
+        let outcome = self
+            .inner
+            .blame_file(
+                rela.as_bstr(),
+                head_id,
+                gix::repository::blame_file::Options {
+                    ranges: gix::blame::BlameRanges::PartialFile(vec![range]),
+                    ..Default::default()
+                },
+            )
+            .map_err(gix_err)?;
+
+        let mut lines = Vec::new();
+        for (entry, content) in outcome.entries_with_lines() {
+            let (author, time) = self.commit_meta(entry.commit_id);
+            let commit = short_id(entry.commit_id);
+            for line in content {
+                if lines.len() >= max_lines {
+                    break;
+                }
+                let content = line.to_str_lossy();
+                let content = content.trim_end_matches(['\n', '\r']).to_string();
+                lines.push(BlameLine {
+                    commit: commit.clone(),
+                    author: author.clone(),
+                    time: time.clone(),
+                    content,
+                });
+            }
+            if lines.len() >= max_lines {
+                break;
+            }
+        }
+        lines.truncate(max_lines);
+        Ok(lines)
+    }
+
+    /// Autor e data formatada de um commit, com fallback vazio em falha.
+    fn commit_meta(&self, id: gix::ObjectId) -> (String, String) {
+        match self.inner.find_commit(id) {
+            Ok(commit) => {
+                let author = commit
+                    .author()
+                    .ok()
+                    .map(|author| author.name.to_str_lossy().trim().to_string())
+                    .unwrap_or_default();
+                let time = commit
+                    .time()
+                    .ok()
+                    .map(format_git_time)
+                    .unwrap_or_else(|| "-".to_string());
+                (author, time)
+            }
+            Err(_) => (String::new(), "-".to_string()),
+        }
     }
 
     /// Abre o index; repositórios recém-inicializados ainda não têm `.git/index`.
@@ -674,6 +855,81 @@ fn sort_dedup(entries: &mut Vec<FileEntry>) {
     entries.dedup();
 }
 
+/// Id curto de 8 caracteres hexadecimais.
+fn short_id(id: gix::ObjectId) -> String {
+    id.to_hex_with_len(8).to_string()
+}
+
+/// Formata um instante Git como `YYYY-MM-DD HH:MM` no fuso do commit.
+fn format_git_time(time: gix::date::Time) -> String {
+    let seconds = time.seconds + i64::from(time.offset);
+    let days = seconds.div_euclid(86_400);
+    let rem = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
+        rem / 3_600,
+        (rem % 3_600) / 60
+    )
+}
+
+/// Converte dias desde 1970-01-01 em (ano, mês, dia) — algoritmo de Hinnant.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// Renderiza o grafo ASCII do log, uma string por commit.
+///
+/// O resultado é uma aproximação determinística de
+/// `git log --graph --oneline`: colunas representam lanes ativas, `*` marca o
+/// commit da linha e merges acrescentam o marcador `|\`. A função é pura e
+/// não depende do repositório, o que facilita os testes.
+pub fn render_graph(commits: &[CommitInfo]) -> Vec<String> {
+    let mut lanes: Vec<&str> = Vec::new();
+    let mut graph = Vec::with_capacity(commits.len());
+
+    for commit in commits {
+        let lane = match lanes.iter().position(|id| *id == commit.id) {
+            Some(index) => index,
+            None => {
+                lanes.push(commit.id.as_str());
+                lanes.len() - 1
+            }
+        };
+
+        let mut row = String::new();
+        for column in 0..lanes.len() {
+            row.push(if column == lane { '*' } else { '|' });
+            row.push(' ');
+        }
+
+        lanes.remove(lane);
+        for (offset, parent) in commit.parents.iter().enumerate() {
+            if lanes.contains(&parent.as_str()) {
+                continue;
+            }
+            let position = (lane + offset).min(lanes.len());
+            lanes.insert(position, parent.as_str());
+        }
+
+        if commit.parents.len() >= 2 {
+            row.push_str("|\\ ");
+        }
+        graph.push(row);
+    }
+
+    graph
+}
+
 #[cfg(unix)]
 fn is_executable(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -877,5 +1133,134 @@ mod tests {
         assert_eq!(status.modified.len(), 1);
         assert_eq!(status.modified[0].path, PathBuf::from("tracked.txt"));
         assert_eq!(status.modified[0].status, FileStatus::Modified);
+    }
+
+    #[test]
+    fn log_linear_lista_commits_do_mais_novo_ao_mais_antigo() {
+        let repo = TestRepo::new();
+        repo.write("a.txt", "1");
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "primeiro"]);
+        repo.write("b.txt", "2");
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "segundo"]);
+        repo.write("c.txt", "3");
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "terceiro"]);
+
+        let log = Repo::discover(&repo.path).unwrap().log(10).unwrap();
+        let messages: Vec<&str> = log.iter().map(|commit| commit.message.as_str()).collect();
+        assert_eq!(messages, vec!["terceiro", "segundo", "primeiro"]);
+        assert!(log.iter().all(|commit| commit.id.len() == 8));
+        assert_eq!(log[0].parents.len(), 1);
+        assert!(log.last().unwrap().parents.is_empty());
+        assert_eq!(log[0].author, "Teste");
+
+        let graph = render_graph(&log);
+        assert_eq!(graph, vec!["* ", "* ", "* "]);
+    }
+
+    #[test]
+    fn log_com_merge_marca_grafo_com_linha_de_bifurcacao() {
+        let repo = TestRepo::new();
+        repo.write("base.txt", "base");
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "base"]);
+
+        repo.git(&["checkout", "-b", "feature"]);
+        repo.write("feature.txt", "f");
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "feature"]);
+
+        repo.git(&["checkout", "main"]);
+        repo.write("main.txt", "m");
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "main"]);
+        repo.git(&["merge", "--no-ff", "feature", "-m", "merge feature"]);
+
+        let log = Repo::discover(&repo.path).unwrap().log(20).unwrap();
+        assert_eq!(log[0].message, "merge feature");
+        assert_eq!(log[0].parents.len(), 2, "merge deve ter dois pais");
+
+        let graph = render_graph(&log);
+        assert_eq!(graph.len(), log.len());
+        assert!(
+            graph.iter().any(|line| line.contains('|')),
+            "grafo de merge deveria conter '|': {graph:?}"
+        );
+    }
+
+    #[test]
+    fn blame_atribui_linhas_aos_commits_certos() {
+        let repo = TestRepo::new();
+        repo.write("linhas.txt", "um\ndois\ntres\n");
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "inicial"]);
+        let first = repo.git(&["rev-parse", "HEAD"]);
+
+        repo.write("linhas.txt", "UM\ndois\ntres\n");
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "altera primeira"]);
+        let second = repo.git(&["rev-parse", "HEAD"]);
+
+        let repo = Repo::discover(&repo.path).unwrap();
+        let blame = repo
+            .blame_file(&repo.root().join("linhas.txt"), 0)
+            .expect("blame");
+
+        assert_eq!(blame.len(), 3);
+        assert_eq!(blame[0].commit, second[..8]);
+        assert_eq!(blame[1].commit, first[..8]);
+        assert_eq!(blame[2].commit, first[..8]);
+        let contents: Vec<&str> = blame.iter().map(|line| line.content.as_str()).collect();
+        assert_eq!(contents, vec!["UM", "dois", "tres"]);
+        assert_eq!(blame[0].author, "Teste");
+    }
+
+    #[test]
+    fn blame_respeita_cap_de_linhas() {
+        let repo = TestRepo::new();
+        let contents = (1..=10)
+            .map(|line| format!("linha {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        repo.write("longo.txt", &contents);
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-m", "inicial"]);
+
+        let repo = Repo::discover(&repo.path).unwrap();
+        let blame = repo.blame_file(&repo.root().join("longo.txt"), 4).unwrap();
+        assert_eq!(blame.len(), 4);
+        assert_eq!(blame[0].content, "linha 1");
+        assert_eq!(blame[3].content, "linha 4");
+    }
+
+    #[test]
+    fn render_graph_e_deterministico_para_merge() {
+        let commits = vec![
+            CommitInfo {
+                id: "aaaaaaaa".into(),
+                message: "merge".into(),
+                author: "A".into(),
+                time: "2026-01-01 00:00".into(),
+                parents: vec!["bbbbbbbb".into(), "cccccccc".into()],
+            },
+            CommitInfo {
+                id: "bbbbbbbb".into(),
+                message: "main".into(),
+                author: "A".into(),
+                time: "2026-01-01 00:00".into(),
+                parents: vec!["dddddddd".into()],
+            },
+            CommitInfo {
+                id: "cccccccc".into(),
+                message: "feature".into(),
+                author: "A".into(),
+                time: "2026-01-01 00:00".into(),
+                parents: vec!["dddddddd".into()],
+            },
+        ];
+        let graph = render_graph(&commits);
+        assert_eq!(graph, vec!["* |\\ ", "* | ", "| * "]);
     }
 }

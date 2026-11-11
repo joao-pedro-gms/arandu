@@ -33,7 +33,10 @@ use arandu_core::preview::{
     PreviewContent, PreviewError, PreviewRequest, UnsupportedReason, hex_row,
 };
 use arandu_core::queue::{OpQueue, QueueEvent, UndoStack};
-use arandu_git::{FileStatus, GitStatus, Repo};
+use arandu_git::{
+    BlameLine, CommitInfo, DEFAULT_BLAME_LINES, DEFAULT_LOG_LIMIT, FileStatus, GitStatus, Repo,
+    render_graph,
+};
 use arandu_index::{IndexEntry, IndexStore, Indexer};
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Key, Label, Layout, Modifiers, Rect, RichText,
@@ -585,11 +588,38 @@ enum GitRefresh {
     Failed(String),
 }
 
+/// Resultado de uma consulta de log: diretório consultado + commits.
+type LogRefresh = (PathBuf, Result<Vec<CommitInfo>, String>);
+/// Resultado de uma consulta de blame: arquivo consultado + linhas.
+type BlameRefresh = (PathBuf, Result<Vec<BlameLine>, String>);
+
+/// Aba visível no painel Git.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum GitTab {
+    #[default]
+    Status,
+    Log,
+    Blame,
+}
+
+impl GitTab {
+    /// Próxima aba, em ciclo (usada por Shift+Tab).
+    fn next(self) -> Self {
+        match self {
+            Self::Status => Self::Log,
+            Self::Log => Self::Blame,
+            Self::Blame => Self::Status,
+        }
+    }
+}
+
 /// Estado do painel Git.
 #[derive(Default)]
 struct GitState {
     /// Painel visível (Ctrl+G alterna).
     visible: bool,
+    /// Aba ativa (Status, Log ou Blame).
+    tab: GitTab,
     /// Diretório da última consulta (para detectar troca de painel).
     requested_dir: Option<PathBuf>,
     /// Raiz do repositório descoberto.
@@ -604,9 +634,29 @@ struct GitState {
     action_error: Option<String>,
     /// Consulta em andamento.
     receiver: Option<Receiver<(PathBuf, GitRefresh)>>,
+    /// Commits carregados para a aba Log.
+    log: Vec<CommitInfo>,
+    /// Grafo ASCII correspondente a `log`.
+    log_graph: Vec<String>,
+    /// Diretório dos dados de log atuais (ou da requisição em voo).
+    log_dir: Option<PathBuf>,
+    /// Erro ao carregar o log.
+    log_error: Option<String>,
+    /// Requisição de log em andamento.
+    log_receiver: Option<Receiver<LogRefresh>>,
+    /// Linhas de blame carregadas.
+    blame: Vec<BlameLine>,
+    /// Arquivo dos dados de blame atuais (ou da requisição em voo).
+    blame_path: Option<PathBuf>,
+    /// Erro ao carregar o blame.
+    blame_error: Option<String>,
+    /// Requisição de blame em andamento.
+    blame_receiver: Option<Receiver<BlameRefresh>>,
+    /// O blame atingiu o limite de linhas.
+    blame_truncated: bool,
     /// Mensagem de commit em edição.
     commit_message: String,
-    /// Linha focada na lista (staged + modified + untracked).
+    /// Linha focada na lista (staged + modified + untracked, ou log).
     focus: usize,
     /// O teclado está focado no painel Git.
     focused: bool,
@@ -835,7 +885,11 @@ impl AranduApp {
         self.pump_git();
         self.request_git_refresh(false);
         self.pump_index_scan(&ctx);
-        if self.compress_job.is_some() || self.extract_job.is_some() || self.git.receiver.is_some()
+        if self.compress_job.is_some()
+            || self.extract_job.is_some()
+            || self.git.receiver.is_some()
+            || self.git.log_receiver.is_some()
+            || self.git.blame_receiver.is_some()
         {
             ctx.request_repaint();
         }
@@ -1131,7 +1185,17 @@ impl AranduApp {
         }
 
         let toggle_preview = self.action_pressed(Action::TogglePreview, &pressed);
-        let toggle_git = self.action_pressed(Action::ToggleGitPanel, &pressed);
+        // Ctrl+Shift+G também satisfaz o binding de Ctrl+G (o matching ignora
+        // Shift em letras), então o log tem precedência quando Shift está ativo.
+        let toggle_git_log = pressed.iter().any(|key| {
+            key.mods.shift
+                && self
+                    .keymap
+                    .effective(Action::ToggleGitLog)
+                    .iter()
+                    .any(|binding| binding.matches(key))
+        });
+        let toggle_git = !toggle_git_log && self.action_pressed(Action::ToggleGitPanel, &pressed);
         let toggle_view_mode = self.action_pressed(Action::ToggleViewMode, &pressed);
         let toggle_panel = self.action_pressed(Action::TogglePanel, &pressed);
         let up = self.action_pressed(Action::NavigateUp, &pressed);
@@ -1156,6 +1220,9 @@ impl AranduApp {
         }
         if toggle_git {
             self.toggle_git_panel();
+        }
+        if toggle_git_log {
+            self.open_git_log();
         }
         if toggle_view_mode {
             self.active_panel_mut().toggle_view_mode();
@@ -1182,19 +1249,42 @@ impl AranduApp {
 
             let mut git_navigated = false;
             if self.git.visible && self.git.focused {
-                let rows = self.git_rows();
-                if !rows.is_empty() {
-                    if up {
-                        self.git.focus = self.git.focus.saturating_sub(1);
+                if ctx.input_mut(|input| input.consume_key(Modifiers::SHIFT, Key::Tab)) {
+                    self.git.tab = self.git.tab.next();
+                    self.git.focus = 0;
+                    git_navigated = true;
+                }
+                match self.git.tab {
+                    GitTab::Status => {
+                        let rows = self.git_rows();
+                        if !rows.is_empty() {
+                            if up {
+                                self.git.focus = self.git.focus.saturating_sub(1);
+                            }
+                            if down {
+                                self.git.focus = (self.git.focus + 1).min(rows.len() - 1);
+                            }
+                            if enter {
+                                let (staged, path) =
+                                    rows[self.git.focus.min(rows.len() - 1)].clone();
+                                self.git_toggle(path, !staged);
+                            }
+                            git_navigated = up || down || enter;
+                        }
                     }
-                    if down {
-                        self.git.focus = (self.git.focus + 1).min(rows.len() - 1);
+                    GitTab::Log => {
+                        if !self.git.log.is_empty() {
+                            if up {
+                                self.git.focus = self.git.focus.saturating_sub(1);
+                            }
+                            if down {
+                                self.git.focus = (self.git.focus + 1).min(self.git.log.len() - 1);
+                            }
+                            // Enter é reservado para ações futuras sobre commits.
+                            git_navigated = up || down || enter;
+                        }
                     }
-                    if enter {
-                        let (staged, path) = rows[self.git.focus.min(rows.len() - 1)].clone();
-                        self.git_toggle(path, !staged);
-                    }
-                    git_navigated = up || down || enter;
+                    GitTab::Blame => {}
                 }
             }
 
@@ -1694,6 +1784,96 @@ impl AranduApp {
         self.active_panel().cwd.clone()
     }
 
+    /// Arquivo focado no painel ativo, se for um arquivo (não diretório).
+    fn git_blame_target(&self) -> Option<PathBuf> {
+        let panel = self.active_panel();
+        let entry = panel.entries.get(panel.focus)?;
+        (!entry.is_dir).then(|| entry.path.clone())
+    }
+
+    /// Abre o painel Git já na aba Log.
+    fn open_git_log(&mut self) {
+        self.git.visible = true;
+        self.git.tab = GitTab::Log;
+        self.git.focus = 0;
+        self.git.focused = false;
+        self.request_git_refresh(true);
+    }
+
+    /// Dispara a consulta do log se a aba Log estiver ativa e os dados forem
+    /// de outro diretório.
+    fn request_git_log(&mut self, force: bool) {
+        if self.git.tab != GitTab::Log {
+            return;
+        }
+        let dir = self.git_target_dir();
+        if force {
+            self.git.log_receiver = None;
+            self.git.log_dir = None;
+            self.git.log_error = None;
+        }
+        if self.git.log_receiver.is_some() {
+            return;
+        }
+        if !force && self.git.log_dir.as_deref() == Some(dir.as_path()) {
+            return;
+        }
+
+        self.git.log_dir = Some(dir.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.git.log_receiver = Some(receiver);
+        std::thread::spawn(move || {
+            let result = match Repo::discover(&dir) {
+                None => Err("not a git repository".to_string()),
+                Some(repo) => repo
+                    .log(DEFAULT_LOG_LIMIT)
+                    .map_err(|error| error.to_string()),
+            };
+            let _ = sender.send((dir, result));
+        });
+    }
+
+    /// Dispara o blame do arquivo focado quando a aba Blame está ativa.
+    fn request_git_blame(&mut self, force: bool) {
+        if self.git.tab != GitTab::Blame {
+            return;
+        }
+        let Some(path) = self.git_blame_target() else {
+            if self.git.blame_receiver.is_none() {
+                self.git.blame.clear();
+                self.git.blame_path = None;
+                self.git.blame_error = None;
+                self.git.blame_truncated = false;
+            }
+            return;
+        };
+        let dir = self.git_target_dir();
+        if force {
+            self.git.blame_receiver = None;
+            self.git.blame_path = None;
+            self.git.blame_error = None;
+        }
+        if self.git.blame_receiver.is_some() {
+            return;
+        }
+        if !force && self.git.blame_path.as_deref() == Some(path.as_path()) {
+            return;
+        }
+
+        self.git.blame_path = Some(path.clone());
+        let (sender, receiver) = mpsc::channel();
+        self.git.blame_receiver = Some(receiver);
+        std::thread::spawn(move || {
+            let result = match Repo::discover(&dir) {
+                None => Err("not a git repository".to_string()),
+                Some(repo) => repo
+                    .blame_file(&path, DEFAULT_BLAME_LINES)
+                    .map_err(|error| error.to_string()),
+            };
+            let _ = sender.send((path, result));
+        });
+    }
+
     /// Dispara (se necessário) uma consulta de status em background.
     ///
     /// `force` ignora o intervalo de 10 s e reinicia uma consulta em voo —
@@ -1702,6 +1882,8 @@ impl AranduApp {
         if !self.git.visible {
             return;
         }
+        self.request_git_log(force);
+        self.request_git_blame(force);
         let dir = self.git_target_dir();
         if force {
             // A thread antiga termina sozinha; o `send` falha no canal órfão.
@@ -1740,6 +1922,8 @@ impl AranduApp {
 
     /// Drena o resultado da consulta de status sem bloquear a UI.
     fn pump_git(&mut self) {
+        self.pump_git_log();
+        self.pump_git_blame();
         let Some(receiver) = self.git.receiver.as_ref() else {
             return;
         };
@@ -1776,6 +1960,74 @@ impl AranduApp {
             GitRefresh::Failed(error) => {
                 self.git.error = Some(error);
                 self.git.not_repo = false;
+            }
+        }
+    }
+
+    /// Drena o resultado do log em background.
+    fn pump_git_log(&mut self) {
+        let Some(receiver) = self.git.log_receiver.as_ref() else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.git.log_receiver = None;
+                return;
+            }
+        };
+        self.git.log_receiver = None;
+        let (dir, result) = result;
+        if self.git_target_dir() != dir {
+            return;
+        }
+        self.git.log_dir = Some(dir);
+        match result {
+            Ok(commits) => {
+                self.git.log_graph = render_graph(&commits);
+                self.git.log = commits;
+                self.git.log_error = None;
+                self.git.focus = self.git.focus.min(self.git.log.len().saturating_sub(1));
+            }
+            Err(error) => {
+                self.git.log.clear();
+                self.git.log_graph.clear();
+                self.git.log_error = Some(error);
+            }
+        }
+    }
+
+    /// Drena o resultado do blame em background.
+    fn pump_git_blame(&mut self) {
+        let Some(receiver) = self.git.blame_receiver.as_ref() else {
+            return;
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.git.blame_receiver = None;
+                return;
+            }
+        };
+        self.git.blame_receiver = None;
+        let (path, result) = result;
+        // Descarta resultados de um arquivo que já não está focado.
+        if self.git_blame_target().as_deref() != Some(path.as_path()) {
+            return;
+        }
+        self.git.blame_path = Some(path);
+        match result {
+            Ok(lines) => {
+                self.git.blame_truncated = lines.len() >= DEFAULT_BLAME_LINES;
+                self.git.blame = lines;
+                self.git.blame_error = None;
+            }
+            Err(error) => {
+                self.git.blame.clear();
+                self.git.blame_truncated = false;
+                self.git.blame_error = Some(error);
             }
         }
     }
@@ -2354,6 +2606,18 @@ impl AranduApp {
             .into_iter()
             .next()
             .map(|binding| format!("{binding} {}", action_description(Action::ToggleGitPanel)));
+        let branch_info = self.git.status.as_ref().map(|status| {
+            let branch = status
+                .branch
+                .clone()
+                .unwrap_or_else(|| rust_i18n::t!("git_detached").into_owned());
+            let upstream = status
+                .upstream
+                .as_ref()
+                .map(|upstream| format!("{upstream} ↑{} ↓{}", status.ahead, status.behind));
+            (branch, upstream)
+        });
+        let mut next_tab: Option<GitTab> = None;
 
         ui.scope_builder(UiBuilder::new().max_rect(inner), |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -2362,24 +2626,29 @@ impl AranduApp {
                 Layout::left_to_right(Align::Center),
                 |ui| {
                     ui.label(RichText::new(rust_i18n::t!("git_title")).strong());
-                    if let Some(status) = &self.git.status {
-                        let branch = status
-                            .branch
-                            .clone()
-                            .unwrap_or_else(|| rust_i18n::t!("git_detached").into_owned());
+                    let tabs = [
+                        (GitTab::Status, rust_i18n::t!("git_tab_status").into_owned()),
+                        (GitTab::Log, rust_i18n::t!("git_tab_log").into_owned()),
+                        (GitTab::Blame, rust_i18n::t!("git_tab_blame").into_owned()),
+                    ];
+                    for (tab, label) in tabs {
+                        let response = ui
+                            .selectable_label(self.git.tab == tab, RichText::new(label).size(11.5));
+                        if response.clicked() {
+                            next_tab = Some(tab);
+                        }
+                    }
+                    if let Some((branch, upstream)) = &branch_info {
                         ui.label(
                             RichText::new(branch)
-                                .size(12.5)
+                                .size(12.0)
                                 .color(visuals.weak_text_color()),
                         );
-                        if let Some(upstream) = &status.upstream {
+                        if let Some(upstream) = upstream {
                             ui.label(
-                                RichText::new(format!(
-                                    "{upstream} ↑{} ↓{}",
-                                    status.ahead, status.behind
-                                ))
-                                .size(11.5)
-                                .color(visuals.weak_text_color()),
+                                RichText::new(upstream)
+                                    .size(11.0)
+                                    .color(visuals.weak_text_color()),
                             );
                         }
                     }
@@ -2387,7 +2656,7 @@ impl AranduApp {
                         if let Some(hint) = &toggle_hint {
                             ui.label(
                                 RichText::new(hint)
-                                    .size(12.5)
+                                    .size(12.0)
                                     .color(visuals.weak_text_color()),
                             );
                         }
@@ -2404,6 +2673,11 @@ impl AranduApp {
                 Rect::from_min_max(pos2(inner.left(), header.response.rect.bottom()), inner.max);
             self.draw_git_body(ui, body, visuals);
         });
+
+        if let Some(tab) = next_tab {
+            self.git.tab = tab;
+            self.git.focus = 0;
+        }
 
         ui.painter().vline(
             rect.left(),
@@ -2426,6 +2700,16 @@ impl AranduApp {
             draw_preview_centered(ui, body, error, visuals);
             return;
         }
+
+        match self.git.tab {
+            GitTab::Status => self.draw_git_status_body(ui, body, visuals),
+            GitTab::Log => self.draw_git_log_body(ui, body, visuals),
+            GitTab::Blame => self.draw_git_blame_body(ui, body, visuals),
+        }
+    }
+
+    /// Aba Status: seções Staged/Modified/Untracked e formulário de commit.
+    fn draw_git_status_body(&mut self, ui: &mut Ui, body: Rect, visuals: &egui::Visuals) {
         let Some(status) = self.git.status.clone() else {
             draw_preview_centered(ui, body, rust_i18n::t!("git_loading"), visuals);
             return;
@@ -2554,6 +2838,135 @@ impl AranduApp {
         if commit_clicked {
             self.git_commit();
         }
+    }
+
+    /// Aba Log: lista virtualizada de commits com grafo ASCII.
+    fn draw_git_log_body(&mut self, ui: &mut Ui, body: Rect, visuals: &egui::Visuals) {
+        if let Some(error) = self.git.log_error.clone() {
+            draw_preview_centered(ui, body, error, visuals);
+            return;
+        }
+        if self.git.log.is_empty() {
+            let message = if self.git.log_receiver.is_some() {
+                rust_i18n::t!("git_loading")
+            } else {
+                rust_i18n::t!("git_log_empty")
+            };
+            draw_preview_centered(ui, body, message, visuals);
+            return;
+        }
+
+        const LOG_ROW_H: f32 = 20.0;
+        let rows = self.git.log.len();
+        let focus = self.git.focus;
+        let focused_panel = self.git.focused;
+        let mut clicked = None;
+
+        ui.scope_builder(
+            UiBuilder::new().max_rect(body.shrink2(vec2(6.0, 4.0))),
+            |ui| {
+                ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show_rows(ui, LOG_ROW_H, rows, |ui, range| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for index in range {
+                            let commit = &self.git.log[index];
+                            let graph = self
+                                .git
+                                .log_graph
+                                .get(index)
+                                .map(String::as_str)
+                                .unwrap_or("");
+                            let text = format!(
+                                "{graph:<6} {} {:<44} {:<12} {}",
+                                commit.id, commit.message, commit.author, commit.time
+                            );
+                            let mut rich = RichText::new(text).monospace().size(11.5);
+                            if focused_panel && index == focus {
+                                rich = rich.strong().color(visuals.strong_text_color());
+                            }
+                            let response =
+                                ui.add(Label::new(rich).truncate().sense(Sense::click()));
+                            if response.clicked() {
+                                clicked = Some(index);
+                            }
+                        }
+                    });
+            },
+        );
+
+        if let Some(index) = clicked {
+            self.git.focus = index;
+            self.git.focused = true;
+        }
+    }
+
+    /// Aba Blame: metadados por linha + conteúdo do arquivo focado.
+    fn draw_git_blame_body(&mut self, ui: &mut Ui, body: Rect, visuals: &egui::Visuals) {
+        if self.git_blame_target().is_none() {
+            draw_preview_centered(ui, body, rust_i18n::t!("git_blame_need_file"), visuals);
+            return;
+        }
+        if let Some(error) = self.git.blame_error.clone() {
+            draw_preview_centered(ui, body, error, visuals);
+            return;
+        }
+        if self.git.blame.is_empty() {
+            let message = if self.git.blame_receiver.is_some() {
+                rust_i18n::t!("git_loading")
+            } else {
+                rust_i18n::t!("git_blame_empty")
+            };
+            draw_preview_centered(ui, body, message, visuals);
+            return;
+        }
+
+        const BLAME_ROW_H: f32 = 20.0;
+        let rows = self.git.blame.len();
+        let truncated = self.git.blame_truncated;
+
+        ui.scope_builder(
+            UiBuilder::new().max_rect(body.shrink2(vec2(6.0, 4.0))),
+            |ui| {
+                if truncated {
+                    ui.label(
+                        RichText::new(rust_i18n::t!(
+                            "git_blame_truncated",
+                            max = DEFAULT_BLAME_LINES
+                        ))
+                        .small()
+                        .color(visuals.weak_text_color()),
+                    );
+                }
+                let meta_width = (ui.available_width() * 0.55).clamp(120.0, 280.0);
+                ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show_rows(ui, BLAME_ROW_H, rows, |ui, range| {
+                        ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
+                        for index in range {
+                            let line = &self.git.blame[index];
+                            let author: String = line.author.chars().take(10).collect();
+                            let meta = format!("{} {:<10} {}", line.commit, author, line.time);
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [meta_width, BLAME_ROW_H - 2.0],
+                                    Label::new(
+                                        RichText::new(meta)
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(visuals.weak_text_color()),
+                                    )
+                                    .truncate(),
+                                );
+                                ui.add(
+                                    Label::new(RichText::new(&line.content).monospace().size(11.5))
+                                        .truncate(),
+                                );
+                            });
+                        }
+                    });
+            },
+        );
     }
 
     /// Desenha o painel de preview completo (header + corpo).
@@ -4400,6 +4813,7 @@ fn action_description(action: Action) -> String {
         Action::Extract => "action_extract",
         Action::ToggleViewMode => "action_toggle_view_mode",
         Action::ToggleQuickOpen => "action_toggle_quick_open",
+        Action::ToggleGitLog => "action_toggle_git_log",
     };
     rust_i18n::t!(key).into_owned()
 }
@@ -4694,11 +5108,35 @@ mod tests {
     use egui_kittest::kittest::Queryable;
 
     use super::{
-        AranduApp, IndexScanStatus, PanelSide, ViewMode, format_modified, parse_hex_color,
+        AranduApp, GitTab, IndexScanStatus, PanelSide, ViewMode, format_modified, parse_hex_color,
         visible_breadcrumb,
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant, UNIX_EPOCH};
+
+    /// Executa `git` no diretório com configuração global isolada.
+    fn run_git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("executa git");
+        assert!(
+            output.status.success(),
+            "git {:?} falhou: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Inicializa um repositório com identidade fixa.
+    fn init_git_repo(dir: &Path) {
+        run_git(dir, &["init", "-b", "main"]);
+        run_git(dir, &["config", "user.name", "Teste"]);
+        run_git(dir, &["config", "user.email", "teste@example.com"]);
+    }
 
     fn fixture_app() -> (tempfile::TempDir, AranduApp) {
         let dir = tempfile::tempdir().expect("cria diretório temporário");
@@ -4869,6 +5307,170 @@ mod tests {
             "Enter de novo deveria despreparar o arquivo"
         );
         assert_eq!(status.untracked.len(), 1);
+    }
+
+    #[test]
+    fn git_panel_tabs_cycle_with_shift_tab() {
+        let (_dir, app) = fixture_app();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::G);
+        harness.run_steps(1);
+        harness.state_mut().git.focused = true;
+        assert_eq!(harness.state().git.tab, GitTab::Status);
+
+        for expected in [GitTab::Log, GitTab::Blame, GitTab::Status] {
+            harness.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Tab);
+            harness.run_steps(1);
+            assert_eq!(harness.state().git.tab, expected);
+        }
+    }
+
+    #[test]
+    fn git_log_lists_commits_in_graph_tab() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        init_git_repo(dir.path());
+        fs::write(dir.path().join("a.txt"), b"a").expect("escreve arquivo");
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "primeiro"]);
+        fs::write(dir.path().join("b.txt"), b"b").expect("escreve arquivo");
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "segundo"]);
+
+        let app = AranduApp::new_at(Config::default(), dir.path());
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        harness.key_press_modifiers(modifiers, egui::Key::G);
+        harness.run_steps(1);
+
+        for _ in 0..200 {
+            if harness.state().git.log.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run_steps(1);
+        }
+
+        let git = &harness.state().git;
+        assert_eq!(git.tab, GitTab::Log, "Ctrl+Shift+G deveria abrir a aba Log");
+        assert_eq!(git.log.len(), 2, "log deveria listar os dois commits");
+        assert_eq!(git.log[0].message, "segundo");
+        assert_eq!(git.log_graph.len(), git.log.len());
+
+        let commit = &git.log[0];
+        let graph = &git.log_graph[0];
+        let expected = format!(
+            "{graph:<6} {} {:<44} {:<12} {}",
+            commit.id, commit.message, commit.author, commit.time
+        );
+        assert!(
+            harness.query_all_by_label(&expected).count() >= 1,
+            "linha do log não apareceu na árvore de acessibilidade: {expected:?}"
+        );
+    }
+
+    #[test]
+    fn git_blame_shows_lines_of_focused_file() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        init_git_repo(dir.path());
+        fs::write(dir.path().join("arquivo.txt"), "um\ndois\n").expect("escreve arquivo");
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "inicial"]);
+        fs::write(dir.path().join("arquivo.txt"), "UM\ndois\n").expect("escreve arquivo");
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "altera primeira"]);
+
+        let app = AranduApp::new_at(Config::default(), dir.path());
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        let focus = harness
+            .state()
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.name == "arquivo.txt")
+            .expect("arquivo no painel");
+        harness.state_mut().left.focus = focus;
+
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::G);
+        harness.run_steps(1);
+        harness.state_mut().git.tab = GitTab::Blame;
+        harness.run_steps(1);
+
+        for _ in 0..200 {
+            if harness.state().git.blame.len() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run_steps(1);
+        }
+
+        let blame = &harness.state().git.blame;
+        assert_eq!(blame.len(), 2, "blame deveria anotar as duas linhas");
+        assert_eq!(blame[0].content, "UM");
+        assert_eq!(blame[1].content, "dois");
+        assert_ne!(
+            blame[0].commit, blame[1].commit,
+            "linhas de commits diferentes devem ter hashes diferentes"
+        );
+        assert!(
+            harness.query_all_by_label("dois").count() >= 1,
+            "conteúdo do blame não apareceu na árvore de acessibilidade"
+        );
+    }
+
+    #[test]
+    fn git_blame_shows_hint_when_focused_item_is_directory() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        init_git_repo(dir.path());
+        fs::create_dir(dir.path().join("subpasta")).expect("cria diretório");
+        fs::write(dir.path().join("subpasta/a.txt"), b"a").expect("escreve arquivo");
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "inicial"]);
+
+        let app = AranduApp::new_at(Config::default(), dir.path());
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        let focus = harness
+            .state()
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.name == "subpasta")
+            .expect("diretório no painel");
+        harness.state_mut().left.focus = focus;
+
+        harness.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::G);
+        harness.run_steps(1);
+        harness.state_mut().git.tab = GitTab::Blame;
+        harness.run_steps(1);
+
+        assert!(
+            harness.state().git_blame_target().is_none(),
+            "diretório não deve ter alvo de blame"
+        );
+        let hint = rust_i18n::t!("git_blame_need_file").into_owned();
+        assert!(
+            harness.query_all_by_label(&hint).count() >= 1,
+            "hint de diretório sem blame não apareceu: {hint:?}"
+        );
     }
 
     #[test]

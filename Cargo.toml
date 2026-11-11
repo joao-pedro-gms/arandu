@@ -45,6 +45,7 @@ toml = "1"
 directories = "6"
 eframe = "0.37"
 rust-i18n = "4.2"
+gix = "0.90"
 trash = "5"
 # `deflate` (flate2/zlib-rs e zopfli) é puro Rust; bzip2/zstd/aes exigiriam C.
 zip = { version = "9", default-features = false, features = ["deflate"] }

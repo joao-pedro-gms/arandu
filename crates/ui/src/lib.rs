@@ -3055,8 +3055,10 @@ impl AranduApp {
                 );
                 ui.add_space(12.0);
             } else {
-                let visuals = ui.visuals().clone();
-                let weak = visuals.weak_text_color();
+                let weak = ui.visuals().weak_text_color();
+                let selection_bg = ui.visuals().selection.bg_fill;
+                let strong = ui.visuals().strong_text_color();
+                let plain = ui.visuals().text_color();
                 for (index, (_, entry)) in quick.results.iter().enumerate() {
                     let selected = index == quick.focus;
                     let (rect, row) = ui.allocate_exact_size(
@@ -3064,14 +3066,9 @@ impl AranduApp {
                         Sense::click(),
                     );
                     if selected {
-                        ui.painter()
-                            .rect_filled(rect, 3.0, visuals.selection.bg_fill);
+                        ui.painter().rect_filled(rect, 3.0, selection_bg);
                     }
-                    let text_color = if selected {
-                        visuals.strong_text_color()
-                    } else {
-                        visuals.text_color()
-                    };
+                    let text_color = if selected { strong } else { plain };
                     let mut row_ui = ui.new_child(
                         UiBuilder::new()
                             .max_rect(rect.shrink2(vec2(8.0, 2.0)))
@@ -3159,13 +3156,10 @@ impl AranduApp {
     }
 
     fn draw_toolbar(&mut self, ui: &mut Ui, rect: Rect) {
-        let visuals = ui.visuals().clone();
-        ui.painter().rect_filled(rect, 0.0, visuals.faint_bg_color);
-        ui.painter().hline(
-            rect.x_range(),
-            rect.bottom(),
-            visuals.widgets.noninteractive.bg_stroke,
-        );
+        let faint = ui.visuals().faint_bg_color;
+        let separator = ui.visuals().widgets.noninteractive.bg_stroke;
+        ui.painter().rect_filled(rect, 0.0, faint);
+        ui.painter().hline(rect.x_range(), rect.bottom(), separator);
 
         ui.scope_builder(
             UiBuilder::new().max_rect(rect.shrink2(vec2(10.0, 0.0))),
@@ -3459,6 +3453,8 @@ impl AranduApp {
     }
 
     fn draw_content(&mut self, ui: &mut Ui, content: Rect) {
+        // Owned é necessário aqui: `ui.visuals()` empresta `ui` imutavelmente,
+        // mas os métodos de desenho abaixo recebem `&mut Ui` e `&Visuals`.
         let visuals = ui.visuals().clone();
         let accent = accent_color(&self.theme, &visuals);
 
@@ -4593,13 +4589,10 @@ impl AranduApp {
     }
 
     fn draw_ops_bar(&mut self, ui: &mut Ui, rect: Rect) {
-        let visuals = ui.visuals().clone();
-        ui.painter().rect_filled(rect, 0.0, visuals.faint_bg_color);
-        ui.painter().hline(
-            rect.x_range(),
-            rect.top(),
-            visuals.widgets.noninteractive.bg_stroke,
-        );
+        let faint = ui.visuals().faint_bg_color;
+        let separator = ui.visuals().widgets.noninteractive.bg_stroke;
+        ui.painter().rect_filled(rect, 0.0, faint);
+        ui.painter().hline(rect.x_range(), rect.top(), separator);
 
         let Some(current) = &self.ops.current else {
             return;
@@ -5360,13 +5353,15 @@ impl AranduApp {
     }
 
     fn draw_status_bar(&mut self, ui: &mut Ui, rect: Rect) {
-        let visuals = ui.visuals().clone();
-        ui.painter().rect_filled(rect, 0.0, visuals.faint_bg_color);
-        ui.painter().hline(
-            rect.x_range(),
-            rect.top(),
-            visuals.widgets.noninteractive.bg_stroke,
-        );
+        // Cores copiadas (todas `Copy`) para não manter `ui` emprestado
+        // imutavelmente enquanto o corpo chama métodos que pedem `&mut Ui`.
+        let faint = ui.visuals().faint_bg_color;
+        let separator = ui.visuals().widgets.noninteractive.bg_stroke;
+        let error_color = ui.visuals().error_fg_color;
+        let text_color = ui.visuals().text_color();
+        let weak = ui.visuals().weak_text_color();
+        ui.painter().rect_filled(rect, 0.0, faint);
+        ui.painter().hline(rect.x_range(), rect.top(), separator);
 
         let panel = self.active_panel();
         let items = rust_i18n::t!("items_count", count = panel.item_count());
@@ -5379,13 +5374,12 @@ impl AranduApp {
             .filter(|n| !n.expired())
             .map(|notice| {
                 let color = if notice.error {
-                    visuals.error_fg_color
+                    error_color
                 } else {
-                    visuals.text_color()
+                    text_color
                 };
                 (notice.text.clone(), color)
             });
-        let weak = visuals.weak_text_color();
         let hints = self.status_hints();
 
         ui.scope_builder(
@@ -5548,6 +5542,8 @@ fn draw_panel(
     accent: Color32,
     tags: &HashMap<String, Vec<String>>,
 ) -> bool {
+    // Owned é necessário: os closures abaixo recebem `&mut Ui`, então não dá
+    // para manter `ui.visuals()` (borrow imutável) vivo durante o corpo.
     let visuals = ui.visuals().clone();
     let mut interacted = false;
 
@@ -5659,13 +5655,23 @@ fn draw_panel(
         };
 
         let focused = panel.focus;
-        let active_selection = panel.multi.clone();
+        // Atualiza a contagem de colunas antes de emprestar `panel` para as
+        // closures de desenho (evita clonar `panel.multi` a cada frame).
+        let grid_cols = if matches!(panel.view_mode, ViewMode::Icons) {
+            let width = ui.available_width();
+            let cols = (((width + CELL_GAP) / (CELL_W + CELL_GAP)).floor() as usize).max(1);
+            panel.grid_cols = cols;
+            cols
+        } else {
+            1
+        };
+        let active_selection = &panel.multi;
         let mut action = None;
 
         let output = match panel.view_mode {
             ViewMode::List => {
                 let entries = &panel.entries;
-                let selection = &active_selection;
+                let selection = active_selection;
                 scroll.show_rows(ui, ROW_H, entries.len(), |ui, range| {
                     for index in range {
                         let entry = &entries[index];
@@ -5686,12 +5692,10 @@ fn draw_panel(
                 })
             }
             ViewMode::Icons => {
-                let width = ui.available_width();
-                let cols = (((width + CELL_GAP) / (CELL_W + CELL_GAP)).floor() as usize).max(1);
-                panel.grid_cols = cols;
+                let cols = grid_cols;
                 let rows = panel.entries.len().div_ceil(cols);
                 let entries = &panel.entries;
-                let selection = &active_selection;
+                let selection = active_selection;
                 scroll.show_rows(ui, GRID_ROW_H, rows, |ui, range| {
                     for row in range {
                         ui.horizontal(|ui| {

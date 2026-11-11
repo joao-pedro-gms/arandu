@@ -25,6 +25,7 @@ arandu-index.workspace = true
 syntect.workspace = true
 image.workspace = true
 egui_commonmark.workspace = true
+open.workspace = true
 
 [dev-dependencies]
 # `wgpu` + `snapshot` são necessários para `Harness::snapshot*`. Dev-deps não

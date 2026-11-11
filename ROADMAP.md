@@ -24,7 +24,7 @@ O roadmap detalhado com justificativas vive em [SCOPE.md](SCOPE.md). Esta págin
 - [x] Painel Git (gix): ~~status, staging visual~~ ✅ (PR #13); ~~log gráfico, blame~~ ✅; ~~branches e stashes~~ ✅
 - [x] Indexação global: walker em background (walkdir; notify p/ fase 3) + fuzzy estilo fzf (PR #14)
 - [x] Preview ampliado: markdown, PDF (pdfrum), hex, CSV/JSON (PR #15)
-- [ ] Visualizadores por tipo de arquivo
+- [x] Visualizadores por tipo de arquivo <!-- "Abrir com" (F11/Shift+F11): app padrão do SO via `open` + `[open_with]` por extensão, sem shell; previews internos seguem para texto/imagem/etc. -->
 
 ## Fase 3 — Extensibilidade
 

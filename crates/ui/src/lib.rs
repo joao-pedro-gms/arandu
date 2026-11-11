@@ -93,6 +93,8 @@ const GIT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 const PLUGIN_NOTICE_TTL: Duration = Duration::from_secs(5);
 /// Altura reservada ao formulário de commit no painel Git.
 const GIT_COMMIT_H: f32 = 96.0;
+/// Altura de uma linha (cabeçalho ou entrada) da aba Status do Git.
+const GIT_STATUS_ROW_H: f32 = 20.0;
 /// Bytes por linha no hex dump.
 const HEX_ROW_BYTES: usize = 16;
 /// Máximo de linhas de dados exibidas na tabela CSV.
@@ -811,6 +813,46 @@ struct GitState {
     commit_focused: bool,
     /// Início da última consulta, para o refresh periódico.
     last_loaded: Option<Instant>,
+    /// Linhas achatadas do status (recomputadas só quando o status muda).
+    status_rows: Vec<GitStatusRow>,
+}
+
+impl GitState {
+    /// Substitui o status e reconstrói a lista achatada uma única vez.
+    fn set_status(&mut self, status: Option<GitStatus>) {
+        self.status = status;
+        self.rebuild_status_rows();
+    }
+
+    fn rebuild_status_rows(&mut self) {
+        let mut rows = Vec::new();
+        if let Some(status) = self.status.as_ref() {
+            let mut entry_index = 0usize;
+            for (section, entries, stage) in [
+                (GitSection::Staged, &status.staged, false),
+                (GitSection::Modified, &status.modified, true),
+                (GitSection::Untracked, &status.untracked, true),
+            ] {
+                if entries.is_empty() {
+                    continue;
+                }
+                rows.push(GitStatusRow::Header {
+                    section,
+                    count: entries.len(),
+                });
+                for entry in entries {
+                    rows.push(GitStatusRow::Entry {
+                        index: entry_index,
+                        stage,
+                        path: entry.path.clone(),
+                        status: entry.status,
+                    });
+                    entry_index += 1;
+                }
+            }
+        }
+        self.status_rows = rows;
+    }
 }
 
 /// Seção de uma linha do painel Git.
@@ -819,6 +861,21 @@ enum GitSection {
     Staged,
     Modified,
     Untracked,
+}
+
+/// Linha achatada da aba Status: cabeçalho de seção ou entrada de arquivo.
+enum GitStatusRow {
+    Header {
+        section: GitSection,
+        count: usize,
+    },
+    Entry {
+        /// Índice na ordem staged + modified + untracked (navegação por teclado).
+        index: usize,
+        stage: bool,
+        path: PathBuf,
+        status: FileStatus,
+    },
 }
 
 /// Evento enviado pela thread de indexação.
@@ -2419,7 +2476,7 @@ impl AranduApp {
         match refresh {
             GitRefresh::NotRepository => {
                 self.git.root = None;
-                self.git.status = None;
+                self.git.set_status(None);
                 self.git.not_repo = true;
                 self.git.error = None;
                 self.git.action_error = None;
@@ -2427,7 +2484,7 @@ impl AranduApp {
             GitRefresh::Status { root, status } => {
                 let rows = status.staged.len() + status.modified.len() + status.untracked.len();
                 self.git.root = Some(root);
-                self.git.status = Some(status);
+                self.git.set_status(Some(status));
                 self.git.not_repo = false;
                 self.git.error = None;
                 self.git.focus = self.git.focus.min(rows.saturating_sub(1));
@@ -2600,7 +2657,7 @@ impl AranduApp {
         let dir = self.git_target_dir();
         let Some(repo) = Repo::discover(&dir) else {
             self.git.not_repo = true;
-            self.git.status = None;
+            self.git.set_status(None);
             return;
         };
         let paths = [path];
@@ -2622,7 +2679,7 @@ impl AranduApp {
         let dir = self.git_target_dir();
         let Some(repo) = Repo::discover(&dir) else {
             self.git.not_repo = true;
-            self.git.status = None;
+            self.git.set_status(None);
             return;
         };
         match repo.commit(&message) {
@@ -2640,7 +2697,7 @@ impl AranduApp {
         let dir = self.git_target_dir();
         let Some(repo) = Repo::discover(&dir) else {
             self.git.not_repo = true;
-            self.git.status = None;
+            self.git.set_status(None);
             return;
         };
         match repo.checkout(name) {
@@ -2658,7 +2715,7 @@ impl AranduApp {
         let dir = self.git_target_dir();
         let Some(repo) = Repo::discover(&dir) else {
             self.git.not_repo = true;
-            self.git.status = None;
+            self.git.set_status(None);
             return Err("not a git repository".to_string());
         };
         repo.create_branch(name)
@@ -2672,7 +2729,7 @@ impl AranduApp {
         let dir = self.git_target_dir();
         let Some(repo) = Repo::discover(&dir) else {
             self.git.not_repo = true;
-            self.git.status = None;
+            self.git.set_status(None);
             return Err("not a git repository".to_string());
         };
         repo.delete_branch(name)
@@ -2686,7 +2743,7 @@ impl AranduApp {
         let dir = self.git_target_dir();
         let Some(repo) = Repo::discover(&dir) else {
             self.git.not_repo = true;
-            self.git.status = None;
+            self.git.set_status(None);
             return;
         };
         match repo.stash_push(message) {
@@ -2704,7 +2761,7 @@ impl AranduApp {
         let dir = self.git_target_dir();
         let Some(repo) = Repo::discover(&dir) else {
             self.git.not_repo = true;
-            self.git.status = None;
+            self.git.set_status(None);
             return;
         };
         match repo.stash_pop(id) {
@@ -3543,12 +3600,23 @@ impl AranduApp {
     }
 
     /// Aba Status: seções Staged/Modified/Untracked e formulário de commit.
+    ///
+    /// As linhas são achatadas uma única vez (quando o status muda) e
+    /// renderizadas com `show_rows`, então só as visíveis viram widgets.
     fn draw_git_status_body(&mut self, ui: &mut Ui, body: Rect, visuals: &egui::Visuals) {
-        let Some(status) = self.git.status.clone() else {
+        let has_staged = self
+            .git
+            .status
+            .as_ref()
+            .is_some_and(|status| !status.staged.is_empty());
+        let Some(root) = self.git.root.clone() else {
             draw_preview_centered(ui, body, rust_i18n::t!("git_loading"), visuals);
             return;
         };
-        let root = self.git.root.clone().unwrap_or_default();
+        if self.git.status.is_none() {
+            draw_preview_centered(ui, body, rust_i18n::t!("git_loading"), visuals);
+            return;
+        }
 
         let footer_h = GIT_COMMIT_H.min(body.height() * 0.5);
         let list_rect = Rect::from_min_max(
@@ -3564,77 +3632,63 @@ impl AranduApp {
         let focused_panel = self.git.focused;
         let mut clicked: Option<(usize, bool, PathBuf)> = None;
         let mut commit_clicked = false;
-        let mut row_index = 0usize;
 
+        let rows = std::mem::take(&mut self.git.status_rows);
         ui.scope_builder(
             UiBuilder::new().max_rect(list_rect.shrink2(vec2(6.0, 4.0))),
             |ui| {
+                if rows.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(rust_i18n::t!("git_clean")).color(visuals.weak_text_color()),
+                    );
+                    return;
+                }
                 ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        let sections = [
-                            (
-                                GitSection::Staged,
-                                rust_i18n::t!("git_staged").into_owned(),
-                                status.staged.clone(),
-                                false,
-                            ),
-                            (
-                                GitSection::Modified,
-                                rust_i18n::t!("git_modified").into_owned(),
-                                status.modified.clone(),
-                                true,
-                            ),
-                            (
-                                GitSection::Untracked,
-                                rust_i18n::t!("git_untracked").into_owned(),
-                                status.untracked.clone(),
-                                true,
-                            ),
-                        ];
-
-                        for (_section, title, entries, stage) in sections {
-                            if entries.is_empty() {
-                                continue;
-                            }
-                            ui.add_space(2.0);
-                            ui.label(
-                                RichText::new(format!("{title} ({})", entries.len()))
-                                    .small()
-                                    .strong()
-                                    .color(visuals.weak_text_color()),
-                            );
-                            for entry in entries {
-                                let focused = focused_panel && row_index == focus;
-                                let text = format!(
-                                    "{}  {}",
-                                    status_glyph(entry.status),
-                                    entry.path.display()
-                                );
-                                let mut rich = RichText::new(text).size(13.0);
-                                if focused {
-                                    rich = rich.strong().color(visuals.strong_text_color());
+                    .show_rows(ui, GIT_STATUS_ROW_H, rows.len(), |ui, range| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for row in &rows[range] {
+                            match row {
+                                GitStatusRow::Header { section, count } => {
+                                    let title = match section {
+                                        GitSection::Staged => rust_i18n::t!("git_staged"),
+                                        GitSection::Modified => rust_i18n::t!("git_modified"),
+                                        GitSection::Untracked => rust_i18n::t!("git_untracked"),
+                                    };
+                                    ui.label(
+                                        RichText::new(format!("{title} ({count})"))
+                                            .small()
+                                            .strong()
+                                            .color(visuals.weak_text_color()),
+                                    );
                                 }
-                                let response = ui
-                                    .add(Label::new(rich).sense(Sense::click()))
-                                    .on_hover_text(entry.path.display().to_string());
-                                if response.clicked() {
-                                    clicked = Some((row_index, stage, root.join(&entry.path)));
+                                GitStatusRow::Entry {
+                                    index,
+                                    stage,
+                                    path,
+                                    status,
+                                } => {
+                                    let focused = focused_panel && *index == focus;
+                                    let text =
+                                        format!("{}  {}", status_glyph(*status), path.display());
+                                    let mut rich = RichText::new(text).size(13.0);
+                                    if focused {
+                                        rich = rich.strong().color(visuals.strong_text_color());
+                                    }
+                                    let response = ui
+                                        .add(Label::new(rich).sense(Sense::click()))
+                                        .on_hover_text(path.display().to_string());
+                                    if response.clicked() {
+                                        clicked = Some((*index, *stage, root.join(path)));
+                                    }
                                 }
-                                row_index += 1;
                             }
-                        }
-
-                        if row_index == 0 {
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new(rust_i18n::t!("git_clean"))
-                                    .color(visuals.weak_text_color()),
-                            );
                         }
                     });
             },
         );
+        self.git.status_rows = rows;
 
         ui.scope_builder(
             UiBuilder::new().max_rect(footer_rect.shrink2(vec2(6.0, 2.0))),
@@ -3647,8 +3701,7 @@ impl AranduApp {
                 let response = ui.add(editor);
                 self.git.commit_focused = response.has_focus();
 
-                let enabled =
-                    !status.staged.is_empty() && !self.git.commit_message.trim().is_empty();
+                let enabled = has_staged && !self.git.commit_message.trim().is_empty();
                 let button =
                     ui.add_enabled(enabled, egui::Button::new(rust_i18n::t!("git_commit")));
                 if button.clicked() {

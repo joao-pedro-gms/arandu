@@ -48,6 +48,25 @@ em andamento (`core`, `config`, `ui`, `git` e `index`).
 
 Detalhes em [SCOPE.md](SCOPE.md) e [ROADMAP.md](ROADMAP.md).
 
+## Sincronizar configuração entre máquinas
+
+O diretório de configuração inteiro (`config.toml`, `keymap.toml`, `tags.toml`,
+`themes/` e `plugins/`) pode ser exportado como um pacote `tar.gz` e importado
+em outra máquina. Funciona com qualquer transporte: pendrive, `rsync`, drive na
+nuvem etc.
+
+```bash
+# Exporta a configuração atual para um pacote
+arandu --export-config ~/arandu-config.tar.gz
+
+# Importa o pacote, sobrescrevendo a configuração local
+arandu --import-config ~/arandu-config.tar.gz
+```
+
+A importação renomeia o diretório atual para `<dir>.bak-<timestamp>` antes de
+extrair, e pacotes com caminhos absolutos ou `..` são rejeitados. Veja também
+`arandu --help`.
+
 ## Contribuindo
 
 Veja [CONTRIBUTING.md](CONTRIBUTING.md). O projeto está em fase de definição —

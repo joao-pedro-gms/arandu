@@ -29,7 +29,7 @@ O roadmap detalhado com justificativas vive em [SCOPE.md](SCOPE.md). Esta págin
 ## Fase 3 — Extensibilidade
 
 - [ ] API de plugins (WASM ou Lua — decisão em aberto, ver SCOPE.md)
-- [ ] Sync de config entre máquinas
+- [x] Sync de config entre máquinas <!-- export/import tar.gz via CLI (`--export-config`/`--import-config`) -->
 - [ ] macOS
 
 ## Decisões em aberto

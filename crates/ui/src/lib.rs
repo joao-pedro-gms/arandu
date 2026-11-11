@@ -35,7 +35,7 @@ use arandu_core::preview::{
 use arandu_core::queue::{OpQueue, QueueEvent, UndoStack};
 use arandu_git::{
     BlameLine, BranchInfo, CommitInfo, DEFAULT_BLAME_LINES, DEFAULT_LOG_LIMIT, FileStatus,
-    GitStatus, Repo, StashInfo, render_graph,
+    GitError, GitStatus, Repo, StashInfo, render_graph,
 };
 use arandu_index::{IndexEntry, IndexStore, Indexer};
 use arandu_plugin::{PluginContext, PluginManager, default_plugin_dir};
@@ -568,6 +568,8 @@ struct PreviewState {
     csv: Option<(PreviewKey, CsvPreview)>,
     /// Cache de layout/renderização do Markdown.
     markdown_cache: egui_commonmark::CommonMarkCache,
+    /// Chave renderizada no frame anterior; quando muda, o scroll volta ao topo.
+    scroll_key: Option<PreviewKey>,
 }
 
 /// Conjunto padrão de sintaxes (carregado uma única vez).
@@ -746,8 +748,10 @@ struct StashDialog {
 }
 
 /// Confirmação de uma ação destrutiva no painel Git.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum GitConfirm {
+    /// Troca de branch: altera o worktree, então pede confirmação antes.
+    CheckoutBranch(String),
     DeleteBranch(String),
     PopStash(String),
 }
@@ -1595,6 +1599,14 @@ impl AranduApp {
                     self.git.focus = 0;
                     git_navigated = true;
                 }
+                // Delete pertence ao painel Git: nas abas sem ação de exclusão
+                // ele é consumido e avisa o usuário em vez de excluir arquivos.
+                if delete && !matches!(self.git.tab, GitTab::Branches | GitTab::Stashes) {
+                    git_consumed_delete = true;
+                    self.ops.notice = Some(Notice::info(
+                        rust_i18n::t!("git_delete_unavailable").to_string(),
+                    ));
+                }
                 match self.git.tab {
                     GitTab::Status => {
                         let rows = self.git_rows();
@@ -1642,8 +1654,12 @@ impl AranduApp {
                                 .branches
                                 .get(self.git.focus.min(self.git.branches.len() - 1))
                                 .cloned();
-                            if enter && let Some(branch) = &selected {
-                                self.git_checkout(&branch.name);
+                            if enter
+                                && let Some(branch) = &selected
+                                && !branch.current
+                            {
+                                self.git.confirm =
+                                    Some(GitConfirm::CheckoutBranch(branch.name.clone()));
                             }
                             if let Some(branch) = &selected {
                                 if delete && !branch.current {
@@ -2391,10 +2407,10 @@ impl AranduApp {
         self.git.log_receiver = Some(receiver);
         std::thread::spawn(move || {
             let result = match Repo::discover(&dir) {
-                None => Err("not a git repository".to_string()),
+                None => Err(git_error_text(&GitError::NotARepository)),
                 Some(repo) => repo
                     .log(DEFAULT_LOG_LIMIT)
-                    .map_err(|error| error.to_string()),
+                    .map_err(|error| git_error_text(&error)),
             };
             let _ = sender.send((dir, result));
         });
@@ -2432,10 +2448,10 @@ impl AranduApp {
         self.git.blame_receiver = Some(receiver);
         std::thread::spawn(move || {
             let result = match Repo::discover(&dir) {
-                None => Err("not a git repository".to_string()),
+                None => Err(git_error_text(&GitError::NotARepository)),
                 Some(repo) => repo
                     .blame_file(&path, DEFAULT_BLAME_LINES)
-                    .map_err(|error| error.to_string()),
+                    .map_err(|error| git_error_text(&error)),
             };
             let _ = sender.send((path, result));
         });
@@ -2464,8 +2480,8 @@ impl AranduApp {
         self.git.branches_receiver = Some(receiver);
         std::thread::spawn(move || {
             let result = match Repo::discover(&dir) {
-                None => Err("not a git repository".to_string()),
-                Some(repo) => repo.branches().map_err(|error| error.to_string()),
+                None => Err(git_error_text(&GitError::NotARepository)),
+                Some(repo) => repo.branches().map_err(|error| git_error_text(&error)),
             };
             let _ = sender.send((dir, result));
         });
@@ -2494,8 +2510,8 @@ impl AranduApp {
         self.git.stashes_receiver = Some(receiver);
         std::thread::spawn(move || {
             let result = match Repo::discover(&dir) {
-                None => Err("not a git repository".to_string()),
-                Some(repo) => repo.stashes().map_err(|error| error.to_string()),
+                None => Err(git_error_text(&GitError::NotARepository)),
+                Some(repo) => repo.stashes().map_err(|error| git_error_text(&error)),
             };
             let _ = sender.send((dir, result));
         });
@@ -2765,7 +2781,7 @@ impl AranduApp {
         } else {
             repo.unstage(&paths)
         };
-        self.git.action_error = outcome.err().map(|error| error.to_string());
+        self.git.action_error = outcome.err().map(|error| git_error_text(&error));
         self.request_git_refresh(true);
     }
 
@@ -2787,7 +2803,7 @@ impl AranduApp {
                 self.git.action_error = None;
                 self.request_git_refresh(true);
             }
-            Err(error) => self.git.action_error = Some(error.to_string()),
+            Err(error) => self.git.action_error = Some(git_error_text(&error)),
         }
     }
 
@@ -2805,7 +2821,7 @@ impl AranduApp {
                 self.reload_dir(&dir);
                 self.request_git_refresh(true);
             }
-            Err(error) => self.git.notice = Some(error.to_string()),
+            Err(error) => self.git.notice = Some(git_error_text(&error)),
         }
     }
 
@@ -2815,10 +2831,10 @@ impl AranduApp {
         let Some(repo) = Repo::discover(&dir) else {
             self.git.not_repo = true;
             self.git.set_status(None);
-            return Err("not a git repository".to_string());
+            return Err(git_error_text(&GitError::NotARepository));
         };
         repo.create_branch(name)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| git_error_text(&error))?;
         self.request_git_refresh(true);
         Ok(())
     }
@@ -2829,10 +2845,10 @@ impl AranduApp {
         let Some(repo) = Repo::discover(&dir) else {
             self.git.not_repo = true;
             self.git.set_status(None);
-            return Err("not a git repository".to_string());
+            return Err(git_error_text(&GitError::NotARepository));
         };
         repo.delete_branch(name)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| git_error_text(&error))?;
         self.request_git_refresh(true);
         Ok(())
     }
@@ -2851,7 +2867,7 @@ impl AranduApp {
                 self.reload_dir(&dir);
                 self.request_git_refresh(true);
             }
-            Err(error) => self.git.notice = Some(error.to_string()),
+            Err(error) => self.git.notice = Some(git_error_text(&error)),
         }
     }
 
@@ -2869,7 +2885,7 @@ impl AranduApp {
                 self.reload_dir(&dir);
                 self.request_git_refresh(true);
             }
-            Err(error) => self.git.notice = Some(error.to_string()),
+            Err(error) => self.git.notice = Some(git_error_text(&error)),
         }
     }
 
@@ -3039,8 +3055,10 @@ impl AranduApp {
                 );
                 ui.add_space(12.0);
             } else {
-                let visuals = ui.visuals().clone();
-                let weak = visuals.weak_text_color();
+                let weak = ui.visuals().weak_text_color();
+                let selection_bg = ui.visuals().selection.bg_fill;
+                let strong = ui.visuals().strong_text_color();
+                let plain = ui.visuals().text_color();
                 for (index, (_, entry)) in quick.results.iter().enumerate() {
                     let selected = index == quick.focus;
                     let (rect, row) = ui.allocate_exact_size(
@@ -3048,14 +3066,9 @@ impl AranduApp {
                         Sense::click(),
                     );
                     if selected {
-                        ui.painter()
-                            .rect_filled(rect, 3.0, visuals.selection.bg_fill);
+                        ui.painter().rect_filled(rect, 3.0, selection_bg);
                     }
-                    let text_color = if selected {
-                        visuals.strong_text_color()
-                    } else {
-                        visuals.text_color()
-                    };
+                    let text_color = if selected { strong } else { plain };
                     let mut row_ui = ui.new_child(
                         UiBuilder::new()
                             .max_rect(rect.shrink2(vec2(8.0, 2.0)))
@@ -3143,13 +3156,10 @@ impl AranduApp {
     }
 
     fn draw_toolbar(&mut self, ui: &mut Ui, rect: Rect) {
-        let visuals = ui.visuals().clone();
-        ui.painter().rect_filled(rect, 0.0, visuals.faint_bg_color);
-        ui.painter().hline(
-            rect.x_range(),
-            rect.bottom(),
-            visuals.widgets.noninteractive.bg_stroke,
-        );
+        let faint = ui.visuals().faint_bg_color;
+        let separator = ui.visuals().widgets.noninteractive.bg_stroke;
+        ui.painter().rect_filled(rect, 0.0, faint);
+        ui.painter().hline(rect.x_range(), rect.bottom(), separator);
 
         ui.scope_builder(
             UiBuilder::new().max_rect(rect.shrink2(vec2(10.0, 0.0))),
@@ -3247,24 +3257,29 @@ impl AranduApp {
                             self.active_panel_mut().toggle_view_mode();
                         }
 
-                        // Segundo grupo de ações (settings/busca).
+                        // Busca: mesma ação do quick-open (Ctrl+P).
                         ui.add_space(4.0);
-                        let settings = ui
-                            .add(
-                                egui::Button::new(rust_i18n::t!("settings"))
-                                    .frame(false)
-                                    .min_size(vec2(0.0, CONTROL_H)),
-                            )
-                            .on_hover_text(rust_i18n::t!("settings"));
-                        let _ = settings;
+                        let search_hint = self
+                            .keymap
+                            .effective(Action::ToggleQuickOpen)
+                            .into_iter()
+                            .next()
+                            .map(|binding| {
+                                format!("{binding} {}", action_description(Action::ToggleQuickOpen))
+                            })
+                            .unwrap_or_else(|| {
+                                action_description(Action::ToggleQuickOpen).to_owned()
+                            });
                         let search = ui
                             .add(
                                 egui::Button::new(rust_i18n::t!("search"))
                                     .frame(false)
                                     .min_size(vec2(0.0, CONTROL_H)),
                             )
-                            .on_hover_text(rust_i18n::t!("search"));
-                        let _ = search;
+                            .on_hover_text(search_hint);
+                        if search.clicked() {
+                            self.open_quick_open();
+                        }
                     });
                 });
             },
@@ -3443,6 +3458,8 @@ impl AranduApp {
     }
 
     fn draw_content(&mut self, ui: &mut Ui, content: Rect) {
+        // Owned é necessário aqui: `ui.visuals()` empresta `ui` imutavelmente,
+        // mas os métodos de desenho abaixo recebem `&mut Ui` e `&Visuals`.
         let visuals = ui.visuals().clone();
         let accent = accent_color(&self.theme, &visuals);
 
@@ -4161,6 +4178,12 @@ impl AranduApp {
         }
 
         let key = PreviewKey::for_entry(entry);
+        // Ao trocar de arquivo, os ScrollAreas do preview devem voltar ao topo.
+        // Dentro do mesmo arquivo o scroll é preservado.
+        let reset_scroll = self.preview.scroll_key.as_ref() != Some(&key);
+        if reset_scroll {
+            self.preview.scroll_key = Some(key.clone());
+        }
         match self.preview.cache.get(&key) {
             Some(PreviewEntry::Ready(content)) => match &*content {
                 PreviewContent::Text {
@@ -4175,21 +4198,30 @@ impl AranduApp {
                         text,
                         *truncated,
                         syntax_name.as_deref(),
+                        reset_scroll,
                     );
                 }
                 PreviewContent::Markdown { text, truncated } => {
-                    self.draw_preview_markdown(ui, body, text, *truncated);
+                    self.draw_preview_markdown(ui, body, text, *truncated, reset_scroll);
                 }
                 PreviewContent::Hex {
                     bytes, truncated, ..
                 } => {
-                    self.draw_preview_hex(ui, body, bytes, *truncated);
+                    self.draw_preview_hex(ui, body, bytes, *truncated, reset_scroll);
                 }
                 PreviewContent::Csv { text, truncated } => {
-                    self.draw_preview_csv(ui, body, &key, text, *truncated);
+                    self.draw_preview_csv(ui, body, &key, text, *truncated, reset_scroll);
                 }
                 PreviewContent::Json { text, truncated } => {
-                    self.draw_preview_text(ui, body, &key, text, *truncated, Some("json"));
+                    self.draw_preview_text(
+                        ui,
+                        body,
+                        &key,
+                        text,
+                        *truncated,
+                        Some("json"),
+                        reset_scroll,
+                    );
                 }
                 PreviewContent::Image { image, .. } => {
                     self.draw_preview_image(ui, body, &key, image, visuals);
@@ -4230,6 +4262,9 @@ impl AranduApp {
         }
     }
 
+    // Parâmetros de renderização são explícitos para manter o fluxo do preview
+    // legível; agrupar em struct só criaria ruído aqui.
+    #[allow(clippy::too_many_arguments)]
     fn draw_preview_text(
         &mut self,
         ui: &mut Ui,
@@ -4238,8 +4273,10 @@ impl AranduApp {
         text: &str,
         truncated: bool,
         syntax_name: Option<&str>,
+        reset_scroll: bool,
     ) {
         let dark = ui.visuals().dark_mode;
+        let text_color = ui.visuals().text_color();
         let rebuild = match &self.preview.job {
             Some((cached_key, cached_dark, _)) => cached_key != key || *cached_dark != dark,
             None => true,
@@ -4248,7 +4285,7 @@ impl AranduApp {
             self.preview.job = Some((
                 key.clone(),
                 dark,
-                Arc::new(build_text_job(text, syntax_name, dark)),
+                Arc::new(build_text_job(text, syntax_name, dark, text_color)),
             ));
         }
         let job = self
@@ -4268,13 +4305,18 @@ impl AranduApp {
                 );
                 ui.add_space(4.0);
             }
-            ScrollArea::both()
+            let mut area = ScrollArea::both()
                 .id_salt("preview-text")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                    ui.add(Label::new(job).selectable(false));
-                });
+                .auto_shrink([false, false]);
+            if reset_scroll {
+                area = area
+                    .vertical_scroll_offset(0.0)
+                    .horizontal_scroll_offset(0.0);
+            }
+            area.show(ui, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                ui.add(Label::new(job).selectable(false));
+            });
         });
     }
 
@@ -4303,7 +4345,14 @@ impl AranduApp {
         })
     }
 
-    fn draw_preview_markdown(&mut self, ui: &mut Ui, body: Rect, text: &str, truncated: bool) {
+    fn draw_preview_markdown(
+        &mut self,
+        ui: &mut Ui,
+        body: Rect,
+        text: &str,
+        truncated: bool,
+        reset_scroll: bool,
+    ) {
         let cache = &mut self.preview.markdown_cache;
         ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
             if truncated {
@@ -4314,18 +4363,28 @@ impl AranduApp {
                         .color(ui.visuals().warn_fg_color),
                 );
             }
-            ScrollArea::vertical()
+            let mut area = ScrollArea::vertical()
                 .id_salt("preview-markdown")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.add_space(4.0);
-                    egui_commonmark::CommonMarkViewer::new().show(ui, cache, text);
-                    ui.add_space(8.0);
-                });
+                .auto_shrink([false, false]);
+            if reset_scroll {
+                area = area.vertical_scroll_offset(0.0);
+            }
+            area.show(ui, |ui| {
+                ui.add_space(4.0);
+                egui_commonmark::CommonMarkViewer::new().show(ui, cache, text);
+                ui.add_space(8.0);
+            });
         });
     }
 
-    fn draw_preview_hex(&mut self, ui: &mut Ui, body: Rect, bytes: &[u8], truncated: bool) {
+    fn draw_preview_hex(
+        &mut self,
+        ui: &mut Ui,
+        body: Rect,
+        bytes: &[u8],
+        truncated: bool,
+        reset_scroll: bool,
+    ) {
         ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
             if truncated {
                 ui.add_space(4.0);
@@ -4337,32 +4396,26 @@ impl AranduApp {
             }
             let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
             let rows = bytes.len().div_ceil(HEX_ROW_BYTES);
-            let visuals = ui.visuals().clone();
-            ScrollArea::vertical()
+            let weak_color = ui.visuals().weak_text_color();
+            let mut area = ScrollArea::vertical()
                 .id_salt("preview-hex")
-                .auto_shrink([false, false])
-                .show_rows(ui, row_height, rows, |ui, row_range| {
-                    for row in row_range {
-                        let offset = row * HEX_ROW_BYTES;
-                        let end = (offset + HEX_ROW_BYTES).min(bytes.len());
-                        let (offset_text, hex_text, ascii_text) =
-                            hex_row(offset, &bytes[offset..end]);
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 12.0;
-                            ui.label(
-                                RichText::new(offset_text)
-                                    .monospace()
-                                    .color(visuals.weak_text_color()),
-                            );
-                            ui.label(RichText::new(hex_text).monospace());
-                            ui.label(
-                                RichText::new(ascii_text)
-                                    .monospace()
-                                    .color(visuals.weak_text_color()),
-                            );
-                        });
-                    }
-                });
+                .auto_shrink([false, false]);
+            if reset_scroll {
+                area = area.vertical_scroll_offset(0.0);
+            }
+            area.show_rows(ui, row_height, rows, |ui, row_range| {
+                for row in row_range {
+                    let offset = row * HEX_ROW_BYTES;
+                    let end = (offset + HEX_ROW_BYTES).min(bytes.len());
+                    let (offset_text, hex_text, ascii_text) = hex_row(offset, &bytes[offset..end]);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        ui.label(RichText::new(offset_text).monospace().color(weak_color));
+                        ui.label(RichText::new(hex_text).monospace());
+                        ui.label(RichText::new(ascii_text).monospace().color(weak_color));
+                    });
+                }
+            });
         });
     }
 
@@ -4373,6 +4426,7 @@ impl AranduApp {
         key: &PreviewKey,
         text: &str,
         truncated: bool,
+        reset_scroll: bool,
     ) {
         // Parseia só quando a chave do preview muda; o desenho abaixo é
         // virtualizado e não depende do número total de linhas.
@@ -4424,25 +4478,30 @@ impl AranduApp {
             }
             // Linha 0 = cabeçalho; demais = registros.
             let total = parsed.rows.len() + 1;
-            ScrollArea::both()
+            let mut area = ScrollArea::both()
                 .id_salt("preview-csv")
-                .auto_shrink([false, false])
-                .show_rows(ui, CSV_ROW_H, total, |ui, range| {
-                    ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-                    for row_index in range {
-                        ui.horizontal(|ui| {
-                            if row_index == 0 {
-                                for field in &parsed.headers {
-                                    csv_cell(ui, field, true, ui.visuals().strong_text_color());
-                                }
-                            } else if let Some(row) = parsed.rows.get(row_index - 1) {
-                                for field in row {
-                                    csv_cell(ui, field, false, ui.visuals().text_color());
-                                }
+                .auto_shrink([false, false]);
+            if reset_scroll {
+                area = area
+                    .vertical_scroll_offset(0.0)
+                    .horizontal_scroll_offset(0.0);
+            }
+            area.show_rows(ui, CSV_ROW_H, total, |ui, range| {
+                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                for row_index in range {
+                    ui.horizontal(|ui| {
+                        if row_index == 0 {
+                            for field in &parsed.headers {
+                                csv_cell(ui, field, true, ui.visuals().strong_text_color());
                             }
-                        });
-                    }
-                });
+                        } else if let Some(row) = parsed.rows.get(row_index - 1) {
+                            for field in row {
+                                csv_cell(ui, field, false, ui.visuals().text_color());
+                            }
+                        }
+                    });
+                }
+            });
             if parsed.capped {
                 ui.add_space(4.0);
                 ui.label(
@@ -4535,13 +4594,10 @@ impl AranduApp {
     }
 
     fn draw_ops_bar(&mut self, ui: &mut Ui, rect: Rect) {
-        let visuals = ui.visuals().clone();
-        ui.painter().rect_filled(rect, 0.0, visuals.faint_bg_color);
-        ui.painter().hline(
-            rect.x_range(),
-            rect.top(),
-            visuals.widgets.noninteractive.bg_stroke,
-        );
+        let faint = ui.visuals().faint_bg_color;
+        let separator = ui.visuals().widgets.noninteractive.bg_stroke;
+        ui.painter().rect_filled(rect, 0.0, faint);
+        ui.painter().hline(rect.x_range(), rect.top(), separator);
 
         let Some(current) = &self.ops.current else {
             return;
@@ -4599,7 +4655,7 @@ impl AranduApp {
         if let Some(paths) = self.delete_confirm.clone() {
             let mut confirm = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::unique("delete-confirm")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("delete-confirm")).show(ctx, |ui| {
                 ui.set_min_width(380.0);
                 ui.heading(rust_i18n::t!("delete_confirm_title"));
                 ui.add_space(6.0);
@@ -4623,6 +4679,9 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                cancel = true;
+            }
             if confirm {
                 self.confirm_delete();
             } else if cancel {
@@ -4633,7 +4692,7 @@ impl AranduApp {
         if let Some(mut dialog) = self.rename.take() {
             let mut submit = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::unique("rename-dialog")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("rename-dialog")).show(ctx, |ui| {
                 ui.set_min_width(380.0);
                 ui.heading(rust_i18n::t!("rename_title"));
                 ui.add_space(6.0);
@@ -4662,6 +4721,9 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                cancel = true;
+            }
 
             if submit {
                 let name = dialog.name.trim().to_owned();
@@ -4693,7 +4755,7 @@ impl AranduApp {
             let mut cancel = false;
             let mut remove: Option<String> = None;
 
-            egui::Modal::new(egui::Id::unique("tag-editor-dialog")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("tag-editor-dialog")).show(ctx, |ui| {
                 ui.set_min_width(380.0);
                 ui.heading(rust_i18n::t!("tags_title"));
                 ui.add_space(6.0);
@@ -4740,6 +4802,9 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                cancel = true;
+            }
 
             if let Some(tag) = remove {
                 for path in &dialog.paths {
@@ -4777,7 +4842,7 @@ impl AranduApp {
         if let Some(mut dialog) = self.compress.take() {
             let mut submit = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::unique("compress-dialog")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("compress-dialog")).show(ctx, |ui| {
                 ui.set_min_width(420.0);
                 ui.heading(rust_i18n::t!("compress_title"));
                 ui.add_space(6.0);
@@ -4820,6 +4885,9 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                cancel = true;
+            }
 
             let name = dialog.name.trim().to_owned();
             if submit && archive::detect_format(Path::new(&name)).is_some() {
@@ -4839,7 +4907,7 @@ impl AranduApp {
             let mut submit = false;
             let mut use_default = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::unique("open-with-dialog")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("open-with-dialog")).show(ctx, |ui| {
                 ui.set_min_width(460.0);
                 ui.heading(rust_i18n::t!("open_with_title"));
                 ui.add_space(6.0);
@@ -4910,6 +4978,9 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                cancel = true;
+            }
 
             if use_default {
                 self.open_paths_default(&dialog.paths);
@@ -4929,7 +5000,7 @@ impl AranduApp {
 
         if let Some(dialog) = self.checksums.take() {
             let mut close = false;
-            egui::Modal::new(egui::Id::unique("checksums-dialog")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("checksums-dialog")).show(ctx, |ui| {
                 ui.set_min_width(640.0);
                 ui.heading(rust_i18n::t!("checksums_title"));
                 ui.add_space(6.0);
@@ -4974,6 +5045,9 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                close = true;
+            }
             if !close {
                 self.checksums = Some(dialog);
             }
@@ -4985,7 +5059,7 @@ impl AranduApp {
             let mut submit = false;
             let mut cancel = false;
 
-            egui::Modal::new(egui::Id::unique("batch-rename-dialog")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("batch-rename-dialog")).show(ctx, |ui| {
                 ui.set_min_width(580.0);
                 ui.heading(rust_i18n::t!("batch_rename_title"));
                 ui.add_space(6.0);
@@ -5078,6 +5152,9 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                cancel = true;
+            }
 
             if submit && validation.is_none() && !dialog.running && dialog.result.is_none() {
                 let pairs = renames
@@ -5094,7 +5171,7 @@ impl AranduApp {
         if let Some(mut dialog) = self.git.branch_dialog.take() {
             let mut submit = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::unique("git-branch-dialog")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("git-branch-dialog")).show(ctx, |ui| {
                 ui.set_min_width(380.0);
                 ui.heading(rust_i18n::t!("git_branch_new_title"));
                 ui.add_space(6.0);
@@ -5123,6 +5200,9 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                cancel = true;
+            }
 
             if submit {
                 let name = dialog.name.trim().to_owned();
@@ -5141,7 +5221,7 @@ impl AranduApp {
         if let Some(mut dialog) = self.git.stash_dialog.take() {
             let mut submit = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::unique("git-stash-dialog")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("git-stash-dialog")).show(ctx, |ui| {
                 ui.set_min_width(380.0);
                 ui.heading(rust_i18n::t!("git_stash_push_title"));
                 ui.add_space(6.0);
@@ -5173,6 +5253,9 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                cancel = true;
+            }
 
             if submit {
                 let message = dialog.message.trim().to_owned();
@@ -5190,9 +5273,17 @@ impl AranduApp {
         if let Some(pending) = self.git.confirm.clone() {
             let mut confirm = false;
             let mut cancel = false;
-            egui::Modal::new(egui::Id::unique("git-action-confirm")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("git-action-confirm")).show(ctx, |ui| {
                 ui.set_min_width(380.0);
                 match &pending {
+                    GitConfirm::CheckoutBranch(name) => {
+                        ui.heading(rust_i18n::t!("git_branch_checkout_title"));
+                        ui.add_space(6.0);
+                        ui.label(rust_i18n::t!(
+                            "git_branch_checkout_body",
+                            name = name.as_str()
+                        ));
+                    }
                     GitConfirm::DeleteBranch(name) => {
                         ui.heading(rust_i18n::t!("git_branch_delete_title"));
                         ui.add_space(6.0);
@@ -5220,10 +5311,14 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                cancel = true;
+            }
 
             if confirm {
                 self.git.confirm = None;
                 match pending {
+                    GitConfirm::CheckoutBranch(name) => self.git_checkout(&name),
                     GitConfirm::DeleteBranch(name) => {
                         if let Err(error) = self.git_delete_branch(&name) {
                             self.git.notice = Some(error);
@@ -5238,7 +5333,7 @@ impl AranduApp {
 
         if let Some(notice) = self.git.notice.clone() {
             let mut close = false;
-            egui::Modal::new(egui::Id::unique("git-notice")).show(ctx, |ui| {
+            let modal = egui::Modal::new(egui::Id::unique("git-notice")).show(ctx, |ui| {
                 ui.set_min_width(380.0);
                 ui.heading(rust_i18n::t!("git_action_failed"));
                 ui.add_space(6.0);
@@ -5253,6 +5348,9 @@ impl AranduApp {
                     }
                 });
             });
+            if modal.should_close() {
+                close = true;
+            }
             if close {
                 self.git.notice = None;
             }
@@ -5260,13 +5358,15 @@ impl AranduApp {
     }
 
     fn draw_status_bar(&mut self, ui: &mut Ui, rect: Rect) {
-        let visuals = ui.visuals().clone();
-        ui.painter().rect_filled(rect, 0.0, visuals.faint_bg_color);
-        ui.painter().hline(
-            rect.x_range(),
-            rect.top(),
-            visuals.widgets.noninteractive.bg_stroke,
-        );
+        // Cores copiadas (todas `Copy`) para não manter `ui` emprestado
+        // imutavelmente enquanto o corpo chama métodos que pedem `&mut Ui`.
+        let faint = ui.visuals().faint_bg_color;
+        let separator = ui.visuals().widgets.noninteractive.bg_stroke;
+        let error_color = ui.visuals().error_fg_color;
+        let text_color = ui.visuals().text_color();
+        let weak = ui.visuals().weak_text_color();
+        ui.painter().rect_filled(rect, 0.0, faint);
+        ui.painter().hline(rect.x_range(), rect.top(), separator);
 
         let panel = self.active_panel();
         let items = rust_i18n::t!("items_count", count = panel.item_count());
@@ -5279,13 +5379,12 @@ impl AranduApp {
             .filter(|n| !n.expired())
             .map(|notice| {
                 let color = if notice.error {
-                    visuals.error_fg_color
+                    error_color
                 } else {
-                    visuals.text_color()
+                    text_color
                 };
                 (notice.text.clone(), color)
             });
-        let weak = visuals.weak_text_color();
         let hints = self.status_hints();
 
         ui.scope_builder(
@@ -5311,10 +5410,50 @@ impl AranduApp {
         );
     }
 
-    /// Hints compactos das ações principais, gerados do keymap efetivo:
+    /// Indica se algum modal está aberto; nesse caso os hints da status bar
+    /// continuam mostrando as ações do painel de arquivos.
+    fn modal_open(&self) -> bool {
+        self.delete_confirm.is_some()
+            || self.rename.is_some()
+            || self.tag_editor.is_some()
+            || self.checksums.is_some()
+            || self.batch_rename.is_some()
+            || self.compress.is_some()
+            || self.open_with_dialog.is_some()
+            || self.git.branch_dialog.is_some()
+            || self.git.stash_dialog.is_some()
+            || self.git.confirm.is_some()
+            || self.git.notice.is_some()
+            || self.quick_open.open
+            || self.show_hints
+    }
+
+    /// Hints compactos da status bar, decididos pelo estado atual:
+    /// painel Git focado (ações da aba), modal aberto (hints padrão) ou as
+    /// ações principais do painel de arquivos.
+    fn status_hints(&self) -> String {
+        if !self.modal_open() && self.git.visible && self.git.focused {
+            return match self.git.tab {
+                GitTab::Branches => rust_i18n::t!("git_branches_hint").to_string(),
+                GitTab::Stashes => rust_i18n::t!("git_stashes_hint").to_string(),
+                _ => self
+                    .keymap
+                    .effective(Action::ToggleGitPanel)
+                    .into_iter()
+                    .next()
+                    .map(|binding| {
+                        format!("{binding} {}", action_description(Action::ToggleGitPanel))
+                    })
+                    .unwrap_or_else(|| action_description(Action::ToggleGitPanel).to_owned()),
+            };
+        }
+        self.default_status_hints()
+    }
+
+    /// Hints das ações principais, gerados do keymap efetivo:
     /// `F3 Preview · F5 Copy · ...`. Ações sem binding (ex.: `move` no preset
     /// vim) são omitidas.
-    fn status_hints(&self) -> String {
+    fn default_status_hints(&self) -> String {
         STATUS_HINTS
             .iter()
             .filter_map(|action| {
@@ -5408,6 +5547,8 @@ fn draw_panel(
     accent: Color32,
     tags: &HashMap<String, Vec<String>>,
 ) -> bool {
+    // Owned é necessário: os closures abaixo recebem `&mut Ui`, então não dá
+    // para manter `ui.visuals()` (borrow imutável) vivo durante o corpo.
     let visuals = ui.visuals().clone();
     let mut interacted = false;
 
@@ -5519,13 +5660,23 @@ fn draw_panel(
         };
 
         let focused = panel.focus;
-        let active_selection = panel.multi.clone();
+        // Atualiza a contagem de colunas antes de emprestar `panel` para as
+        // closures de desenho (evita clonar `panel.multi` a cada frame).
+        let grid_cols = if matches!(panel.view_mode, ViewMode::Icons) {
+            let width = ui.available_width();
+            let cols = (((width + CELL_GAP) / (CELL_W + CELL_GAP)).floor() as usize).max(1);
+            panel.grid_cols = cols;
+            cols
+        } else {
+            1
+        };
+        let active_selection = &panel.multi;
         let mut action = None;
 
         let output = match panel.view_mode {
             ViewMode::List => {
                 let entries = &panel.entries;
-                let selection = &active_selection;
+                let selection = active_selection;
                 scroll.show_rows(ui, ROW_H, entries.len(), |ui, range| {
                     for index in range {
                         let entry = &entries[index];
@@ -5546,12 +5697,10 @@ fn draw_panel(
                 })
             }
             ViewMode::Icons => {
-                let width = ui.available_width();
-                let cols = (((width + CELL_GAP) / (CELL_W + CELL_GAP)).floor() as usize).max(1);
-                panel.grid_cols = cols;
+                let cols = grid_cols;
                 let rows = panel.entries.len().div_ceil(cols);
                 let entries = &panel.entries;
-                let selection = &active_selection;
+                let selection = active_selection;
                 scroll.show_rows(ui, GRID_ROW_H, rows, |ui, range| {
                     for row in range {
                         ui.horizontal(|ui| {
@@ -6075,17 +6224,58 @@ fn parse_csv_row(line: &str, delimiter: char) -> Vec<String> {
     fields
 }
 
+/// Converte um erro tipado do backend Git em mensagem localizada para a UI.
+///
+/// O `Display` de [`GitError`] é em português e não passa pelo catálogo de
+/// traduções; aqui cada variante vira uma chave i18n.
+fn git_error_text(error: &GitError) -> String {
+    match error {
+        GitError::NotARepository => rust_i18n::t!("git_not_a_repo").to_string(),
+        GitError::NoWorktree => rust_i18n::t!("git_error_no_worktree").to_string(),
+        GitError::PathOutsideRepository(path) => {
+            rust_i18n::t!("git_error_path_outside", path = path.display().to_string()).to_string()
+        }
+        GitError::InvalidPath(path) => {
+            rust_i18n::t!("git_error_invalid_path", path = path.display().to_string()).to_string()
+        }
+        GitError::EmptyMessage => rust_i18n::t!("git_error_empty_message").to_string(),
+        GitError::NothingStaged => rust_i18n::t!("git_error_nothing_staged").to_string(),
+        GitError::InvalidBranchName(name) => {
+            rust_i18n::t!("git_error_invalid_branch", name = name.as_str()).to_string()
+        }
+        GitError::BranchNotFound(name) => {
+            rust_i18n::t!("git_error_branch_not_found", name = name.as_str()).to_string()
+        }
+        GitError::BranchAlreadyExists(name) => {
+            rust_i18n::t!("git_error_branch_exists", name = name.as_str()).to_string()
+        }
+        GitError::CurrentBranch(name) => {
+            rust_i18n::t!("git_error_current_branch", name = name.as_str()).to_string()
+        }
+        GitError::DirtyWorktree => rust_i18n::t!("git_error_dirty_worktree").to_string(),
+        GitError::NothingToStash => rust_i18n::t!("git_error_nothing_to_stash").to_string(),
+        GitError::StashNotFound(id) => {
+            rust_i18n::t!("git_error_stash_not_found", id = id.as_str()).to_string()
+        }
+        GitError::Gix(message) => {
+            rust_i18n::t!("git_error_generic", error = message.as_str()).to_string()
+        }
+        GitError::Io(error) => rust_i18n::t!("git_error_io", error = error.to_string()).to_string(),
+    }
+}
+
 /// Constrói o `LayoutJob` com syntax highlight (ou monospace puro).
 ///
 /// Limitado a [`MAX_HIGHLIGHT_LINES`] para manter o frame barato.
-fn build_text_job(text: &str, syntax_name: Option<&str>, dark: bool) -> egui::text::LayoutJob {
+fn build_text_job(
+    text: &str,
+    syntax_name: Option<&str>,
+    dark: bool,
+    text_color: Color32,
+) -> egui::text::LayoutJob {
     let base = TextFormat {
         font_id: FontId::monospace(12.0),
-        color: if dark {
-            Color32::from_rgb(0xd4, 0xd4, 0xd4)
-        } else {
-            Color32::from_rgb(0x24, 0x24, 0x24)
-        },
+        color: text_color,
         ..Default::default()
     };
 
@@ -6673,7 +6863,7 @@ impl AranduApp {
 mod tests {
     use std::fs;
 
-    use arandu_config::Config;
+    use arandu_config::{Action, Config};
     use arandu_core::ops::{OpKind, Progress};
     use arandu_index::IndexEntry;
     use eframe::egui;
@@ -6681,9 +6871,9 @@ mod tests {
     use egui_kittest::kittest::Queryable;
 
     use super::{
-        AranduApp, BatchRenameDialog, GitTab, IndexScanStatus, OpenExecutor, PanelSide,
-        PreviewContent, PreviewKey, ViewMode, build_open_invocations, format_modified,
-        parse_hex_color, visible_breadcrumb,
+        AranduApp, BatchRenameDialog, GitConfirm, GitTab, IndexScanStatus, OpenExecutor, PanelSide,
+        PreviewContent, PreviewKey, ViewMode, action_description, build_open_invocations,
+        format_modified, parse_hex_color, visible_breadcrumb,
     };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
@@ -8412,6 +8602,186 @@ mod tests {
         assert_eq!(
             harness.state().notice_text().as_deref(),
             Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn status_hints_follow_focused_git_tab() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        init_git_repo(dir.path());
+        fs::write(dir.path().join("a.txt"), b"a").expect("escreve arquivo");
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "inicial"]);
+
+        let app = AranduApp::new_at(Config::default(), dir.path());
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        // Painel fechado: hints padrão do painel de arquivos.
+        assert_eq!(
+            harness.state().status_hints(),
+            harness.state().default_status_hints()
+        );
+
+        harness.state_mut().git.visible = true;
+        harness.state_mut().git.focused = true;
+        harness.state_mut().git.tab = GitTab::Branches;
+        harness.run_steps(1);
+        assert_eq!(
+            harness.state().status_hints(),
+            rust_i18n::t!("git_branches_hint").to_string()
+        );
+
+        harness.state_mut().git.tab = GitTab::Stashes;
+        harness.run_steps(1);
+        assert_eq!(
+            harness.state().status_hints(),
+            rust_i18n::t!("git_stashes_hint").to_string()
+        );
+
+        // Outras abas não mostram ações de arquivo, só o toggle do painel.
+        harness.state_mut().git.tab = GitTab::Log;
+        harness.run_steps(1);
+        let hints = harness.state().status_hints();
+        assert_ne!(hints, harness.state().default_status_hints());
+        assert!(
+            hints.contains(&action_description(Action::ToggleGitPanel)),
+            "hints da aba Log deveriam citar o toggle do painel: {hints:?}"
+        );
+
+        // Painel visível mas sem foco volta aos hints padrão.
+        harness.state_mut().git.focused = false;
+        harness.run_steps(1);
+        assert_eq!(
+            harness.state().status_hints(),
+            harness.state().default_status_hints()
+        );
+    }
+
+    #[test]
+    fn git_checkout_enter_opens_confirmation_modal() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        init_git_repo(dir.path());
+        fs::write(dir.path().join("a.txt"), b"a").expect("escreve arquivo");
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "inicial"]);
+        run_git(dir.path(), &["branch", "feature"]);
+
+        let app = AranduApp::new_at(Config::default(), dir.path());
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        open_git_panel(&mut harness);
+
+        harness.state_mut().git.tab = GitTab::Branches;
+        harness.state_mut().git.focused = true;
+        for _ in 0..200 {
+            if harness.state().git.branches.len() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            harness.run_steps(1);
+        }
+        let index = harness
+            .state()
+            .git
+            .branches
+            .iter()
+            .position(|branch| branch.name == "feature")
+            .expect("branch feature na lista");
+        harness.state_mut().git.focus = index;
+
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(1);
+        let confirm = harness.state().git.confirm.clone();
+        assert!(
+            matches!(&confirm, Some(GitConfirm::CheckoutBranch(name)) if name == "feature"),
+            "Enter deveria pedir confirmação antes do checkout, veio {confirm:?}"
+        );
+        // Nada foi trocado ainda: a branch atual continua sendo main.
+        let main = harness
+            .state()
+            .git
+            .branches
+            .iter()
+            .find(|branch| branch.name == "main")
+            .expect("branch main");
+        assert!(
+            main.current,
+            "checkout não deveria acontecer sem confirmação"
+        );
+        assert_eq!(
+            harness
+                .query_all_by_label(&rust_i18n::t!("git_branch_checkout_title"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn git_delete_on_log_tab_shows_unavailable_notice() {
+        let dir = tempfile::tempdir().expect("cria diretório temporário");
+        init_git_repo(dir.path());
+        fs::write(dir.path().join("a.txt"), b"a").expect("escreve arquivo");
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-m", "inicial"]);
+
+        let app = AranduApp::new_at(Config::default(), dir.path());
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1200.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+        open_git_panel(&mut harness);
+
+        harness.state_mut().git.tab = GitTab::Log;
+        harness.state_mut().git.focused = true;
+        harness.run_steps(1);
+
+        harness.key_press(egui::Key::Delete);
+        harness.run_steps(1);
+        assert!(
+            harness.state().delete_confirm.is_none(),
+            "Delete na aba Log não pode cair na exclusão de arquivo"
+        );
+        assert_eq!(
+            harness.state().notice_text().as_deref(),
+            Some(rust_i18n::t!("git_delete_unavailable").to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn rename_modal_closes_on_outside_click() {
+        let (_dir, app) = fixture_app();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        harness
+            .query_all_by_label("fixture-file.txt")
+            .next()
+            .expect("linha do fixture")
+            .click();
+        harness.run_steps(1);
+        harness.key_press(egui::Key::F2);
+        harness.run_steps(1);
+        assert!(
+            harness.state().rename.is_some(),
+            "F2 deveria abrir o rename"
+        );
+
+        // Clique no fundo, longe do modal centrado.
+        let outside = egui::pos2(8.0, 8.0);
+        harness.hover_at(outside);
+        harness.drag_at(outside);
+        harness.drop_at(outside);
+        harness.run_steps(3);
+        assert!(
+            harness.state().rename.is_none(),
+            "clique fora deveria fechar o modal de rename"
         );
     }
 

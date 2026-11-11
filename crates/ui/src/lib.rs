@@ -99,6 +99,10 @@ const GIT_STATUS_ROW_H: f32 = 20.0;
 const HEX_ROW_BYTES: usize = 16;
 /// Máximo de linhas de dados exibidas na tabela CSV.
 const CSV_MAX_ROWS: usize = 1000;
+/// Altura fixa de uma linha do preview CSV (virtualização).
+const CSV_ROW_H: f32 = 20.0;
+/// Largura fixa de uma célula do preview CSV.
+const CSV_CELL_W: f32 = 120.0;
 /// Teto de linhas renderizadas com syntax highlight.
 ///
 /// Um arquivo de 1 MiB pode ter dezenas de milhares de linhas; construir e
@@ -529,6 +533,14 @@ impl PreviewCache {
     }
 }
 
+/// CSV parseado para renderização virtualizada.
+struct CsvPreview {
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    /// Havia mais linhas além de [`CSV_MAX_ROWS`].
+    capped: bool,
+}
+
 /// Estado do painel de preview (F3).
 #[derive(Default)]
 struct PreviewState {
@@ -543,6 +555,10 @@ struct PreviewState {
     job: Option<(PreviewKey, bool, Arc<egui::text::LayoutJob>)>,
     /// Textura da imagem/PDF atual.
     texture: Option<(PreviewKey, egui::TextureHandle)>,
+    /// RGBA decodificado da imagem atual (evita `to_rgba8()` por frame).
+    image: Option<(PreviewKey, Arc<image::RgbaImage>)>,
+    /// CSV já parseado da prévia atual (evita reparse por frame).
+    csv: Option<(PreviewKey, CsvPreview)>,
     /// Cache de layout/renderização do Markdown.
     markdown_cache: egui_commonmark::CommonMarkCache,
 }
@@ -4087,7 +4103,7 @@ impl AranduApp {
                     self.draw_preview_hex(ui, body, bytes, *truncated);
                 }
                 PreviewContent::Csv { text, truncated } => {
-                    self.draw_preview_csv(ui, body, text, *truncated);
+                    self.draw_preview_csv(ui, body, &key, text, *truncated);
                 }
                 PreviewContent::Json { text, truncated } => {
                     self.draw_preview_text(ui, body, &key, text, *truncated, Some("json"));
@@ -4267,7 +4283,53 @@ impl AranduApp {
         });
     }
 
-    fn draw_preview_csv(&mut self, ui: &mut Ui, body: Rect, text: &str, truncated: bool) {
+    fn draw_preview_csv(
+        &mut self,
+        ui: &mut Ui,
+        body: Rect,
+        key: &PreviewKey,
+        text: &str,
+        truncated: bool,
+    ) {
+        // Parseia só quando a chave do preview muda; o desenho abaixo é
+        // virtualizado e não depende do número total de linhas.
+        if self
+            .preview
+            .csv
+            .as_ref()
+            .is_none_or(|(cached_key, _)| cached_key != key)
+        {
+            let mut lines = text.lines();
+            let (headers, rows, capped) = match lines.next() {
+                Some(header) => {
+                    let delimiter = if header.contains('\t') && !header.contains(',') {
+                        '\t'
+                    } else {
+                        ','
+                    };
+                    let mut rows: Vec<Vec<String>> = lines
+                        .take(CSV_MAX_ROWS + 1)
+                        .map(|line| parse_csv_row(line, delimiter))
+                        .collect();
+                    let capped = rows.len() > CSV_MAX_ROWS;
+                    rows.truncate(CSV_MAX_ROWS);
+                    (parse_csv_row(header, delimiter), rows, capped)
+                }
+                None => (Vec::new(), Vec::new(), false),
+            };
+            self.preview.csv = Some((
+                key.clone(),
+                CsvPreview {
+                    headers,
+                    rows,
+                    capped,
+                },
+            ));
+        }
+        let Some((_, parsed)) = self.preview.csv.as_ref() else {
+            return;
+        };
+
         ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
             if truncated {
                 ui.add_space(4.0);
@@ -4277,52 +4339,35 @@ impl AranduApp {
                         .color(ui.visuals().warn_fg_color),
                 );
             }
-            let mut lines = text.lines();
-            let Some(header) = lines.next() else {
-                return;
-            };
-            let delimiter = if header.contains('\t') && !header.contains(',') {
-                '\t'
-            } else {
-                ','
-            };
-            let headers = parse_csv_row(header, delimiter);
-            let rows: Vec<Vec<String>> = lines
-                .take(CSV_MAX_ROWS + 1)
-                .map(|line| parse_csv_row(line, delimiter))
-                .collect();
-            let capped = rows.len() > CSV_MAX_ROWS;
+            // Linha 0 = cabeçalho; demais = registros.
+            let total = parsed.rows.len() + 1;
             ScrollArea::both()
                 .id_salt("preview-csv")
                 .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    egui::Grid::new("preview-csv-grid")
-                        .striped(true)
-                        .min_col_width(32.0)
-                        .show(ui, |ui| {
-                            for field in &headers {
-                                ui.label(RichText::new(field.as_str()).strong());
-                            }
-                            ui.end_row();
-                            for row in rows.iter().take(CSV_MAX_ROWS) {
-                                for field in row {
-                                    ui.label(if field.is_empty() { " " } else { field });
+                .show_rows(ui, CSV_ROW_H, total, |ui, range| {
+                    ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                    for row_index in range {
+                        ui.horizontal(|ui| {
+                            if row_index == 0 {
+                                for field in &parsed.headers {
+                                    csv_cell(ui, field, true, ui.visuals().strong_text_color());
                                 }
-                                ui.end_row();
+                            } else if let Some(row) = parsed.rows.get(row_index - 1) {
+                                for field in row {
+                                    csv_cell(ui, field, false, ui.visuals().text_color());
+                                }
                             }
                         });
-                    if capped {
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(rust_i18n::t!(
-                                "preview_csv_limit",
-                                count => CSV_MAX_ROWS
-                            ))
-                            .size(12.5)
-                            .color(ui.visuals().warn_fg_color),
-                        );
                     }
                 });
+            if parsed.capped {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(rust_i18n::t!("preview_csv_limit", count => CSV_MAX_ROWS))
+                        .size(12.5)
+                        .color(ui.visuals().warn_fg_color),
+                );
+            }
         });
     }
 
@@ -4334,7 +4379,22 @@ impl AranduApp {
         image: &image::DynamicImage,
         visuals: &egui::Visuals,
     ) {
-        let rgba = image.to_rgba8();
+        // A conversão é cara (decodifica todos os pixels); reaproveita o RGBA
+        // enquanto a chave do preview não mudar.
+        let cached = self
+            .preview
+            .image
+            .as_ref()
+            .filter(|(cached_key, _)| cached_key == key)
+            .map(|(_, rgba)| Arc::clone(rgba));
+        let rgba = match cached {
+            Some(rgba) => rgba,
+            None => {
+                let rgba = Arc::new(image.to_rgba8());
+                self.preview.image = Some((key.clone(), Arc::clone(&rgba)));
+                rgba
+            }
+        };
         self.draw_preview_rgba(ui, body, key, &rgba, visuals);
     }
 
@@ -5848,6 +5908,21 @@ fn preview_reason(reason: UnsupportedReason) -> String {
         UnsupportedReason::Pdf => "preview_reason_pdf",
     };
     rust_i18n::t!(key).to_string()
+}
+
+/// Célula de largura fixa do preview CSV (mantém colunas alinhadas).
+fn csv_cell(ui: &mut Ui, field: &str, strong: bool, color: Color32) {
+    let mut rich = RichText::new(if field.is_empty() { " " } else { field })
+        .size(12.5)
+        .color(color);
+    if strong {
+        rich = rich.strong();
+    }
+    let response = ui.add_sized(
+        vec2(CSV_CELL_W, CSV_ROW_H),
+        Label::new(rich).truncate().sense(Sense::hover()),
+    );
+    response.on_hover_text(field);
 }
 
 /// Divide uma linha CSV/TSV em campos, tratando aspas duplas básicas.

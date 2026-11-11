@@ -568,6 +568,8 @@ struct PreviewState {
     csv: Option<(PreviewKey, CsvPreview)>,
     /// Cache de layout/renderização do Markdown.
     markdown_cache: egui_commonmark::CommonMarkCache,
+    /// Chave renderizada no frame anterior; quando muda, o scroll volta ao topo.
+    scroll_key: Option<PreviewKey>,
 }
 
 /// Conjunto padrão de sintaxes (carregado uma única vez).
@@ -4175,6 +4177,12 @@ impl AranduApp {
         }
 
         let key = PreviewKey::for_entry(entry);
+        // Ao trocar de arquivo, os ScrollAreas do preview devem voltar ao topo.
+        // Dentro do mesmo arquivo o scroll é preservado.
+        let reset_scroll = self.preview.scroll_key.as_ref() != Some(&key);
+        if reset_scroll {
+            self.preview.scroll_key = Some(key.clone());
+        }
         match self.preview.cache.get(&key) {
             Some(PreviewEntry::Ready(content)) => match &*content {
                 PreviewContent::Text {
@@ -4189,21 +4197,30 @@ impl AranduApp {
                         text,
                         *truncated,
                         syntax_name.as_deref(),
+                        reset_scroll,
                     );
                 }
                 PreviewContent::Markdown { text, truncated } => {
-                    self.draw_preview_markdown(ui, body, text, *truncated);
+                    self.draw_preview_markdown(ui, body, text, *truncated, reset_scroll);
                 }
                 PreviewContent::Hex {
                     bytes, truncated, ..
                 } => {
-                    self.draw_preview_hex(ui, body, bytes, *truncated);
+                    self.draw_preview_hex(ui, body, bytes, *truncated, reset_scroll);
                 }
                 PreviewContent::Csv { text, truncated } => {
-                    self.draw_preview_csv(ui, body, &key, text, *truncated);
+                    self.draw_preview_csv(ui, body, &key, text, *truncated, reset_scroll);
                 }
                 PreviewContent::Json { text, truncated } => {
-                    self.draw_preview_text(ui, body, &key, text, *truncated, Some("json"));
+                    self.draw_preview_text(
+                        ui,
+                        body,
+                        &key,
+                        text,
+                        *truncated,
+                        Some("json"),
+                        reset_scroll,
+                    );
                 }
                 PreviewContent::Image { image, .. } => {
                     self.draw_preview_image(ui, body, &key, image, visuals);
@@ -4244,6 +4261,9 @@ impl AranduApp {
         }
     }
 
+    // Parâmetros de renderização são explícitos para manter o fluxo do preview
+    // legível; agrupar em struct só criaria ruído aqui.
+    #[allow(clippy::too_many_arguments)]
     fn draw_preview_text(
         &mut self,
         ui: &mut Ui,
@@ -4252,8 +4272,10 @@ impl AranduApp {
         text: &str,
         truncated: bool,
         syntax_name: Option<&str>,
+        reset_scroll: bool,
     ) {
         let dark = ui.visuals().dark_mode;
+        let text_color = ui.visuals().text_color();
         let rebuild = match &self.preview.job {
             Some((cached_key, cached_dark, _)) => cached_key != key || *cached_dark != dark,
             None => true,
@@ -4262,7 +4284,7 @@ impl AranduApp {
             self.preview.job = Some((
                 key.clone(),
                 dark,
-                Arc::new(build_text_job(text, syntax_name, dark)),
+                Arc::new(build_text_job(text, syntax_name, dark, text_color)),
             ));
         }
         let job = self
@@ -4282,13 +4304,18 @@ impl AranduApp {
                 );
                 ui.add_space(4.0);
             }
-            ScrollArea::both()
+            let mut area = ScrollArea::both()
                 .id_salt("preview-text")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                    ui.add(Label::new(job).selectable(false));
-                });
+                .auto_shrink([false, false]);
+            if reset_scroll {
+                area = area
+                    .vertical_scroll_offset(0.0)
+                    .horizontal_scroll_offset(0.0);
+            }
+            area.show(ui, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                ui.add(Label::new(job).selectable(false));
+            });
         });
     }
 
@@ -4317,7 +4344,14 @@ impl AranduApp {
         })
     }
 
-    fn draw_preview_markdown(&mut self, ui: &mut Ui, body: Rect, text: &str, truncated: bool) {
+    fn draw_preview_markdown(
+        &mut self,
+        ui: &mut Ui,
+        body: Rect,
+        text: &str,
+        truncated: bool,
+        reset_scroll: bool,
+    ) {
         let cache = &mut self.preview.markdown_cache;
         ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
             if truncated {
@@ -4328,18 +4362,28 @@ impl AranduApp {
                         .color(ui.visuals().warn_fg_color),
                 );
             }
-            ScrollArea::vertical()
+            let mut area = ScrollArea::vertical()
                 .id_salt("preview-markdown")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.add_space(4.0);
-                    egui_commonmark::CommonMarkViewer::new().show(ui, cache, text);
-                    ui.add_space(8.0);
-                });
+                .auto_shrink([false, false]);
+            if reset_scroll {
+                area = area.vertical_scroll_offset(0.0);
+            }
+            area.show(ui, |ui| {
+                ui.add_space(4.0);
+                egui_commonmark::CommonMarkViewer::new().show(ui, cache, text);
+                ui.add_space(8.0);
+            });
         });
     }
 
-    fn draw_preview_hex(&mut self, ui: &mut Ui, body: Rect, bytes: &[u8], truncated: bool) {
+    fn draw_preview_hex(
+        &mut self,
+        ui: &mut Ui,
+        body: Rect,
+        bytes: &[u8],
+        truncated: bool,
+        reset_scroll: bool,
+    ) {
         ui.scope_builder(UiBuilder::new().max_rect(body), |ui| {
             if truncated {
                 ui.add_space(4.0);
@@ -4351,32 +4395,26 @@ impl AranduApp {
             }
             let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
             let rows = bytes.len().div_ceil(HEX_ROW_BYTES);
-            let visuals = ui.visuals().clone();
-            ScrollArea::vertical()
+            let weak_color = ui.visuals().weak_text_color();
+            let mut area = ScrollArea::vertical()
                 .id_salt("preview-hex")
-                .auto_shrink([false, false])
-                .show_rows(ui, row_height, rows, |ui, row_range| {
-                    for row in row_range {
-                        let offset = row * HEX_ROW_BYTES;
-                        let end = (offset + HEX_ROW_BYTES).min(bytes.len());
-                        let (offset_text, hex_text, ascii_text) =
-                            hex_row(offset, &bytes[offset..end]);
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 12.0;
-                            ui.label(
-                                RichText::new(offset_text)
-                                    .monospace()
-                                    .color(visuals.weak_text_color()),
-                            );
-                            ui.label(RichText::new(hex_text).monospace());
-                            ui.label(
-                                RichText::new(ascii_text)
-                                    .monospace()
-                                    .color(visuals.weak_text_color()),
-                            );
-                        });
-                    }
-                });
+                .auto_shrink([false, false]);
+            if reset_scroll {
+                area = area.vertical_scroll_offset(0.0);
+            }
+            area.show_rows(ui, row_height, rows, |ui, row_range| {
+                for row in row_range {
+                    let offset = row * HEX_ROW_BYTES;
+                    let end = (offset + HEX_ROW_BYTES).min(bytes.len());
+                    let (offset_text, hex_text, ascii_text) = hex_row(offset, &bytes[offset..end]);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        ui.label(RichText::new(offset_text).monospace().color(weak_color));
+                        ui.label(RichText::new(hex_text).monospace());
+                        ui.label(RichText::new(ascii_text).monospace().color(weak_color));
+                    });
+                }
+            });
         });
     }
 
@@ -4387,6 +4425,7 @@ impl AranduApp {
         key: &PreviewKey,
         text: &str,
         truncated: bool,
+        reset_scroll: bool,
     ) {
         // Parseia só quando a chave do preview muda; o desenho abaixo é
         // virtualizado e não depende do número total de linhas.
@@ -4438,25 +4477,30 @@ impl AranduApp {
             }
             // Linha 0 = cabeçalho; demais = registros.
             let total = parsed.rows.len() + 1;
-            ScrollArea::both()
+            let mut area = ScrollArea::both()
                 .id_salt("preview-csv")
-                .auto_shrink([false, false])
-                .show_rows(ui, CSV_ROW_H, total, |ui, range| {
-                    ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-                    for row_index in range {
-                        ui.horizontal(|ui| {
-                            if row_index == 0 {
-                                for field in &parsed.headers {
-                                    csv_cell(ui, field, true, ui.visuals().strong_text_color());
-                                }
-                            } else if let Some(row) = parsed.rows.get(row_index - 1) {
-                                for field in row {
-                                    csv_cell(ui, field, false, ui.visuals().text_color());
-                                }
+                .auto_shrink([false, false]);
+            if reset_scroll {
+                area = area
+                    .vertical_scroll_offset(0.0)
+                    .horizontal_scroll_offset(0.0);
+            }
+            area.show_rows(ui, CSV_ROW_H, total, |ui, range| {
+                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                for row_index in range {
+                    ui.horizontal(|ui| {
+                        if row_index == 0 {
+                            for field in &parsed.headers {
+                                csv_cell(ui, field, true, ui.visuals().strong_text_color());
                             }
-                        });
-                    }
-                });
+                        } else if let Some(row) = parsed.rows.get(row_index - 1) {
+                            for field in row {
+                                csv_cell(ui, field, false, ui.visuals().text_color());
+                            }
+                        }
+                    });
+                }
+            });
             if parsed.capped {
                 ui.add_space(4.0);
                 ui.label(

@@ -13,6 +13,7 @@ pub use keymap::{Action, KeyBinding, Keymap, Modifiers};
 pub use tags::TagsStore;
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Configuração raiz da aplicação.
@@ -23,6 +24,13 @@ pub struct Config {
     pub locale: String,
     /// Tema visual da interface.
     pub theme: Theme,
+    /// Apps externos por extensão ("Abrir com").
+    ///
+    /// A chave é a extensão sem ponto, em minúsculas (`mp4`, `docx`); o valor
+    /// é uma linha de comando com os placeholders `{path}` (um arquivo por
+    /// invocação) ou `{paths}` (todos os arquivos de uma vez). Sem shell: o
+    /// comando é dividido em argv por espaços em branco.
+    pub open_with: BTreeMap<String, String>,
 }
 
 impl Default for Config {
@@ -30,8 +38,23 @@ impl Default for Config {
         Self {
             locale: "en".to_owned(),
             theme: Theme::default(),
+            open_with: BTreeMap::new(),
         }
     }
+}
+
+/// Normaliza a extensão de um caminho para a chave de `[open_with]`.
+///
+/// Devolve a extensão sem ponto e em minúsculas, ou `None` quando o caminho
+/// não tem extensão (ou ela é vazia).
+pub fn extension_key(path: &Path) -> Option<String> {
+    path.extension()
+        .map(|ext| {
+            ext.to_string_lossy()
+                .trim_start_matches('.')
+                .to_ascii_lowercase()
+        })
+        .filter(|ext| !ext.is_empty())
 }
 
 /// Tema visual declarativo, com paleta completa em `#rrggbb`.
@@ -319,6 +342,12 @@ impl Config {
         Ok(config)
     }
 
+    /// Comando configurado para a extensão do arquivo, se houver.
+    pub fn open_with_for(&self, path: &Path) -> Option<&str> {
+        let key = extension_key(path)?;
+        self.open_with.get(&key).map(String::as_str)
+    }
+
     /// Tema efetivo: config da aplicação + sobrescrita por
     /// `themes/<name>.toml` no diretório de configuração, se existir.
     pub fn resolved_theme(&self) -> Theme {
@@ -360,6 +389,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::{Config, Theme};
+    use std::path::Path;
 
     #[test]
     fn roundtrips_config_through_toml() {
@@ -375,12 +405,41 @@ mod tests {
                 text_muted: None,
                 border: Some("#333333".to_owned()),
             },
+            open_with: std::collections::BTreeMap::new(),
         };
 
         let encoded = config.to_toml().expect("serializa config");
         let decoded = Config::from_toml(&encoded).expect("desserializa config");
 
         assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn open_with_map_roundtrips_and_serializes_as_table() {
+        let mut config = Config::default();
+        config
+            .open_with
+            .insert("mp4".to_owned(), "vlc {path}".to_owned());
+        config
+            .open_with
+            .insert("docx".to_owned(), "libreoffice --writer {path}".to_owned());
+
+        let encoded = config.to_toml().expect("serializa config");
+        assert!(encoded.contains("[open_with]"), "TOML:\n{encoded}");
+        let decoded = Config::from_toml(&encoded).expect("desserializa config");
+
+        assert_eq!(decoded, config);
+        assert_eq!(
+            decoded.open_with_for(Path::new("/tmp/video.MP4")),
+            Some("vlc {path}")
+        );
+        assert_eq!(decoded.open_with_for(Path::new("/tmp/readme")), None);
+    }
+
+    #[test]
+    fn open_with_defaults_to_empty_map() {
+        let decoded = Config::from_toml("locale = \"en\"\n").expect("desserializa config");
+        assert!(decoded.open_with.is_empty());
     }
 
     #[test]

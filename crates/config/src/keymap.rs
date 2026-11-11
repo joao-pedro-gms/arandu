@@ -44,6 +44,8 @@ pub enum Action {
     ToggleViewMode,
     ToggleQuickOpen,
     ToggleGitLog,
+    OpenWith,
+    OpenWithDefault,
 }
 
 impl Action {
@@ -73,11 +75,13 @@ impl Action {
             Self::ToggleViewMode => "toggle_view_mode",
             Self::ToggleQuickOpen => "toggle_quick_open",
             Self::ToggleGitLog => "toggle_git_log",
+            Self::OpenWith => "open_with",
+            Self::OpenWithDefault => "open_with_default",
         }
     }
 
     /// Todas as ações, na ordem canônica do arquivo.
-    pub const ALL: [Action; 23] = [
+    pub const ALL: [Action; 25] = [
         Self::TogglePreview,
         Self::ToggleGitPanel,
         Self::TogglePanel,
@@ -101,6 +105,8 @@ impl Action {
         Self::ToggleViewMode,
         Self::ToggleQuickOpen,
         Self::ToggleGitLog,
+        Self::OpenWith,
+        Self::OpenWithDefault,
     ];
 
     /// Converte um nome `snake_case` em ação.
@@ -387,6 +393,14 @@ fn default_bindings(action: Action) -> Vec<KeyBinding> {
             },
             "G",
         )],
+        Action::OpenWith => vec![kb("F11")],
+        Action::OpenWithDefault => vec![KeyBinding::with_mods(
+            Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            },
+            "F11",
+        )],
     }
 }
 
@@ -423,6 +437,14 @@ fn vim_bindings(action: Action) -> Vec<KeyBinding> {
                 ..Modifiers::NONE
             },
             "G",
+        )],
+        Action::OpenWith => vec![kb("F11")],
+        Action::OpenWithDefault => vec![KeyBinding::with_mods(
+            Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            },
+            "F11",
         )],
     }
 }
@@ -672,6 +694,30 @@ mod tests {
             assert_eq!(
                 keymap.effective(Action::ToggleQuickOpen),
                 vec![KeyBinding::with_mods(Modifiers::CTRL, "P")]
+            );
+        }
+    }
+
+    #[test]
+    fn open_with_uses_f11_and_shift_f11_in_both_presets() {
+        for preset in ["default", "vim"] {
+            let keymap = Keymap {
+                preset: preset.to_owned(),
+                ..Keymap::default()
+            };
+            assert_eq!(
+                keymap.effective(Action::OpenWith),
+                vec![KeyBinding::key("F11")]
+            );
+            assert_eq!(
+                keymap.effective(Action::OpenWithDefault),
+                vec![KeyBinding::with_mods(
+                    Modifiers {
+                        shift: true,
+                        ..Modifiers::NONE
+                    },
+                    "F11"
+                )]
             );
         }
     }

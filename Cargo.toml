@@ -44,6 +44,9 @@ serde = { version = "1", features = ["derive"] }
 toml = "1"
 directories = "6"
 eframe = "0.37"
+# Abre arquivos no app padrão do SO (xdg-open/open/start). MIT, sem deps
+# nativas além de libc/is-wsl.
+open = "5"
 rust-i18n = "4.2"
 gix = "0.90"
 trash = "5"

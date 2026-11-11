@@ -298,6 +298,7 @@ dependencies = [
  "egui_kittest",
  "filetime",
  "image",
+ "open",
  "rust-i18n",
  "syntect",
  "tempfile",

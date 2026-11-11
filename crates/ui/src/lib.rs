@@ -22,7 +22,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arandu_config::{
-    Action, Config, KeyBinding, Keymap, Modifiers as KeyModifiers, TagsStore, Theme,
+    Action, Config, KeyBinding, Keymap, Modifiers as KeyModifiers, TagsStore, Theme, extension_key,
 };
 use arandu_core::archive::{self, ArchiveFormat};
 use arandu_core::batch::apply_pattern;
@@ -568,6 +568,44 @@ struct CompressDialog {
     name: String,
 }
 
+/// Diálogo "Abrir com" para arquivos sem app configurado.
+struct OpenWithDialog {
+    /// Alvos da abertura.
+    paths: Vec<PathBuf>,
+    /// Comando digitado (sem shell; placeholders `{path}`/`{paths}`).
+    command: String,
+    /// Erro de validação do último envio.
+    error: Option<String>,
+}
+
+/// Executa a abertura de arquivos em aplicativos externos.
+///
+/// A trait permite substituir o spawn real por um executor de teste, sem
+/// lançar processos durante os testes headless.
+trait OpenExecutor: Send + Sync {
+    /// Abre um caminho com o aplicativo padrão do sistema operacional.
+    fn open_default(&self, path: &Path) -> Result<(), String>;
+    /// Executa um comando já dividido em argv (sem shell).
+    fn run_command(&self, program: &str, args: &[String]) -> Result<(), String>;
+}
+
+/// Executor real: `open` para o app padrão e `Command` para comandos.
+struct SystemOpenExecutor;
+
+impl OpenExecutor for SystemOpenExecutor {
+    fn open_default(&self, path: &Path) -> Result<(), String> {
+        open::that(path).map_err(|error| error.to_string())
+    }
+
+    fn run_command(&self, program: &str, args: &[String]) -> Result<(), String> {
+        std::process::Command::new(program)
+            .args(args)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// Trabalho de compressão/extração em background.
 ///
 /// A thread é independente da UI: o resultado chega pelo canal e é drenado em
@@ -819,6 +857,10 @@ pub struct AranduApp {
     compress_job: Option<ArchiveJob>,
     /// Extração em andamento (background).
     extract_job: Option<ArchiveJob>,
+    /// Diálogo "Abrir com" aberto (F11 sem app configurado).
+    open_with_dialog: Option<OpenWithDialog>,
+    /// Executor de abertura externa (substituível em testes).
+    open_executor: Arc<dyn OpenExecutor>,
     /// Tags dos arquivos, persistidas em `tags.toml`.
     tags: TagsStore,
     /// Painel de pré-visualização (F3).
@@ -901,6 +943,8 @@ impl AranduApp {
             compress: None,
             compress_job: None,
             extract_job: None,
+            open_with_dialog: None,
+            open_executor: Arc::new(SystemOpenExecutor),
             tags,
             preview: PreviewState::default(),
             git: GitState::default(),
@@ -1148,9 +1192,9 @@ impl AranduApp {
             return;
         }
 
-        // O `TextEdit` dos diálogos de renomeação/edição de tags recebe a
-        // digitação; os atalhos globais ficam suspensos.
-        if self.rename.is_some() || self.tag_editor.is_some() {
+        // O `TextEdit` dos diálogos de renomeação/edição de tags/"Abrir com"
+        // recebe a digitação; os atalhos globais ficam suspensos.
+        if self.rename.is_some() || self.tag_editor.is_some() || self.open_with_dialog.is_some() {
             return;
         }
 
@@ -1276,6 +1320,8 @@ impl AranduApp {
         let batch_rename = self.action_pressed(Action::BatchRename, &pressed);
         let compress = self.action_pressed(Action::Compress, &pressed);
         let extract = self.action_pressed(Action::Extract, &pressed);
+        let open_with_default = self.action_pressed(Action::OpenWithDefault, &pressed);
+        let open_with = self.action_pressed(Action::OpenWith, &pressed);
 
         if toggle_preview {
             self.preview.visible = !self.preview.visible;
@@ -1472,6 +1518,11 @@ impl AranduApp {
         }
         if extract {
             self.start_extract();
+        }
+        if open_with_default {
+            self.open_with_default();
+        } else if open_with {
+            self.start_open_with();
         }
         if delete && !git_consumed_delete {
             self.request_delete();
@@ -1879,6 +1930,102 @@ impl AranduApp {
             reload_dir: cwd,
         });
         self.ops.notice = Some(Notice::info(rust_i18n::t!("extracting").to_string()));
+    }
+
+    /// Abre a seleção no app configurado ou mostra o diálogo "Abrir com".
+    ///
+    /// Quando a extensão do primeiro alvo tem comando em `[open_with]`, ele é
+    /// executado direto. Caso contrário abre o diálogo para escolher o app
+    /// padrão do sistema, reusar um comando existente ou digitar um novo.
+    fn start_open_with(&mut self) {
+        let paths = self.active_panel().selected_paths();
+        if paths.is_empty() {
+            self.ops.notice = Some(Notice::error(
+                rust_i18n::t!("open_with_no_selection").to_string(),
+            ));
+            return;
+        }
+        if let Some(command) = self.config().open_with_for(&paths[0]) {
+            let command = command.to_owned();
+            self.execute_open_command(&command, &paths);
+            return;
+        }
+        self.open_with_dialog = Some(OpenWithDialog {
+            paths,
+            command: String::new(),
+            error: None,
+        });
+        self.ops.notice = None;
+    }
+
+    /// Abre a seleção no aplicativo padrão do sistema operacional.
+    fn open_with_default(&mut self) {
+        let paths = self.active_panel().selected_paths();
+        if paths.is_empty() {
+            self.ops.notice = Some(Notice::error(
+                rust_i18n::t!("open_with_no_selection").to_string(),
+            ));
+            return;
+        }
+        self.open_paths_default(&paths);
+    }
+
+    /// Abre cada caminho com o app padrão, reportando o primeiro erro.
+    fn open_paths_default(&mut self, paths: &[PathBuf]) {
+        for path in paths {
+            if let Err(error) = self.open_executor.open_default(path) {
+                self.ops.notice = Some(Notice::error(format!(
+                    "{}: {error}",
+                    rust_i18n::t!("open_failed")
+                )));
+                return;
+            }
+        }
+        self.ops.notice = Some(Notice::info(
+            rust_i18n::t!("open_with_opened", count = paths.len()).to_string(),
+        ));
+    }
+
+    /// Executa um comando de `[open_with]` sobre os caminhos dados.
+    ///
+    /// O comando é dividido em argv por espaços em branco e executado sem
+    /// shell. `{path}` gera uma invocação por arquivo; `{paths}` expande todos
+    /// os arquivos na mesma invocação.
+    fn execute_open_command(&mut self, command: &str, paths: &[PathBuf]) {
+        let invocations = match build_open_invocations(command, paths) {
+            Ok(invocations) => invocations,
+            Err(error) => {
+                self.ops.notice = Some(Notice::error(error));
+                return;
+            }
+        };
+        for (program, args) in invocations {
+            if let Err(error) = self.open_executor.run_command(&program, &args) {
+                self.ops.notice = Some(Notice::error(format!(
+                    "{}: {error}",
+                    rust_i18n::t!("open_failed")
+                )));
+                return;
+            }
+        }
+        self.ops.notice = Some(Notice::info(
+            rust_i18n::t!("open_with_opened", count = paths.len()).to_string(),
+        ));
+    }
+
+    /// Persiste o comando digitado para a extensão do primeiro alvo.
+    fn remember_open_command(&mut self, path: &Path, command: &str) {
+        let Some(extension) = extension_key(path) else {
+            return;
+        };
+        self.config.open_with.insert(extension, command.to_owned());
+        #[cfg(not(test))]
+        if let Err(error) = self.config().save() {
+            self.ops.notice = Some(Notice::error(format!(
+                "{}: {error}",
+                rust_i18n::t!("config_save_failed")
+            )));
+        }
     }
 
     /// Drena os trabalhos de compressão/extração sem bloquear.
@@ -4148,6 +4295,104 @@ impl AranduApp {
             }
         }
 
+        if let Some(mut dialog) = self.open_with_dialog.take() {
+            let configured: Vec<(String, String)> = self
+                .config
+                .open_with
+                .iter()
+                .map(|(extension, command)| (extension.clone(), command.clone()))
+                .collect();
+            let mut submit = false;
+            let mut use_default = false;
+            let mut cancel = false;
+            egui::Modal::new(egui::Id::unique("open-with-dialog")).show(ctx, |ui| {
+                ui.set_min_width(460.0);
+                ui.heading(rust_i18n::t!("open_with_title"));
+                ui.add_space(6.0);
+                ui.label(rust_i18n::t!(
+                    "open_with_targets",
+                    count = dialog.paths.len()
+                ));
+                if let Some(first) = dialog.paths.first() {
+                    let name = first
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| first.display().to_string());
+                    ui.label(RichText::new(name).color(ui.visuals().weak_text_color()));
+                }
+                ui.add_space(8.0);
+
+                if !configured.is_empty() {
+                    ui.label(rust_i18n::t!("open_with_configured_label"));
+                    ui.horizontal_wrapped(|ui| {
+                        for (extension, command) in &configured {
+                            if ui
+                                .button(format!(".{extension} — {command}"))
+                                .on_hover_text(command)
+                                .clicked()
+                            {
+                                dialog.command = command.clone();
+                            }
+                        }
+                    });
+                    ui.add_space(8.0);
+                }
+
+                ui.label(rust_i18n::t!("open_with_command_label"));
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut dialog.command)
+                        .hint_text(rust_i18n::t!("open_with_command_hint"))
+                        .desired_width(f32::INFINITY),
+                );
+                if !response.has_focus() && dialog.error.is_none() {
+                    response.request_focus();
+                }
+                ui.label(
+                    RichText::new(rust_i18n::t!("open_with_command_help"))
+                        .color(ui.visuals().weak_text_color()),
+                );
+                if let Some(error) = &dialog.error {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+                if ui.input(|input| input.key_pressed(Key::Enter)) {
+                    submit = true;
+                }
+                if ui.input(|input| input.key_pressed(Key::Escape)) {
+                    cancel = true;
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button(rust_i18n::t!("open_with_ok")).clicked() {
+                        submit = true;
+                    }
+                    if ui
+                        .button(rust_i18n::t!("open_with_system_default"))
+                        .clicked()
+                    {
+                        use_default = true;
+                    }
+                    if ui.button(rust_i18n::t!("cancel")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+            if use_default {
+                self.open_paths_default(&dialog.paths);
+            } else if submit {
+                let command = dialog.command.trim().to_owned();
+                if command.is_empty() {
+                    dialog.error = Some(rust_i18n::t!("open_with_empty_command").to_string());
+                    self.open_with_dialog = Some(dialog);
+                } else if let Some(first) = dialog.paths.first() {
+                    self.remember_open_command(first, &command);
+                    self.execute_open_command(&command, &dialog.paths);
+                }
+            } else if !cancel {
+                self.open_with_dialog = Some(dialog);
+            }
+        }
+
         if let Some(dialog) = self.checksums.take() {
             let mut close = false;
             egui::Modal::new(egui::Id::unique("checksums-dialog")).show(ctx, |ui| {
@@ -5447,6 +5692,8 @@ fn action_description(action: Action) -> String {
         Action::ToggleViewMode => "action_toggle_view_mode",
         Action::ToggleQuickOpen => "action_toggle_quick_open",
         Action::ToggleGitLog => "action_toggle_git_log",
+        Action::OpenWith => "action_open_with",
+        Action::OpenWithDefault => "action_open_with_default",
     };
     rust_i18n::t!(key).into_owned()
 }
@@ -5504,6 +5751,58 @@ fn validate_batch_renames(renames: &[(PathBuf, String, String)]) -> Option<Strin
         }
     }
     None
+}
+
+/// Constrói as invocações de um comando de `[open_with]`.
+///
+/// O comando é dividido em argv por espaços em branco (não há shell, então
+/// metacaracteres como `|`, `>`, `*` e variáveis não são interpretados).
+/// `{path}` é substituído por um arquivo, gerando uma invocação por caminho;
+/// `{paths}` é substituído por todos os caminhos na mesma invocação. Sem
+/// placeholder, os caminhos são anexados ao final dos argumentos.
+fn build_open_invocations(
+    command: &str,
+    paths: &[PathBuf],
+) -> Result<Vec<(String, Vec<String>)>, String> {
+    let mut tokens = command.split_whitespace().map(str::to_owned);
+    let program = tokens
+        .next()
+        .ok_or_else(|| rust_i18n::t!("open_with_empty_command").to_string())?;
+    let args: Vec<String> = tokens.collect();
+
+    if args.iter().any(|arg| arg.contains("{paths}")) {
+        let joined = paths
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut expanded = Vec::new();
+        for arg in &args {
+            if arg == "{paths}" {
+                expanded.extend(paths.iter().map(|path| path.to_string_lossy().into_owned()));
+            } else {
+                expanded.push(arg.replace("{paths}", &joined));
+            }
+        }
+        return Ok(vec![(program, expanded)]);
+    }
+
+    if args.iter().any(|arg| arg.contains("{path}")) {
+        let mut invocations = Vec::with_capacity(paths.len());
+        for path in paths {
+            let path_text = path.to_string_lossy();
+            let expanded = args
+                .iter()
+                .map(|arg| arg.replace("{path}", &path_text))
+                .collect();
+            invocations.push((program.clone(), expanded));
+        }
+        return Ok(invocations);
+    }
+
+    let mut expanded = args;
+    expanded.extend(paths.iter().map(|path| path.to_string_lossy().into_owned()));
+    Ok(vec![(program, expanded)])
 }
 
 /// Extrai o nome-base de um arquivo de compressão, removendo a extensão.
@@ -5741,11 +6040,37 @@ mod tests {
     use egui_kittest::kittest::Queryable;
 
     use super::{
-        AranduApp, GitTab, IndexScanStatus, PanelSide, ViewMode, format_modified, parse_hex_color,
-        visible_breadcrumb,
+        AranduApp, GitTab, IndexScanStatus, OpenExecutor, PanelSide, ViewMode,
+        build_open_invocations, format_modified, parse_hex_color, visible_breadcrumb,
     };
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, UNIX_EPOCH};
+
+    /// Comando registrado pelo executor de teste: programa + argv.
+    type RecordedCommand = (String, Vec<String>);
+
+    /// Executor de teste: registra as chamadas sem lançar processos.
+    #[derive(Clone, Default)]
+    struct RecordingOpenExecutor {
+        default_calls: Arc<Mutex<Vec<PathBuf>>>,
+        commands: Arc<Mutex<Vec<RecordedCommand>>>,
+    }
+
+    impl OpenExecutor for RecordingOpenExecutor {
+        fn open_default(&self, path: &Path) -> Result<(), String> {
+            self.default_calls.lock().unwrap().push(path.to_path_buf());
+            Ok(())
+        }
+
+        fn run_command(&self, program: &str, args: &[String]) -> Result<(), String> {
+            self.commands
+                .lock()
+                .unwrap()
+                .push((program.to_owned(), args.to_vec()));
+            Ok(())
+        }
+    }
 
     /// Executa `git` no diretório com configuração global isolada.
     fn run_git(dir: &Path, args: &[&str]) {
@@ -7071,6 +7396,199 @@ mod tests {
         assert!(
             extracted.is_file(),
             "esperava o conteúdo extraído em pacote/"
+        );
+    }
+
+    #[test]
+    fn build_open_invocations_expands_path_and_paths() {
+        let paths = [PathBuf::from("/tmp/a.txt"), PathBuf::from("/tmp/b.txt")];
+
+        let per_file = build_open_invocations("editor --file {path}", &paths).expect("comando");
+        assert_eq!(per_file.len(), 2);
+        assert_eq!(
+            per_file[0],
+            (
+                "editor".to_owned(),
+                vec!["--file".to_owned(), "/tmp/a.txt".to_owned()]
+            )
+        );
+        assert_eq!(
+            per_file[1],
+            (
+                "editor".to_owned(),
+                vec!["--file".to_owned(), "/tmp/b.txt".to_owned()]
+            )
+        );
+
+        let all_at_once = build_open_invocations("cmp {paths}", &paths).expect("comando");
+        assert_eq!(
+            all_at_once,
+            vec![(
+                "cmp".to_owned(),
+                vec!["/tmp/a.txt".to_owned(), "/tmp/b.txt".to_owned()]
+            )]
+        );
+
+        let appended = build_open_invocations("xdg-open", &paths[..1]).expect("comando");
+        assert_eq!(
+            appended,
+            vec![("xdg-open".to_owned(), vec!["/tmp/a.txt".to_owned()])]
+        );
+
+        assert!(build_open_invocations("   ", &paths).is_err());
+    }
+
+    #[test]
+    fn f11_runs_configured_command_without_spawning() {
+        let (dir, mut app) = fixture_app();
+        app.config
+            .open_with
+            .insert("txt".to_owned(), "reader --file {path}".to_owned());
+        let index = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.name == "fixture-file.txt")
+            .expect("fixture tem fixture-file.txt");
+        app.left.select(index, false);
+        let executor = RecordingOpenExecutor::default();
+        app.open_executor = Arc::new(executor.clone());
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        harness.key_press(egui::Key::F11);
+        harness.run();
+
+        let commands = executor.commands.lock().unwrap();
+        assert_eq!(commands.len(), 1, "F11 deveria rodar o comando configurado");
+        assert_eq!(commands[0].0, "reader");
+        assert_eq!(
+            commands[0].1,
+            vec![
+                "--file".to_owned(),
+                dir.path()
+                    .join("fixture-file.txt")
+                    .to_string_lossy()
+                    .into_owned()
+            ]
+        );
+        assert!(executor.default_calls.lock().unwrap().is_empty());
+        assert!(harness.state().open_with_dialog.is_none());
+    }
+
+    #[test]
+    fn shift_f11_uses_system_default_app() {
+        let (dir, mut app) = fixture_app();
+        let index = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.name == "fixture-file.txt")
+            .expect("fixture tem fixture-file.txt");
+        app.left.select(index, false);
+        let executor = RecordingOpenExecutor::default();
+        app.open_executor = Arc::new(executor.clone());
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        harness.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::F11);
+        harness.run();
+
+        let calls = executor.default_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], dir.path().join("fixture-file.txt"));
+        assert!(executor.commands.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn f11_without_configured_app_opens_dialog() {
+        let (_dir, mut app) = fixture_app();
+        let index = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.name == "fixture-file.txt")
+            .expect("fixture tem fixture-file.txt");
+        app.left.select(index, false);
+        let executor = RecordingOpenExecutor::default();
+        app.open_executor = Arc::new(executor.clone());
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        harness.key_press(egui::Key::F11);
+        harness.run();
+
+        assert!(harness.state().open_with_dialog.is_some());
+        let title = rust_i18n::t!("open_with_title").to_string();
+        assert!(
+            harness.query_all_by_label(&title).count() >= 1,
+            "esperava o diálogo '{title}'"
+        );
+        assert!(executor.commands.lock().unwrap().is_empty());
+        assert!(executor.default_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn open_with_dialog_persists_typed_command() {
+        let (dir, mut app) = fixture_app();
+        let index = app
+            .left
+            .entries
+            .iter()
+            .position(|entry| entry.name == "fixture-file.txt")
+            .expect("fixture tem fixture-file.txt");
+        app.left.select(index, false);
+        let executor = RecordingOpenExecutor::default();
+        app.open_executor = Arc::new(executor.clone());
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1000.0, 700.0))
+            .build_ui_state(|ui, app: &mut AranduApp| app.show(ui), app);
+        harness.run();
+
+        harness.key_press(egui::Key::F11);
+        harness.run();
+        let dialog = harness
+            .state_mut()
+            .open_with_dialog
+            .as_mut()
+            .expect("diálogo aberto");
+        dialog.command = "writer {path}".to_owned();
+        harness.run();
+
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+
+        assert!(harness.state().open_with_dialog.is_none());
+        assert_eq!(
+            harness
+                .state()
+                .config
+                .open_with
+                .get("txt")
+                .map(String::as_str),
+            Some("writer {path}")
+        );
+        let commands = executor.commands.lock().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].0, "writer");
+        assert_eq!(
+            commands[0].1,
+            vec![
+                dir.path()
+                    .join("fixture-file.txt")
+                    .to_string_lossy()
+                    .into_owned()
+            ]
         );
     }
 }
